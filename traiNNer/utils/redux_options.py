@@ -560,7 +560,7 @@ class ReduxOptions(StrictStruct):
     otf_shared_hf_noise_prob: Annotated[
         float,
         Meta(
-            description="Probability of adding the same shared high-frequency noise field to both GT and LQ after the final OTF crop, between 0 and 1."
+            description="Probability of adding a high-frequency noise field to GT only after the final OTF crop, between 0 and 1. The model learns to synthesize this texture."
         ),
     ] = 0
     otf_shared_hf_noise_alpha_range: Annotated[

@@ -16,15 +16,15 @@
 
 ## 1. Shared High-Frequency Noise
 
-Adds the **same** beta-distributed noise field to both GT and LQ after the final OTF crop. The model learns to preserve this shared texture/grain rather than treating it as noise to remove.
+Adds a beta-distributed noise field to **GT only** after the final OTF crop. The LR does not receive this noise, so the model learns to **synthesize** high-frequency texture/grain during upscaling.
 
 ### How It Works
 
 1. A noise field is sampled from a `Beta(a, b)` distribution at GT resolution.
 2. Optionally forced to grayscale (single channel broadcast to RGB).
 3. Either **normalized** (zero-centered, unit-variance, clamped to ±3σ, scaled by α) or used **raw** as `(beta - 0.5) * 2 * α`.
-4. The noise is added to GT, then **nearest-exact downscaled** to LQ resolution and added to LQ.
-5. Both GT and LQ are clamped to [0, 1].
+4. The noise is added to GT only. LR is left untouched.
+5. GT is clamped to [0, 1].
 
 ### Pipeline Position
 
@@ -37,8 +37,8 @@ Adds the **same** beta-distributed noise field to both GT and LQ after the final
 All fields are **top-level** (same level as `high_order_degradation`, not inside `datasets`).
 
 ```yaml
-# ── Shared High-Frequency Noise ───────────────────────────────────────────────
-# Adds identical noise to both GT and LQ so the model preserves texture/grain.
+# ── High-Frequency Noise (GT only) ────────────────────────────────────────────
+# Adds noise to GT only so the model learns to synthesize texture/grain.
 
 otf_shared_hf_noise_prob: 0.0          # Probability of applying. 0 = disabled.
                                         # Type: float, range [0, 1]

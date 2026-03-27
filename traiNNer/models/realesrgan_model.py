@@ -209,19 +209,12 @@ class RealESRGANModel(SRModel):
             return
 
         assert self.gt is not None
-        assert self.lq is not None
 
         if RNG.get_rng().uniform() >= self.opt.otf_shared_hf_noise_prob:
             return
 
         shared_noise = self._generate_shared_hf_noise(self.gt)
         self.gt = torch.clamp(self.gt + shared_noise, 0, 1)
-        shared_noise_lq = resize_pt(
-            shared_noise,
-            size=self.lq.shape[-2:],
-            mode="nearest-exact",
-        )
-        self.lq = torch.clamp(self.lq + shared_noise_lq, 0, 1)
 
     @torch.no_grad()
     def feed_data(self, data: DataFeed) -> None:
