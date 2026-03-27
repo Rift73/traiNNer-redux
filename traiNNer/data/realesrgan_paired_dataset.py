@@ -31,10 +31,14 @@ class RealESRGANPairedDataset(BaseDataset):
         super().__init__(opt)
 
         self.otf_dataset = RealESRGANDataset(deepcopy(opt))
-        self.paired_dataset = PairedImageDataset(deepcopy(opt))
+
+        paired_opt = deepcopy(opt)
+        if paired_opt.paired_dataroot_gt is not None:
+            paired_opt.dataroot_gt = paired_opt.paired_dataroot_gt
+        self.paired_dataset = PairedImageDataset(paired_opt)
 
     def __getitem__(self, index: int) -> DataFeed:
-        paired = self.paired_dataset[index]
+        paired = self.paired_dataset[index % len(self.paired_dataset)]
         otf = self.otf_dataset[index]
 
         paired = {f"paired_{k}": v for k, v in paired.items()}

@@ -162,6 +162,89 @@ def paired_random_crop(
 
 
 @overload
+def paired_random_crop_multi_gt(
+    img_gts: list[np.ndarray],
+    img_lq: np.ndarray,
+    gt_patch_size: int,
+    scale: int,
+    gt_path: str | None = None,
+) -> tuple[list[np.ndarray], np.ndarray]: ...
+
+
+@overload
+def paired_random_crop_multi_gt(
+    img_gts: list[Tensor],
+    img_lq: Tensor,
+    gt_patch_size: int,
+    scale: int,
+    gt_path: str | None = None,
+) -> tuple[list[Tensor], Tensor]: ...
+
+
+def paired_random_crop_multi_gt(
+    img_gts: list[np.ndarray] | list[Tensor],
+    img_lq: np.ndarray | Tensor,
+    gt_patch_size: int,
+    scale: int,
+    gt_path: str | None = None,
+) -> tuple[list[np.ndarray], np.ndarray] | tuple[list[Tensor], Tensor]:
+    """Paired random crop for one LQ image and multiple aligned GT images.
+
+    All GT tensors/arrays must share the same size and stay aligned with the LQ image.
+    The same crop coordinates are applied to every GT.
+    """
+
+    if not img_gts:
+        raise ValueError("img_gts must contain at least one GT image")
+
+    first_gt = img_gts[0]
+    if isinstance(first_gt, Tensor):
+        assert isinstance(img_lq, Tensor)
+        h_lq, w_lq = img_lq.size()[-2:]
+        h_gt, w_gt = first_gt.size()[-2:]
+    else:
+        assert isinstance(img_lq, np.ndarray)
+        h_lq, w_lq = img_lq.shape[0:2]
+        h_gt, w_gt = first_gt.shape[0:2]
+
+    lq_patch_size = gt_patch_size // scale
+
+    if h_gt != h_lq * scale or w_gt != w_lq * scale:
+        raise ValueError(
+            f"Scale mismatches. GT ({h_gt}, {w_gt}) is not {scale}x ",
+            f"multiplication of LQ ({h_lq}, {w_lq}). {gt_path}",
+        )
+    if h_lq < lq_patch_size or w_lq < lq_patch_size:
+        raise ValueError(
+            f"LQ ({h_lq}, {w_lq}) is smaller than patch size "
+            f"({lq_patch_size}, {lq_patch_size}). "
+            f"Please remove {gt_path}."
+        )
+
+    top = random.randint(0, h_lq - lq_patch_size)
+    left = random.randint(0, w_lq - lq_patch_size)
+
+    if isinstance(img_lq, Tensor):
+        img_lq = img_lq[:, :, top : top + lq_patch_size, left : left + lq_patch_size]
+    else:
+        img_lq = img_lq[top : top + lq_patch_size, left : left + lq_patch_size, ...]
+
+    top_gt, left_gt = int(top * scale), int(left * scale)
+    cropped_gts = []
+    for gt in img_gts:
+        if isinstance(gt, Tensor):
+            cropped_gts.append(
+                gt[:, :, top_gt : top_gt + gt_patch_size, left_gt : left_gt + gt_patch_size]
+            )
+        else:
+            cropped_gts.append(
+                gt[top_gt : top_gt + gt_patch_size, left_gt : left_gt + gt_patch_size, ...]
+            )
+
+    return cropped_gts, img_lq  # type: ignore
+
+
+@overload
 def paired_random_crop_list(
     img_gts: list[np.ndarray],
     img_lqs: list[np.ndarray],

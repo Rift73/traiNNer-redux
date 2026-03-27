@@ -32,6 +32,14 @@ class RealESRGANPairedModel(RealESRGANModel):
 
     @torch.no_grad()
     def feed_data(self, data: DataFeed) -> None:
+        # Validation data has no paired_/otf_ prefixes — pass through directly
+        has_prefixed = any(
+            k.startswith(("paired_", "otf_")) for k in data.keys()
+        )
+        if not has_prefixed:
+            super().feed_data(data)  # type: ignore
+            return
+
         if RNG.get_rng().uniform() < self.dataroot_lq_prob:
             # paired feed data
             new_data = {

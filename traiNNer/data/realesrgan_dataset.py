@@ -9,7 +9,12 @@ import torch
 
 from traiNNer.data.base_dataset import BaseDataset
 from traiNNer.data.degradations import circular_lowpass_kernel, random_mixed_kernels
-from traiNNer.data.transforms import augment_vips, single_random_crop_vips
+from traiNNer.data.transforms import (
+    augment_vips,
+    augment_vips_pair,
+    single_crop_vips,
+    single_random_crop_vips,
+)
 from traiNNer.utils import (
     RNG,
     FileClient,
@@ -50,8 +55,23 @@ class RealESRGANDataset(BaseDataset):
         assert isinstance(self.gt_folders, list), (
             f"dataroot_gt must be a list of folders for dataset {opt.name}"
         )
+        self.target_gt_folders = opt.target_dataroot_gt
+        self.target_paths: list[str] | None = None
+
+        if self.target_gt_folders is not None:
+            assert isinstance(self.target_gt_folders, list), (
+                f"target_dataroot_gt must be a list of folders for dataset {opt.name}"
+            )
+            if len(self.target_gt_folders) != len(self.gt_folders):
+                raise ValueError(
+                    "target_dataroot_gt must have the same number of roots as dataroot_gt"
+                )
 
         if self.io_backend_opt["type"] == "lmdb":
+            if self.target_gt_folders is not None:
+                raise NotImplementedError(
+                    "target_dataroot_gt is not supported with lmdb datasets."
+                )
             self.io_backend_opt["db_paths"] = self.gt_folders
             self.io_backend_opt["client_keys"] = ["gt"] * len(self.gt_folders)
 
@@ -68,14 +88,31 @@ class RealESRGANDataset(BaseDataset):
 
         elif self.opt.meta_info is not None:
             self.paths = []
-            for folder in self.gt_folders:
+            if self.target_gt_folders is not None:
+                self.target_paths = []
+            for folder_idx, folder in enumerate(self.gt_folders):
                 with open(self.opt.meta_info) as fin:
-                    paths = [line.strip().split(" ")[0] for line in fin]
-                    self.paths.extend([os.path.join(folder, v) for v in paths])
+                    relative_paths = [line.strip().split(" ")[0] for line in fin]
+                    self.paths.extend([os.path.join(folder, v) for v in relative_paths])
+                    if self.target_paths is not None:
+                        assert self.target_gt_folders is not None
+                        target_folder = self.target_gt_folders[folder_idx]
+                        self.target_paths.extend(
+                            [os.path.join(target_folder, v) for v in relative_paths]
+                        )
         else:
             self.paths = []
-            for folder in self.gt_folders:
-                self.paths.extend(sorted(scandir(folder, full_path=True)))
+            if self.target_gt_folders is not None:
+                self.target_paths = []
+            for folder_idx, folder in enumerate(self.gt_folders):
+                relative_paths = sorted(scandir(folder, full_path=False, recursive=True))
+                self.paths.extend([os.path.join(folder, v) for v in relative_paths])
+                if self.target_paths is not None:
+                    assert self.target_gt_folders is not None
+                    target_folder = self.target_gt_folders[folder_idx]
+                    self.target_paths.extend(
+                        [os.path.join(target_folder, v) for v in relative_paths]
+                    )
 
         # blur settings for the first degradation
         self.blur_kernel_size = opt.blur_kernel_size
@@ -126,13 +163,32 @@ class RealESRGANDataset(BaseDataset):
         assert self.opt.use_rot is not None
 
         vips_img_gt = vipsimfrompath(gt_path)
+        target_gt_path = None
+        vips_img_target = None
+        if self.target_paths is not None:
+            target_gt_path = self.target_paths[index]
+            vips_img_target = vipsimfrompath(target_gt_path)
 
         # -------------------- Do augmentation for training: flip, rotation -------------------- #
-        vips_img_gt = augment_vips(vips_img_gt, self.opt.use_hflip, self.opt.use_rot)
+        if vips_img_target is not None:
+            vips_img_gt, vips_img_target = augment_vips_pair(
+                (vips_img_gt, vips_img_target), self.opt.use_hflip, self.opt.use_rot
+            )
+        else:
+            vips_img_gt = augment_vips(vips_img_gt, self.opt.use_hflip, self.opt.use_rot)
 
         h: int = vips_img_gt.height  # type: ignore
         w: int = vips_img_gt.width  # type: ignore
         assert self.opt.gt_size is not None
+
+        if vips_img_target is not None:
+            target_h: int = vips_img_target.height  # type: ignore
+            target_w: int = vips_img_target.width  # type: ignore
+            if target_h != h or target_w != w:
+                raise ValueError(
+                    f"target GT size mismatch for {target_gt_path}: "
+                    f"expected ({h}, {w}), got ({target_h}, {target_w})"
+                )
 
         crop_pad_size = self.opt.gt_size + 32
         # pad
@@ -140,11 +196,25 @@ class RealESRGANDataset(BaseDataset):
             pad_h = max(0, crop_pad_size - h)
             pad_w = max(0, crop_pad_size - w)
             vips_img_gt: pyvips.Image = vips_img_gt.embed(0, 0, w + pad_w, h + pad_h)  # type: ignore
+            if vips_img_target is not None:
+                vips_img_target = vips_img_target.embed(
+                    0, 0, w + pad_w, h + pad_h
+                )  # type: ignore
         # crop
         if w > crop_pad_size or h > crop_pad_size:
-            img_gt = single_random_crop_vips(vips_img_gt, crop_pad_size)
+            if vips_img_target is not None:
+                y = random.randint(0, h - crop_pad_size)
+                x = random.randint(0, w - crop_pad_size)
+                img_gt = single_crop_vips(vips_img_gt, crop_pad_size, x, y, gt_path)
+                img_target = single_crop_vips(
+                    vips_img_target, crop_pad_size, x, y, target_gt_path
+                )
+            else:
+                img_gt = single_random_crop_vips(vips_img_gt, crop_pad_size)
         else:
             img_gt = img2rgb(vips_img_gt.numpy())
+            if vips_img_target is not None:
+                img_target = img2rgb(vips_img_target.numpy())
 
         # ------------------------ Generate kernels (used in the first degradation) ------------------------ #
         kernel_size = random.choice(self.kernel_range)
@@ -210,13 +280,20 @@ class RealESRGANDataset(BaseDataset):
         kernel = torch.FloatTensor(kernel)
         kernel2 = torch.FloatTensor(kernel2)
 
-        return {
+        output = {
             "gt": img_gt,
             "kernel1": kernel,
             "kernel2": kernel2,
             "sinc_kernel": sinc_kernel,
             "gt_path": gt_path,
         }
+        if vips_img_target is not None:
+            output["target_gt"] = img2tensor(
+                img_target, from_bgr=False, float32=True
+            )
+            output["target_gt_path"] = target_gt_path
+
+        return output
 
     def __len__(self) -> int:
         return len(self.paths)

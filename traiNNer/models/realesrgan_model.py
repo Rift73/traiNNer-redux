@@ -13,7 +13,7 @@ from traiNNer.data.degradations import (
     random_add_poisson_noise_pt,
     resize_pt,
 )
-from traiNNer.data.transforms import paired_random_crop
+from traiNNer.data.transforms import paired_random_crop, paired_random_crop_multi_gt
 from traiNNer.models.sr_model import SRModel
 from traiNNer.utils import RNG, DiffJPEG, get_root_logger
 from traiNNer.utils.img_process_util import USMSharp, filter2d
@@ -117,6 +117,112 @@ class RealESRGANModel(SRModel):
             )
             self.queue_ptr = self.queue_ptr + b
 
+    def _sample_beta_noise(
+        self,
+        channels: int,
+        height: int,
+        width: int,
+        shape_a: Tensor,
+        shape_b: Tensor,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tensor:
+        distribution = torch.distributions.Beta(
+            shape_a.view(-1, 1, 1, 1).expand(-1, channels, height, width),
+            shape_b.view(-1, 1, 1, 1).expand(-1, channels, height, width),
+        )
+        return distribution.sample().to(device=device, dtype=dtype)
+
+    def _generate_shared_hf_noise(self, img: Tensor) -> Tensor:
+        batch_size, channels, height, width = img.shape
+        rng = RNG.get_rng()
+        sample_dtype = torch.float32
+        device = img.device
+
+        shape_a = torch.as_tensor(
+            rng.uniform(*self.opt.otf_shared_hf_noise_beta_shape_range, size=batch_size),
+            device=device,
+            dtype=sample_dtype,
+        )
+        if self.opt.otf_shared_hf_noise_beta_offset_range is not None:
+            shape_b = shape_a + torch.as_tensor(
+                rng.uniform(
+                    *self.opt.otf_shared_hf_noise_beta_offset_range, size=batch_size
+                ),
+                device=device,
+                dtype=sample_dtype,
+            )
+        else:
+            shape_b = torch.as_tensor(
+                rng.uniform(
+                    *self.opt.otf_shared_hf_noise_beta_shape_range, size=batch_size
+                ),
+                device=device,
+                dtype=sample_dtype,
+            )
+        alpha = torch.as_tensor(
+            rng.uniform(*self.opt.otf_shared_hf_noise_alpha_range, size=batch_size),
+            device=device,
+            dtype=sample_dtype,
+        ).view(-1, 1, 1, 1)
+
+        noise = self._sample_beta_noise(
+            channels,
+            height,
+            width,
+            shape_a,
+            shape_b,
+            sample_dtype,
+            device,
+        )
+
+        if channels > 1 and self.opt.otf_shared_hf_noise_gray_prob > 0:
+            gray_mask = torch.as_tensor(
+                rng.uniform(size=batch_size) < self.opt.otf_shared_hf_noise_gray_prob,
+                device=device,
+                dtype=torch.bool,
+            )
+            gray_count = int(gray_mask.sum().item())
+            if gray_count > 0:
+                gray_noise = self._sample_beta_noise(
+                    1,
+                    height,
+                    width,
+                    shape_a[gray_mask],
+                    shape_b[gray_mask],
+                    sample_dtype,
+                    device,
+                ).expand(-1, channels, -1, -1)
+                noise[gray_mask] = gray_noise
+
+        if self.opt.otf_shared_hf_noise_normalize:
+            noise = noise - noise.mean(dim=(1, 2, 3), keepdim=True)
+            noise = noise / (noise.std(dim=(1, 2, 3), keepdim=True) + 1e-6)
+            noise = torch.clamp(noise, -3, 3) * alpha
+        else:
+            noise = (noise - 0.5) * (2 * alpha)
+
+        return noise.to(dtype=img.dtype)
+
+    def _apply_shared_hf_noise(self) -> None:
+        if self.opt.otf_shared_hf_noise_prob <= 0:
+            return
+
+        assert self.gt is not None
+        assert self.lq is not None
+
+        if RNG.get_rng().uniform() >= self.opt.otf_shared_hf_noise_prob:
+            return
+
+        shared_noise = self._generate_shared_hf_noise(self.gt)
+        self.gt = torch.clamp(self.gt + shared_noise, 0, 1)
+        shared_noise_lq = resize_pt(
+            shared_noise,
+            size=self.lq.shape[-2:],
+            mode="nearest-exact",
+        )
+        self.lq = torch.clamp(self.lq + shared_noise_lq, 0, 1)
+
     @torch.no_grad()
     def feed_data(self, data: DataFeed) -> None:
         """Accept data from dataloader, and then add two-order degradations to obtain LQ images."""
@@ -128,25 +234,48 @@ class RealESRGANModel(SRModel):
                 and "sinc_kernel" in data
             )
             # training data synthesis
-            self.gt = data["gt"].to(
-                self.device,
-                memory_format=self.memory_format,
-                non_blocking=True,
-            )
-            self.kernel1 = data["kernel1"].to(
-                self.device,
-                non_blocking=True,
-            )
-            self.kernel2 = data["kernel2"].to(
-                self.device,
-                non_blocking=True,
-            )
-            self.sinc_kernel = data["sinc_kernel"].to(
-                self.device,
-                non_blocking=True,
-            )
+            gt_source = data["gt"]
+            if gt_source.device != self.device:
+                gt_source = gt_source.to(
+                    self.device,
+                    memory_format=self.memory_format,
+                    non_blocking=True,
+                )
+            target_gt = data.get("target_gt")
+            if target_gt is not None and target_gt.device != self.device:
+                target_gt = target_gt.to(
+                    self.device,
+                    memory_format=self.memory_format,
+                    non_blocking=True,
+                )
 
-            ori_h, ori_w = self.gt.size()[2:4]
+            self.gt = target_gt if target_gt is not None else gt_source
+
+            kernel1 = data["kernel1"]
+            if kernel1.device != self.device:
+                kernel1 = kernel1.to(
+                    self.device,
+                    non_blocking=True,
+                )
+            self.kernel1 = kernel1
+
+            kernel2 = data["kernel2"]
+            if kernel2.device != self.device:
+                kernel2 = kernel2.to(
+                    self.device,
+                    non_blocking=True,
+                )
+            self.kernel2 = kernel2
+
+            sinc_kernel = data["sinc_kernel"]
+            if sinc_kernel.device != self.device:
+                sinc_kernel = sinc_kernel.to(
+                    self.device,
+                    non_blocking=True,
+                )
+            self.sinc_kernel = sinc_kernel
+
+            ori_h, ori_w = gt_source.size()[2:4]
 
             # ----------------------- The first degradation process ----------------------- #
             if self.opt.lq_usm:
@@ -159,9 +288,9 @@ class RealESRGANModel(SRModel):
                     memory_format=self.memory_format,
                     non_blocking=True,
                 )  # pyright: ignore[reportCallIssue] # https://github.com/pytorch/pytorch/issues/131765
-                out = usm_sharpener(self.gt)
+                out = usm_sharpener(gt_source)
             else:
-                out = self.gt
+                out = gt_source
 
             # thick lines
             if RNG.get_rng().uniform() < self.opt.thicklines_prob:
@@ -319,9 +448,16 @@ class RealESRGANModel(SRModel):
             # random crop
             gt_size = self.opt.datasets["train"].gt_size
             assert gt_size is not None
-            self.gt, self.lq = paired_random_crop(
-                self.gt, self.lq, gt_size, self.opt.scale
-            )
+            if target_gt is not None:
+                cropped_gts, self.lq = paired_random_crop_multi_gt(
+                    [self.gt, gt_source], self.lq, gt_size, self.opt.scale
+                )
+                self.gt = cropped_gts[0]
+            else:
+                self.gt, self.lq = paired_random_crop(
+                    self.gt, self.lq, gt_size, self.opt.scale
+                )
+            self._apply_shared_hf_noise()
 
             # training pair pool
             self._dequeue_and_enqueue()

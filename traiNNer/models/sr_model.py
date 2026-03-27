@@ -1,7 +1,9 @@
 import os
+import re
 import shutil
 import warnings
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from os import path as osp
 from typing import Any
 
@@ -23,6 +25,7 @@ from traiNNer.archs.arch_info import ARCHS_WITHOUT_FP16
 from traiNNer.data.base_dataset import BaseDataset
 from traiNNer.losses import build_loss
 from traiNNer.metrics import calculate_metric
+from traiNNer.metrics.psnr_ssim import calculate_psnr_pt, calculate_ssim_pt
 from traiNNer.models.base_model import BaseModel
 from traiNNer.utils import get_root_logger, imwrite, tensor2img
 from traiNNer.utils.color_util import pixelformat2rgb_pt, rgb2pixelformat_pt
@@ -390,21 +393,61 @@ class SRModel(BaseModel):
 
         print("WARNING: Could not find layer to register entropy hook")
 
+    def _invalidate_reparam_eval_cache(self, module: nn.Module) -> None:
+        # Re-parameterized blocks (e.g. Conv3XC) cache fused eval kernels.
+        # EMA mutates weights outside training forward, so force cache refresh.
+        for submodule in module.modules():
+            if hasattr(submodule, "update_params_flag"):
+                submodule.update_params_flag = False  # pyright: ignore[reportAttributeAccessIssue]
+            if hasattr(submodule, "_cached_param_versions"):
+                submodule._cached_param_versions = None  # pyright: ignore[reportAttributeAccessIssue]
+
     def setup_optimizers(self) -> None:
         train_opt = self.opt.train
         assert train_opt is not None
         # assert train_opt.optim_g is not None
         optim_params = []
         logger = get_root_logger()
+        include_patterns = train_opt.optim_include_params_g or []
+        exclude_patterns = train_opt.optim_exclude_params_g or []
+
+        try:
+            include_regexes = [re.compile(pattern) for pattern in include_patterns]
+            exclude_regexes = [re.compile(pattern) for pattern in exclude_patterns]
+        except re.error as exc:
+            raise ValueError(f"Invalid generator optimizer parameter regex: {exc}") from exc
+
+        def _selected_for_optim(name: str) -> bool:
+            if include_regexes and not any(regex.search(name) for regex in include_regexes):
+                return False
+            if exclude_regexes and any(regex.search(name) for regex in exclude_regexes):
+                return False
+            return True
 
         if train_opt.optim_g is not None:
+            filtered_trainable: list[str] = []
             for k, v in self.net_g.named_parameters():
                 if v.requires_grad:
-                    optim_params.append(v)
+                    if _selected_for_optim(k):
+                        optim_params.append(v)
+                    else:
+                        filtered_trainable.append(k)
                 elif "eval_" in k:
                     pass  # intentionally frozen for reparameterization, skip warning
                 else:
                     logger.warning("Params %s will not be optimized.", k)
+
+            if (include_patterns or exclude_patterns) and filtered_trainable:
+                logger.info(
+                    "Filtered %d trainable generator params from optimizer, up to 10 shown:",
+                    len(filtered_trainable),
+                )
+                for name in filtered_trainable[:10]:
+                    logger.info("    %s", name)
+            if (include_patterns or exclude_patterns) and len(optim_params) == 0:
+                raise ValueError(
+                    "Generator optimizer parameter filters excluded all trainable parameters."
+                )
 
             self.optimizer_g = self.get_optimizer(optim_params, train_opt.optim_g)
             self.optimizers.append(self.optimizer_g)
@@ -572,6 +615,8 @@ class SRModel(BaseModel):
                     logger.warning(
                         "NaN/Inf in loss (count: %d), skipping update", self.nan_count
                     )
+                    if self.optimizer_g is not None:
+                        self.optimizer_g.zero_grad()
                     return  # skip this iteration
                 else:
                     self.nan_count = 0
@@ -679,6 +724,7 @@ class SRModel(BaseModel):
         if self.net_g_ema is not None and apply_gradient:
             if not (self.use_amp and self.optimizers_skipped[0]):
                 self.net_g_ema.update()
+                self._invalidate_reparam_eval_cache(self.net_g_ema.ema_model)
 
     def infer_tiled(self, net: nn.Module, lq: torch.Tensor) -> torch.Tensor:
         assert self.opt.val is not None
@@ -771,10 +817,20 @@ class SRModel(BaseModel):
 
             assert self.opt.val is not None
             with torch.inference_mode():
+                # During training with torch.compile, run validation forward on
+                # the eager module to avoid compile cache growth from varied
+                # validation input shapes.
+                inference_net = (
+                    self.get_bare_model(net)
+                    if self.is_train and self.use_compile
+                    else net
+                )
+                inference_net.eval()  # pyright: ignore[reportUnusedExpression]
+
                 if self.opt.val.tile_size > 0:
-                    tmp_out = self.infer_tiled(net, lq)
+                    tmp_out = self.infer_tiled(inference_net, lq)
                 else:
-                    tmp_out = net(lq)
+                    tmp_out = inference_net(lq)
                 self.output = pixelformat2rgb_pt(
                     tmp_out, self.gt, self.opt.output_pixel_format
                 )
@@ -844,36 +900,108 @@ class SRModel(BaseModel):
 
         gt_key = "img2"
         run_metrics = self.with_metrics
+        metrics_cfg = self.opt.val.metrics if run_metrics else None
+        save_executor: ThreadPoolExecutor | None = None
+        save_futures = []
+        if save_img:
+            # Overlap PNG encoding/writes with next validation iterations.
+            max_save_workers = max(1, min(8, (os.cpu_count() or 1) // 2))
+            save_executor = ThreadPoolExecutor(
+                max_workers=max_save_workers, thread_name_prefix="valsave"
+            )
+
+        # Fast path for built-in PSNR/SSIM: compute directly on tensors to avoid
+        # expensive tensor->numpy conversions per validation image.
+        tensor_metric_cfg: dict[str, tuple[str, int, bool]] = {}
+        fallback_metric_cfg: dict[str, dict[str, Any]] = {}
+        if run_metrics and metrics_cfg is not None:
+            for metric_name, metric_opt in metrics_cfg.items():
+                metric_type = metric_opt.get("type")
+                if metric_type == "calculate_psnr":
+                    tensor_metric_cfg[metric_name] = (
+                        "psnr",
+                        int(metric_opt.get("crop_border", 0)),
+                        bool(metric_opt.get("test_y_channel", False)),
+                    )
+                elif metric_type == "calculate_ssim":
+                    tensor_metric_cfg[metric_name] = (
+                        "ssim",
+                        int(metric_opt.get("crop_border", 0)),
+                        bool(metric_opt.get("test_y_channel", False)),
+                    )
+                else:
+                    fallback_metric_cfg[metric_name] = metric_opt
+
+            if tensor_metric_cfg:
+                logger.info(
+                    "Validation metric fast path enabled for %s.",
+                    ", ".join(tensor_metric_cfg.keys()),
+                )
 
         for val_data in dataloader:
             img_name = osp.splitext(osp.basename(val_data["lq_path"][0]))[0]
             self.feed_data(val_data)
             self.test()
 
-            visuals = self.get_current_visuals()
-            sr_img = tensor2img(
-                visuals["result"],
-                to_bgr=False,
-            )
-            metric_data["img"] = sr_img
-            if "gt" in visuals:
-                gt_img = tensor2img(
-                    visuals["gt"],
-                    to_bgr=False,
+            assert self.output is not None
+            output_tensor = self.output
+            gt_tensor = self.gt
+            sr_img = None
+
+            # Fast tensor metrics (PSNR/SSIM).
+            if run_metrics and gt_tensor is not None and tensor_metric_cfg:
+                # Match legacy metric semantics used by tensor2img() + numpy metrics:
+                # clamp to [0, 1], then quantize to uint8 grid.
+                output_metric_tensor = (
+                    torch.round(output_tensor.detach().float().clamp(0, 1) * 255.0)
+                    / 255.0
                 )
-                metric_data[gt_key] = gt_img
-                self.gt = None
-            # else:
-            #     run_metrics = False
+                gt_metric_tensor = (
+                    torch.round(gt_tensor.detach().float().clamp(0, 1) * 255.0) / 255.0
+                )
+                for metric_name, (
+                    metric_kind,
+                    crop_border,
+                    test_y_channel,
+                ) in tensor_metric_cfg.items():
+                    if metric_kind == "psnr":
+                        metric_val = calculate_psnr_pt(
+                            output_metric_tensor,
+                            gt_metric_tensor,
+                            crop_border=crop_border,
+                            test_y_channel=test_y_channel,
+                        )
+                    else:
+                        metric_val = calculate_ssim_pt(
+                            output_metric_tensor,
+                            gt_metric_tensor,
+                            crop_border=crop_border,
+                            test_y_channel=test_y_channel,
+                        )
+                    self.metric_results[metric_name] += float(metric_val.mean().item())
+
+            # Fallback metrics keep existing numpy path.
+            if run_metrics and fallback_metric_cfg:
+                metric_data.clear()
+                sr_img = tensor2img(output_tensor, to_bgr=False)
+                metric_data["img"] = sr_img
+                if gt_tensor is not None:
+                    metric_data[gt_key] = tensor2img(gt_tensor, to_bgr=False)
+                for name, opt_ in fallback_metric_cfg.items():
+                    result = calculate_metric(metric_data, opt_, self.device)
+                    self.metric_results[name] += result
 
             # tentative for out of GPU memory
             self.lq = None
+            self.gt = None
             self.output = None
             torch.cuda.empty_cache()
 
             save_img_dir = None
 
             if save_img:
+                if sr_img is None:
+                    sr_img = tensor2img(output_tensor, to_bgr=False)
                 if self.opt.is_train:
                     if multi_val_datasets:
                         save_img_dir = osp.join(
@@ -922,7 +1050,15 @@ class SRModel(BaseModel):
                         dataset_name,
                         f"{img_name}.png",
                     )
-                imwrite(cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR), save_img_path)
+                if save_img_dir is not None:
+                    os.makedirs(save_img_dir, exist_ok=True)
+                sr_img_bgr = cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR)
+                if save_executor is not None:
+                    save_futures.append(
+                        save_executor.submit(imwrite, sr_img_bgr, save_img_path)
+                    )
+                else:
+                    imwrite(sr_img_bgr, save_img_path)
                 if (
                     self.opt.is_train
                     and not self.first_val_completed
@@ -931,20 +1067,26 @@ class SRModel(BaseModel):
                     assert save_img_dir is not None
                     lr_img_target_path = osp.join(save_img_dir, f"{img_name}_lr.png")
                     if not os.path.exists(lr_img_target_path):
-                        shutil.copy(val_data["lq_path"][0], lr_img_target_path)
+                        if save_executor is not None:
+                            save_futures.append(
+                                save_executor.submit(
+                                    shutil.copy, val_data["lq_path"][0], lr_img_target_path
+                                )
+                            )
+                        else:
+                            shutil.copy(val_data["lq_path"][0], lr_img_target_path)
 
-            if run_metrics:
-                # calculate metrics
-                assert self.opt.val.metrics is not None
-                for name, opt_ in self.opt.val.metrics.items():
-                    result = calculate_metric(metric_data, opt_, self.device)
-                    # logger.info("%d %s/%s: %f", current_iter, name, img_name, result)
-                    self.metric_results[name] += result
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_description(f"Test {img_name}")
         if pbar is not None:
             pbar.close()
+
+        if save_executor is not None:
+            for future in save_futures:
+                # Propagate write/copy errors before finishing validation.
+                future.result()
+            save_executor.shutdown(wait=True)
 
         if run_metrics:
             for metric in self.metric_results.keys():
