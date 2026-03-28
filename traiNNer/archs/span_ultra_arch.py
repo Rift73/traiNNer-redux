@@ -100,10 +100,16 @@ class Conv3XC(nn.Module):
             nn.Conv2d(c_out * gain, c_out, 1, bias=bias),
         )
 
-        # Fused inference conv (populated by update_params)
-        self.fused_conv = nn.Conv2d(c_in, c_out, 3, padding=1, stride=s, bias=bias)
-        self.fused_conv.weight.requires_grad = False
-        self.fused_conv.bias.requires_grad = False  # type: ignore[union-attr]
+        self.eval_conv = nn.Conv2d(
+            in_channels=c_in,
+            out_channels=c_out,
+            kernel_size=3,
+            padding=1,
+            stride=s,
+            bias=bias,
+        )
+        self.eval_conv.weight.requires_grad = False
+        self.eval_conv.bias.requires_grad = False  # type: ignore[union-attr]
         self.update_params()
 
     def update_params(self) -> None:
@@ -136,8 +142,8 @@ class Conv3XC(nn.Module):
         sk_b = self.sk.bias.data.clone().detach()  # type: ignore[union-attr]
         sk_w = F.pad(sk_w, [1, 1, 1, 1])
 
-        self.fused_conv.weight.data = (weight_concat + sk_w).contiguous()
-        self.fused_conv.bias.data = (bias_concat + sk_b).contiguous()  # type: ignore[union-attr]
+        self.eval_conv.weight.data = (weight_concat + sk_w).contiguous()
+        self.eval_conv.bias.data = (bias_concat + sk_b).contiguous()  # type: ignore[union-attr]
 
     def forward(self, x: Tensor) -> Tensor:
         if self.training:
@@ -145,7 +151,7 @@ class Conv3XC(nn.Module):
             out = self.conv(x_pad) + self.sk(x)
         else:
             self.update_params()
-            out = self.fused_conv(x)
+            out = self.eval_conv(x)
 
         if self.has_act:
             out = F.leaky_relu(out, negative_slope=0.05)
