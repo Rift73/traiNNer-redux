@@ -588,6 +588,142 @@ class ReduxOptions(StrictStruct):
         ),
     ] = 1
 
+    # ── Dithering (applied after crop, before dequeue — last degradation) ──────
+    dithering_prob: Annotated[
+        float,
+        Meta(
+            description="Probability of applying dithering to the LQ, between 0 and 1. Applied after crop as the last degradation step."
+        ),
+    ] = 0
+    dithering_types: Annotated[
+        list[str],
+        Meta(
+            description="List of dithering algorithms to choose from. Options: quantize, floydsteinberg, jarvisjudiceninke, stucki, atkinson, burkes, sierra, tworowsierra, sierralite, order, riemersma."
+        ),
+    ] = field(default_factory=lambda: ["quantize"])
+    dithering_quantize_range: Annotated[
+        tuple[int, int],
+        Meta(
+            description="Range of quantization levels per channel for dithering, in the format `[min_levels, max_levels]`."
+        ),
+    ] = (2, 10)
+    dithering_map_size: Annotated[
+        list[int],
+        Meta(
+            description="List of map sizes to choose from for ordered dithering."
+        ),
+    ] = field(default_factory=lambda: [4, 8])
+    dithering_history_range: Annotated[
+        tuple[int, int],
+        Meta(
+            description="Range of history values for Riemersma dithering."
+        ),
+    ] = (10, 15)
+    dithering_ratio_range: Annotated[
+        tuple[float, float],
+        Meta(
+            description="Range of decay ratio values for Riemersma dithering."
+        ),
+    ] = (0.1, 0.9)
+
+    # ── Channel Shift (applied before resize1) ────────────────────────────────
+    shift_prob: Annotated[
+        float,
+        Meta(
+            description="Probability of applying channel shift to the LQ, between 0 and 1. Applied before the first resize."
+        ),
+    ] = 0
+    shift_types: Annotated[
+        list[str],
+        Meta(
+            description="List of color spaces to apply shift in. One is randomly selected. Options: rgb, yuv, cmyk."
+        ),
+    ] = field(default_factory=lambda: ["rgb"])
+    shift_percent: Annotated[
+        bool,
+        Meta(
+            description="If true, shift amounts are percentages of image dimensions. If false, shift amounts are in pixels."
+        ),
+    ] = False
+    shift_rgb_r: Annotated[
+        list[list[int]],
+        Meta(description="Shift range for R channel: [[x_min, x_max], [y_min, y_max]]."),
+    ] = field(default_factory=lambda: [[0, 0], [0, 0]])
+    shift_rgb_g: Annotated[
+        list[list[int]],
+        Meta(description="Shift range for G channel: [[x_min, x_max], [y_min, y_max]]."),
+    ] = field(default_factory=lambda: [[0, 0], [0, 0]])
+    shift_rgb_b: Annotated[
+        list[list[int]],
+        Meta(description="Shift range for B channel: [[x_min, x_max], [y_min, y_max]]."),
+    ] = field(default_factory=lambda: [[0, 0], [0, 0]])
+    shift_yuv_y: Annotated[
+        list[list[int]],
+        Meta(description="Shift range for Y channel (YUV): [[x_min, x_max], [y_min, y_max]]."),
+    ] = field(default_factory=lambda: [[0, 0], [0, 0]])
+    shift_yuv_u: Annotated[
+        list[list[int]],
+        Meta(description="Shift range for U channel (YUV): [[x_min, x_max], [y_min, y_max]]."),
+    ] = field(default_factory=lambda: [[0, 0], [0, 0]])
+    shift_yuv_v: Annotated[
+        list[list[int]],
+        Meta(description="Shift range for V channel (YUV): [[x_min, x_max], [y_min, y_max]]."),
+    ] = field(default_factory=lambda: [[0, 0], [0, 0]])
+    shift_cmyk_c: Annotated[
+        list[list[int]],
+        Meta(description="Shift range for C channel (CMYK): [[x_min, x_max], [y_min, y_max]]."),
+    ] = field(default_factory=lambda: [[0, 0], [0, 0]])
+    shift_cmyk_m: Annotated[
+        list[list[int]],
+        Meta(description="Shift range for M channel (CMYK): [[x_min, x_max], [y_min, y_max]]."),
+    ] = field(default_factory=lambda: [[0, 0], [0, 0]])
+    shift_cmyk_y: Annotated[
+        list[list[int]],
+        Meta(description="Shift range for Y channel (CMYK): [[x_min, x_max], [y_min, y_max]]."),
+    ] = field(default_factory=lambda: [[0, 0], [0, 0]])
+    shift_cmyk_k: Annotated[
+        list[list[int]],
+        Meta(description="Shift range for K channel (CMYK): [[x_min, x_max], [y_min, y_max]]."),
+    ] = field(default_factory=lambda: [[0, 0], [0, 0]])
+
+    # ── Chroma Subsampling (applied before resize1, after shift) ──────────────
+    subsampling_prob: Annotated[
+        float,
+        Meta(
+            description="Probability of applying chroma subsampling to the LQ, between 0 and 1. Applied before the first resize."
+        ),
+    ] = 0
+    subsampling_down_algorithms: Annotated[
+        list[str],
+        Meta(
+            description="List of downscaling algorithms to choose from for subsampling. Options: nearest, box, hermite, linear, lagrange, cubic_catrom, cubic_mitchell, cubic_bspline, lanczos, gauss."
+        ),
+    ] = field(default_factory=lambda: ["nearest"])
+    subsampling_up_algorithms: Annotated[
+        list[str],
+        Meta(
+            description="List of upscaling algorithms to choose from for subsampling."
+        ),
+    ] = field(default_factory=lambda: ["nearest"])
+    subsampling_formats: Annotated[
+        list[str],
+        Meta(
+            description="List of chroma subsampling formats to choose from. Options: 4:4:4, 4:2:2, 4:1:1, 4:2:0, 4:1:0, 4:4:0, 4:2:1, 4:1:2, 4:1:3."
+        ),
+    ] = field(default_factory=lambda: ["4:4:4"])
+    subsampling_blur_range: Annotated[
+        tuple[float, float] | None,
+        Meta(
+            description="Optional Gaussian blur sigma range for chroma channels after subsampling, in the format `[min_sigma, max_sigma]`. Null to disable."
+        ),
+    ] = None
+    subsampling_ycbcr_type: Annotated[
+        list[str],
+        Meta(
+            description="List of YCbCr standards to choose from. Options: 601, 709, 2020, 240."
+        ),
+    ] = field(default_factory=lambda: ["601"])
+
     lq_usm: Annotated[
         bool, Meta(description="Whether to enable unsharp mask on the LQ image.")
     ] = False
@@ -646,7 +782,7 @@ class ReduxOptions(StrictStruct):
     jpeg_prob: Annotated[
         float,
         Meta(
-            description="The probability of applying the first JPEG degradation to the LQ, between 0 and 1."
+            description="The probability of applying compression (JPEG or other configured algorithm) to the LQ in stage 1, between 0 and 1."
         ),
     ] = 1
     jpeg_range: Annotated[
@@ -655,6 +791,48 @@ class ReduxOptions(StrictStruct):
             description="The range of JPEG quality to apply for the first JPEG degradation, in the format `[min_quality, max_quality]`."
         ),
     ] = (75, 95)
+    compress_algorithms: Annotated[
+        list[str],
+        Meta(
+            description="List of compression algorithms to choose from in stage 1. One is randomly selected per iteration. Options: jpeg, webp, h264, hevc, mpeg2, mpeg4, vp9."
+        ),
+    ] = field(default_factory=lambda: ["jpeg"])
+    compress_algorithm_probs: Annotated[
+        list[float],
+        Meta(
+            description="Probability weights for each algorithm in compress_algorithms. Must match length of compress_algorithms."
+        ),
+    ] = field(default_factory=lambda: [1.0])
+    compress_webp_range: Annotated[
+        tuple[int, int],
+        Meta(description="Quality range for WebP compression in stage 1 (1-100)."),
+    ] = (50, 95)
+    compress_h264_range: Annotated[
+        tuple[int, int],
+        Meta(description="CRF range for H.264 compression in stage 1 (0-51, lower = better)."),
+    ] = (20, 40)
+    compress_hevc_range: Annotated[
+        tuple[int, int],
+        Meta(description="CRF range for HEVC compression in stage 1 (0-51, lower = better)."),
+    ] = (20, 40)
+    compress_mpeg2_range: Annotated[
+        tuple[int, int],
+        Meta(description="qscale range for MPEG-2 compression in stage 1 (1-31, lower = better)."),
+    ] = (2, 20)
+    compress_mpeg4_range: Annotated[
+        tuple[int, int],
+        Meta(description="qscale range for MPEG-4 compression in stage 1 (1-31, lower = better)."),
+    ] = (2, 20)
+    compress_vp9_range: Annotated[
+        tuple[int, int],
+        Meta(description="CRF range for VP9 compression in stage 1 (0-63, lower = better)."),
+    ] = (20, 50)
+    compress_video_sampling: Annotated[
+        list[str],
+        Meta(
+            description="List of video chroma subsampling options for video codecs in stage 1. Options: 444, 422, 420."
+        ),
+    ] = field(default_factory=lambda: ["444", "422", "420"])
 
     blur_prob2: Annotated[
         float,
@@ -698,7 +876,7 @@ class ReduxOptions(StrictStruct):
     jpeg_prob2: Annotated[
         float,
         Meta(
-            description="The probability of applying the second JPEG degradation to the LQ, between 0 and 1."
+            description="The probability of applying compression (JPEG or other configured algorithm) to the LQ in stage 2, between 0 and 1."
         ),
     ] = 1
     jpeg_range2: Annotated[
@@ -707,6 +885,48 @@ class ReduxOptions(StrictStruct):
             description="The range of JPEG quality to apply for the second JPEG degradation, in the format `[min_quality, max_quality]`."
         ),
     ] = field(default_factory=lambda: [75, 95])
+    compress_algorithms2: Annotated[
+        list[str],
+        Meta(
+            description="List of compression algorithms to choose from in stage 2. Same options as compress_algorithms."
+        ),
+    ] = field(default_factory=lambda: ["jpeg"])
+    compress_algorithm_probs2: Annotated[
+        list[float],
+        Meta(
+            description="Probability weights for each algorithm in compress_algorithms2."
+        ),
+    ] = field(default_factory=lambda: [1.0])
+    compress_webp_range2: Annotated[
+        tuple[int, int],
+        Meta(description="Quality range for WebP compression in stage 2 (1-100)."),
+    ] = (50, 95)
+    compress_h264_range2: Annotated[
+        tuple[int, int],
+        Meta(description="CRF range for H.264 compression in stage 2."),
+    ] = (20, 40)
+    compress_hevc_range2: Annotated[
+        tuple[int, int],
+        Meta(description="CRF range for HEVC compression in stage 2."),
+    ] = (20, 40)
+    compress_mpeg2_range2: Annotated[
+        tuple[int, int],
+        Meta(description="qscale range for MPEG-2 compression in stage 2."),
+    ] = (2, 20)
+    compress_mpeg4_range2: Annotated[
+        tuple[int, int],
+        Meta(description="qscale range for MPEG-4 compression in stage 2."),
+    ] = (2, 20)
+    compress_vp9_range2: Annotated[
+        tuple[int, int],
+        Meta(description="CRF range for VP9 compression in stage 2."),
+    ] = (20, 50)
+    compress_video_sampling2: Annotated[
+        list[str],
+        Meta(
+            description="List of video chroma subsampling options for video codecs in stage 2."
+        ),
+    ] = field(default_factory=lambda: ["444", "422", "420"])
 
     resize_mode_list3: Annotated[
         list[Literal["bilinear", "bicubic", "nearest-exact", "lanczos", "area"]],

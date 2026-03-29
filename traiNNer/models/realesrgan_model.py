@@ -13,6 +13,14 @@ from traiNNer.data.degradations import (
     random_add_poisson_noise_pt,
     resize_pt,
 )
+from traiNNer.data.otf_degradations import (
+    apply_dithering,
+    apply_per_image,
+    apply_shift,
+    apply_subsampling,
+    compress_video,
+    compress_webp,
+)
 from traiNNer.data.transforms import paired_random_crop, paired_random_crop_multi_gt
 from traiNNer.models.sr_model import SRModel
 from traiNNer.utils import RNG, DiffJPEG, get_root_logger
@@ -223,6 +231,119 @@ class RealESRGANModel(SRModel):
         )
         self.lq = torch.clamp(self.lq + shared_noise_lq, 0, 1)
 
+    def _apply_compression(self, out: Tensor, stage: int = 1) -> Tensor:
+        """Apply a randomly chosen compression algorithm.
+
+        Selects one algorithm from the configured list and applies it.
+        JPEG uses GPU DiffJPEG; all others use CPU numpy path.
+        """
+        algos = (
+            self.opt.compress_algorithms
+            if stage == 1
+            else self.opt.compress_algorithms2
+        )
+        probs = (
+            self.opt.compress_algorithm_probs
+            if stage == 1
+            else self.opt.compress_algorithm_probs2
+        )
+        algo = random.choices(algos, probs)[0]
+
+        if algo == "jpeg":
+            jpeg_range = self.opt.jpeg_range if stage == 1 else self.opt.jpeg_range2
+            jpeg_p = out.new_zeros(out.size(0)).uniform_(*jpeg_range)
+            out = torch.clamp(out, 0, 1)
+            out = self.jpeger(out, quality=jpeg_p)
+        elif algo == "webp":
+            quality_range = (
+                self.opt.compress_webp_range
+                if stage == 1
+                else self.opt.compress_webp_range2
+            )
+            quality = int(RNG.get_rng().integers(*quality_range))
+            out = torch.clamp(out, 0, 1)
+            out = apply_per_image(out, lambda img: compress_webp(img, quality))
+        elif algo in ("h264", "hevc", "mpeg2", "mpeg4", "vp9"):
+            range_attr = f"compress_{algo}_range{'2' if stage == 2 else ''}"
+            quality_range = getattr(self.opt, range_attr)
+            quality = int(RNG.get_rng().integers(*quality_range))
+            video_sampling = (
+                self.opt.compress_video_sampling
+                if stage == 1
+                else self.opt.compress_video_sampling2
+            )
+            out = torch.clamp(out, 0, 1)
+            out = apply_per_image(
+                out, lambda img: compress_video(img, algo, quality, video_sampling)
+            )
+        return out
+
+    def _apply_shift(self, out: Tensor) -> Tensor:
+        """Apply channel shift degradation."""
+        rng = RNG.get_rng()
+        shift_type = rng.choice(self.opt.shift_types)
+
+        if shift_type == "rgb":
+            amounts = [
+                self.opt.shift_rgb_r,
+                self.opt.shift_rgb_g,
+                self.opt.shift_rgb_b,
+            ]
+        elif shift_type == "yuv":
+            amounts = [
+                self.opt.shift_yuv_y,
+                self.opt.shift_yuv_u,
+                self.opt.shift_yuv_v,
+            ]
+        elif shift_type == "cmyk":
+            amounts = [
+                self.opt.shift_cmyk_c,
+                self.opt.shift_cmyk_m,
+                self.opt.shift_cmyk_y,
+                self.opt.shift_cmyk_k,
+            ]
+        else:
+            return out
+
+        return apply_per_image(
+            out,
+            lambda img: apply_shift(img, shift_type, amounts, self.opt.shift_percent),
+        )
+
+    def _apply_subsampling(self, out: Tensor) -> Tensor:
+        """Apply chroma subsampling degradation."""
+        rng = RNG.get_rng()
+        down_alg = rng.choice(self.opt.subsampling_down_algorithms)
+        up_alg = rng.choice(self.opt.subsampling_up_algorithms)
+        fmt = rng.choice(self.opt.subsampling_formats)
+        ycbcr = rng.choice(self.opt.subsampling_ycbcr_type)
+        blur_sigma = None
+        if self.opt.subsampling_blur_range is not None:
+            blur_sigma = float(rng.uniform(*self.opt.subsampling_blur_range))
+
+        return apply_per_image(
+            out,
+            lambda img: apply_subsampling(
+                img, down_alg, up_alg, fmt, blur_sigma, ycbcr
+            ),
+        )
+
+    def _apply_dithering(self, out: Tensor) -> Tensor:
+        """Apply dithering degradation to the LQ tensor."""
+        rng = RNG.get_rng()
+        dtype = rng.choice(self.opt.dithering_types)
+        quantize_ch = int(rng.integers(*self.opt.dithering_quantize_range))
+        map_size = int(rng.choice(self.opt.dithering_map_size))
+        history = int(rng.integers(*self.opt.dithering_history_range))
+        decay_ratio = float(rng.uniform(*self.opt.dithering_ratio_range))
+
+        return apply_per_image(
+            out,
+            lambda img: apply_dithering(
+                img, dtype, quantize_ch, map_size, history, decay_ratio
+            ),
+        )
+
     @torch.no_grad()
     def feed_data(self, data: DataFeed) -> None:
         """Accept data from dataloader, and then add two-order degradations to obtain LQ images."""
@@ -300,6 +421,15 @@ class RealESRGANModel(SRModel):
             # blur
             if RNG.get_rng().uniform() < self.opt.blur_prob:
                 out = filter2d(out, self.kernel1)
+
+            # channel shift (before resize1)
+            if RNG.get_rng().uniform() < self.opt.shift_prob:
+                out = self._apply_shift(out)
+
+            # chroma subsampling (before resize1)
+            if RNG.get_rng().uniform() < self.opt.subsampling_prob:
+                out = self._apply_subsampling(out)
+
             # random resize
             updown_type = random.choices(["up", "down", "keep"], self.opt.resize_prob)[
                 0
@@ -343,13 +473,9 @@ class RealESRGANModel(SRModel):
                     clip=True,
                     rounds=False,
                 )
-            # JPEG compression
+            # compression (stage 1: JPEG, WebP, or video codec)
             if RNG.get_rng().uniform() < self.opt.jpeg_prob:
-                jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt.jpeg_range)
-                out = torch.clamp(
-                    out, 0, 1
-                )  # clamp to [0, 1], otherwise JPEGer will result in unpleasant artifacts
-                out = self.jpeger(out, quality=jpeg_p)
+                out = self._apply_compression(out, stage=1)
 
             # ----------------------- The second degradation process ----------------------- #
             # blur
@@ -423,17 +549,13 @@ class RealESRGANModel(SRModel):
                     mode=mode,
                 )
                 out = filter2d(out, self.sinc_kernel)
-                # JPEG compression
+                # compression (stage 2)
                 if RNG.get_rng().uniform() < self.opt.jpeg_prob2:
-                    jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt.jpeg_range2)
-                    out = torch.clamp(out, 0, 1)
-                    out = self.jpeger(out, quality=jpeg_p)
+                    out = self._apply_compression(out, stage=2)
             else:
-                # JPEG compression
+                # compression (stage 2)
                 if RNG.get_rng().uniform() < self.opt.jpeg_prob2:
-                    jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt.jpeg_range2)
-                    out = torch.clamp(out, 0, 1)
-                    out = self.jpeger(out, quality=jpeg_p)
+                    out = self._apply_compression(out, stage=2)
                 # resize back + the final sinc filter
                 out = resize_pt(
                     out,
@@ -458,6 +580,10 @@ class RealESRGANModel(SRModel):
                     self.gt, self.lq, gt_size, self.opt.scale
                 )
             self._apply_shared_hf_noise()
+
+            # dithering (last degradation, applied to LQ only)
+            if RNG.get_rng().uniform() < self.opt.dithering_prob:
+                self.lq = self._apply_dithering(self.lq)
 
             # training pair pool
             self._dequeue_and_enqueue()
