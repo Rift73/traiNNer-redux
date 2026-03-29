@@ -1,6 +1,6 @@
 #!/bin/bash
 
-sudo apt install -y ffmpeg
+apt install -y ffmpeg
 
 python3.12 -m venv venv
 source venv/bin/activate
