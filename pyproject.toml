@@ -4,11 +4,14 @@ requires-python = ">=3.11"
 dynamic = ["version"]
 dependencies = [
 "antialiased_cnns",
+"chainner_ext",
+"colour-science",
 "einops",
 "ema-pytorch",
 "msgspec",
 "numpy>=2",
 "opencv-python",
+"pepeline",
 "Pillow",
 "pytorch-optimizer>=3.4.2",
 "pyvips>=2.2.3",

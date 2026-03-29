@@ -407,7 +407,7 @@ compress_video_sampling: [420, 422]
 ### Dependencies
 
 - **WebP**: OpenCV (already a traiNNer dependency).
-- **Video codecs**: `ffmpeg` must be installed and accessible in `$PATH`.
+- **Video codecs**: `ffmpeg` must be installed and accessible in `$PATH`. Install with `apt install ffmpeg` (Ubuntu/Debian) or equivalent for your OS.
 
 ---
 
