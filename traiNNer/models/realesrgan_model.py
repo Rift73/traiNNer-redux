@@ -20,6 +20,7 @@ from traiNNer.data.otf_degradations import (
     apply_subsampling,
     compress_video,
     compress_webp,
+    nlmeans_denoise_pt,
 )
 from traiNNer.data.transforms import paired_random_crop, paired_random_crop_multi_gt
 from traiNNer.models.sr_model import SRModel
@@ -148,14 +149,14 @@ class RealESRGANModel(SRModel):
         device = img.device
 
         shape_a = torch.as_tensor(
-            rng.uniform(*self.opt.otf_shared_hf_noise_beta_shape_range, size=batch_size),
+            rng.uniform(*self.opt.otf_hf_noise_beta_shape_range, size=batch_size),
             device=device,
             dtype=sample_dtype,
         )
-        if self.opt.otf_shared_hf_noise_beta_offset_range is not None:
+        if self.opt.otf_hf_noise_beta_offset_range is not None:
             shape_b = shape_a + torch.as_tensor(
                 rng.uniform(
-                    *self.opt.otf_shared_hf_noise_beta_offset_range, size=batch_size
+                    *self.opt.otf_hf_noise_beta_offset_range, size=batch_size
                 ),
                 device=device,
                 dtype=sample_dtype,
@@ -163,13 +164,13 @@ class RealESRGANModel(SRModel):
         else:
             shape_b = torch.as_tensor(
                 rng.uniform(
-                    *self.opt.otf_shared_hf_noise_beta_shape_range, size=batch_size
+                    *self.opt.otf_hf_noise_beta_shape_range, size=batch_size
                 ),
                 device=device,
                 dtype=sample_dtype,
             )
         alpha = torch.as_tensor(
-            rng.uniform(*self.opt.otf_shared_hf_noise_alpha_range, size=batch_size),
+            rng.uniform(*self.opt.otf_hf_noise_alpha_range, size=batch_size),
             device=device,
             dtype=sample_dtype,
         ).view(-1, 1, 1, 1)
@@ -184,9 +185,9 @@ class RealESRGANModel(SRModel):
             device,
         )
 
-        if channels > 1 and self.opt.otf_shared_hf_noise_gray_prob > 0:
+        if channels > 1 and self.opt.otf_hf_noise_gray_prob > 0:
             gray_mask = torch.as_tensor(
-                rng.uniform(size=batch_size) < self.opt.otf_shared_hf_noise_gray_prob,
+                rng.uniform(size=batch_size) < self.opt.otf_hf_noise_gray_prob,
                 device=device,
                 dtype=torch.bool,
             )
@@ -203,7 +204,7 @@ class RealESRGANModel(SRModel):
                 ).expand(-1, channels, -1, -1)
                 noise[gray_mask] = gray_noise
 
-        if self.opt.otf_shared_hf_noise_normalize:
+        if self.opt.otf_hf_noise_normalize:
             noise = noise - noise.mean(dim=(1, 2, 3), keepdim=True)
             noise = noise / (noise.std(dim=(1, 2, 3), keepdim=True) + 1e-6)
             noise = torch.clamp(noise, -3, 3) * alpha
@@ -213,13 +214,13 @@ class RealESRGANModel(SRModel):
         return noise.to(dtype=img.dtype)
 
     def _apply_shared_hf_noise(self) -> None:
-        if self.opt.otf_shared_hf_noise_prob <= 0:
+        if self.opt.otf_hf_noise_prob <= 0:
             return
 
         assert self.gt is not None
         assert self.lq is not None
 
-        if RNG.get_rng().uniform() >= self.opt.otf_shared_hf_noise_prob:
+        if RNG.get_rng().uniform() >= self.opt.otf_hf_noise_prob:
             return
 
         shared_noise = self._generate_shared_hf_noise(self.gt)
@@ -526,13 +527,19 @@ class RealESRGANModel(SRModel):
                     rounds=False,
                 )
 
-            # JPEG compression + the final sinc filter
+            # NLMeans denoise LQ (before final resize, while resolution is still high)
+            if self.opt.otf_hf_noise_denoise_lq and self.opt.otf_hf_noise_prob > 0:
+                out = nlmeans_denoise_pt(
+                    out, h=self.opt.otf_hf_noise_denoise_strength
+                )
+
+            # Compression + the final sinc filter
             # We also need to resize images to desired sizes. We group [resize back + sinc filter] together
             # as one operation.
             # We consider two orders:
-            #   1. [resize back + sinc filter] + JPEG compression
-            #   2. JPEG compression + [resize back + sinc filter]
-            # Empirically, we find other combinations (sinc + JPEG + Resize) will introduce twisted lines.
+            #   1. [resize back + sinc filter] + compression
+            #   2. compression + [resize back + sinc filter]
+            # Empirically, we find other combinations (sinc + compression + Resize) will introduce twisted lines.
 
             assert len(self.opt.resize_mode_list3) == len(self.opt.resize_mode_prob3), (
                 "resize_mode_list3 and resize_mode_prob3 must be the same length"

@@ -551,42 +551,54 @@ class ReduxOptions(StrictStruct):
         float,
         Meta(description="Probability of using paired LR data instead of OTF LR data."),
     ] = 0
-    otf_shared_hf_noise_normalize: Annotated[
+    otf_hf_noise_normalize: Annotated[
         bool,
         Meta(
-            description="Whether to zero-center and normalize the shared high-frequency noise field before scaling it. Disable to use the raw `(beta - 0.5) * 2 * alpha` style field."
+            description="Whether to zero-center and normalize the high-frequency noise field before scaling it. Disable to use the raw `(beta - 0.5) * 2 * alpha` style field."
         ),
     ] = True
-    otf_shared_hf_noise_prob: Annotated[
+    otf_hf_noise_prob: Annotated[
         float,
         Meta(
             description="Probability of adding the same shared high-frequency noise field to both GT and LQ after the final OTF crop, between 0 and 1."
         ),
     ] = 0
-    otf_shared_hf_noise_alpha_range: Annotated[
+    otf_hf_noise_alpha_range: Annotated[
         tuple[float, float],
         Meta(
-            description="Amplitude range for the shared high-frequency noise field, in the format `[min_alpha, max_alpha]`."
+            description="Amplitude range for the high-frequency noise field, in the format `[min_alpha, max_alpha]`."
         ),
     ] = (0.01, 0.05)
-    otf_shared_hf_noise_beta_shape_range: Annotated[
+    otf_hf_noise_beta_shape_range: Annotated[
         tuple[float, float],
         Meta(
-            description="Range used to sample the beta `a` shape parameter, and also the `b` shape parameter when no `otf_shared_hf_noise_beta_offset_range` is set."
+            description="Range used to sample the beta `a` shape parameter, and also the `b` shape parameter when no `otf_hf_noise_beta_offset_range` is set."
         ),
     ] = (2, 5)
-    otf_shared_hf_noise_beta_offset_range: Annotated[
+    otf_hf_noise_beta_offset_range: Annotated[
         tuple[float, float] | None,
         Meta(
             description="Optional positive offset range used to derive `b = a + offset` instead of sampling `b` independently. Use `[1, 5]` to approximate the external hf_noise snippet more closely."
         ),
     ] = None
-    otf_shared_hf_noise_gray_prob: Annotated[
+    otf_hf_noise_gray_prob: Annotated[
         float,
         Meta(
-            description="Probability that the shared high-frequency noise field is grayscale and broadcast to all channels, between 0 and 1."
+            description="Probability that the high-frequency noise field is grayscale and broadcast to all channels, between 0 and 1."
         ),
     ] = 1
+    otf_hf_noise_denoise_lq: Annotated[
+        bool,
+        Meta(
+            description="Whether to apply GPU Non-Local Means denoising to the LQ before the final resize. Removes existing noise so the model learns to produce clean output with HF texture from GT."
+        ),
+    ] = False
+    otf_hf_noise_denoise_strength: Annotated[
+        float,
+        Meta(
+            description="NLMeans filter strength (h parameter) on a 0-255 scale. Higher = more smoothing. Only used when otf_hf_noise_denoise_lq is true."
+        ),
+    ] = 30.0
 
     # ── Dithering (applied after crop, before dequeue — last degradation) ──────
     dithering_prob: Annotated[

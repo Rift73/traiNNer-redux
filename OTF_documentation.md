@@ -19,22 +19,25 @@
 
 ---
 
-## 1. Shared High-Frequency Noise
+## 1. High-Frequency Noise
 
 Adds the **same** beta-distributed noise field to both GT and LQ after the final OTF crop. The model learns to preserve this shared texture/grain rather than treating it as noise to remove.
+
+Optionally, GPU Non-Local Means denoising can be applied to LR **before the final resize** to remove existing noise, creating a cleaner input for the model to learn from.
 
 ### How It Works
 
 1. A noise field is sampled from a `Beta(a, b)` distribution at GT resolution.
 2. Optionally forced to grayscale (single channel broadcast to RGB).
 3. Either **normalized** (zero-centered, unit-variance, clamped to ±3σ, scaled by α) or used **raw** as `(beta - 0.5) * 2 * α`.
-4. The noise is added to GT, then **nearest-exact downscaled** to LQ resolution and added to LQ.
-5. Both GT and LQ are clamped to [0, 1].
+4. The noise is added to GT only. LR is left untouched.
+5. GT is clamped to [0, 1].
+6. **(Optional)** If `otf_hf_noise_denoise_lq` is enabled, LR is denoised with GPU NLMeans **before the final resize** (earlier in the pipeline). This is applied when `otf_hf_noise_prob > 0`.
 
 ### Pipeline Position
 
 ```
-... → final resize → clamp/round → random crop → ★ shared HF noise ★ → dequeue/enqueue → training
+... → Noise2 → ★ NLMeans denoise LQ (optional) ★ → Compress2/FinalResize/FinalSinc → Clamp → Crop → ★ HF noise (GT only) ★ → Dithering → Dequeue
 ```
 
 ### Config Fields
@@ -45,60 +48,78 @@ All fields are **top-level** (same level as `high_order_degradation`, not inside
 # ── Shared High-Frequency Noise ───────────────────────────────────────────────
 # Adds identical noise to both GT and LQ so the model preserves texture/grain.
 
-otf_shared_hf_noise_prob: 0.0          # Probability of applying. 0 = disabled.
+otf_hf_noise_prob: 0.0          # Probability of applying. 0 = disabled.
                                         # Type: float, range [0, 1]
 
-otf_shared_hf_noise_normalize: true     # true:  zero-center, normalize to unit variance,
+otf_hf_noise_normalize: true     # true:  zero-center, normalize to unit variance,
                                         #        clamp ±3σ, then scale by alpha.
                                         # false: raw mode, noise = (beta - 0.5) * 2 * alpha.
                                         # Type: bool
 
-otf_shared_hf_noise_alpha_range: [0.01, 0.05]
+otf_hf_noise_alpha_range: [0.01, 0.05]
                                         # Amplitude range. One alpha is sampled uniformly
                                         # per batch element from [min, max].
                                         # Type: [float, float]
 
-otf_shared_hf_noise_beta_shape_range: [2, 5]
+otf_hf_noise_beta_shape_range: [2, 5]
                                         # Range for the Beta distribution 'a' parameter.
                                         # Also used for 'b' when beta_offset_range is null.
                                         # Type: [float, float]
 
-otf_shared_hf_noise_beta_offset_range: ~
+otf_hf_noise_beta_offset_range: ~
                                         # Optional. When set, b = a + uniform(offset_min, offset_max)
                                         # instead of sampling b independently.
                                         # Use [1, 5] to approximate the external hf_noise snippet.
                                         # Type: [float, float] or null (~)
 
-otf_shared_hf_noise_gray_prob: 1.0      # Probability the noise is single-channel (grayscale),
+otf_hf_noise_gray_prob: 1.0      # Probability the noise is single-channel (grayscale),
                                         # broadcast to all RGB channels.
                                         # 1.0 = always grayscale, 0.0 = always per-channel color.
                                         # Type: float, range [0, 1]
+
+otf_hf_noise_denoise_lq: false          # Apply GPU NLMeans denoising to LQ before final resize.
+                                        # Removes existing noise for cleaner model input.
+                                        # Only active when otf_hf_noise_prob > 0.
+                                        # Type: bool
+
+otf_hf_noise_denoise_strength: 30.0     # NLMeans filter strength (h parameter, 0-255 scale).
+                                        # Higher = more smoothing. 10-20 is mild, 30-50 is strong.
+                                        # Type: float
 ```
 
 ### Example: Enable with defaults
 
 ```yaml
-otf_shared_hf_noise_prob: 0.5
+otf_hf_noise_prob: 0.5
 # All other fields use their defaults (shown above).
 ```
 
 ### Example: Stronger grain, color noise allowed
 
 ```yaml
-otf_shared_hf_noise_prob: 0.8
-otf_shared_hf_noise_alpha_range: [0.03, 0.10]
-otf_shared_hf_noise_beta_shape_range: [1.5, 4]
-otf_shared_hf_noise_gray_prob: 0.5        # 50% grayscale, 50% color noise
+otf_hf_noise_prob: 0.8
+otf_hf_noise_alpha_range: [0.03, 0.10]
+otf_hf_noise_beta_shape_range: [1.5, 4]
+otf_hf_noise_gray_prob: 0.5        # 50% grayscale, 50% color noise
 ```
 
 ### Example: Approximate external hf_noise snippet style
 
 ```yaml
-otf_shared_hf_noise_prob: 0.7
-otf_shared_hf_noise_normalize: false       # raw (beta - 0.5) * 2 * alpha mode
-otf_shared_hf_noise_alpha_range: [0.02, 0.08]
-otf_shared_hf_noise_beta_shape_range: [2, 5]
-otf_shared_hf_noise_beta_offset_range: [1, 5]  # b = a + offset, skews distribution
+otf_hf_noise_prob: 0.7
+otf_hf_noise_normalize: false       # raw (beta - 0.5) * 2 * alpha mode
+otf_hf_noise_alpha_range: [0.02, 0.08]
+otf_hf_noise_beta_shape_range: [2, 5]
+otf_hf_noise_beta_offset_range: [1, 5]  # b = a + offset, skews distribution
+```
+
+### Example: HF noise with LQ denoising
+
+```yaml
+otf_hf_noise_prob: 0.6
+otf_hf_noise_alpha_range: [0.02, 0.07]
+otf_hf_noise_denoise_lq: true           # Denoise LQ before final resize
+otf_hf_noise_denoise_strength: 25.0     # Moderate smoothing
 ```
 
 ---
@@ -694,6 +715,7 @@ GT Source
   ├─ Blur 2
   ├─ Resize 2
   ├─ Noise 2 (Gaussian or Poisson)
+  ├─ ★ NLMeans denoise LQ (optional, before final resize)
   ├─ ★ Compression 2 + Final Resize + Final Sinc (interleaved)
   ├─ Clamp & Round
   ├─ Random Crop (paired with GT)
@@ -713,12 +735,14 @@ GT Source
 
 | Field | Level | Type | Default | Feature |
 |---|---|---|---|---|
-| `otf_shared_hf_noise_prob` | top | float | `0` | Shared HF Noise |
-| `otf_shared_hf_noise_normalize` | top | bool | `true` | Shared HF Noise |
-| `otf_shared_hf_noise_alpha_range` | top | [float, float] | `[0.01, 0.05]` | Shared HF Noise |
-| `otf_shared_hf_noise_beta_shape_range` | top | [float, float] | `[2, 5]` | Shared HF Noise |
-| `otf_shared_hf_noise_beta_offset_range` | top | [float, float] \| null | `~` | Shared HF Noise |
-| `otf_shared_hf_noise_gray_prob` | top | float | `1` | Shared HF Noise |
+| `otf_hf_noise_prob` | top | float | `0` | HF Noise |
+| `otf_hf_noise_normalize` | top | bool | `true` | HF Noise |
+| `otf_hf_noise_alpha_range` | top | [float, float] | `[0.01, 0.05]` | HF Noise |
+| `otf_hf_noise_beta_shape_range` | top | [float, float] | `[2, 5]` | HF Noise |
+| `otf_hf_noise_beta_offset_range` | top | [float, float] \| null | `~` | HF Noise |
+| `otf_hf_noise_gray_prob` | top | float | `1` | HF Noise |
+| `otf_hf_noise_denoise_lq` | top | bool | `false` | HF Noise |
+| `otf_hf_noise_denoise_strength` | top | float | `30.0` | HF Noise |
 | `target_dataroot_gt` | datasets.train | list[str] \| null | `~` | Target GT |
 | `paired_dataroot_gt` | datasets.train | list[str] \| null | `~` | Paired Hybrid |
 | `dataroot_lq_prob` | top | float | `0` | Paired Hybrid |
@@ -761,8 +785,8 @@ All three features are independent and can be combined. For example, you can use
 high_order_degradation: true
 
 # Shared HF noise
-otf_shared_hf_noise_prob: 0.6
-otf_shared_hf_noise_alpha_range: [0.02, 0.07]
+otf_hf_noise_prob: 0.6
+otf_hf_noise_alpha_range: [0.02, 0.07]
 
 # Standard OTF degradation params
 blur_prob: 0.5
@@ -787,8 +811,8 @@ high_order_degradation: true
 dataroot_lq_prob: 0.2
 
 # Shared HF noise
-otf_shared_hf_noise_prob: 0.5
-otf_shared_hf_noise_alpha_range: [0.01, 0.05]
+otf_hf_noise_prob: 0.5
+otf_hf_noise_alpha_range: [0.01, 0.05]
 
 datasets:
   train:
@@ -814,7 +838,7 @@ datasets:
 
 | File | What was modified |
 |---|---|
-| `traiNNer/utils/redux_options.py` | Added `target_dataroot_gt`, `paired_dataroot_gt`, all `otf_shared_hf_noise_*` fields, all `compress_*` fields, all `dithering_*` fields, all `shift_*` fields, all `subsampling_*` fields |
+| `traiNNer/utils/redux_options.py` | Added `target_dataroot_gt`, `paired_dataroot_gt`, all `otf_hf_noise_*` fields, all `compress_*` fields, all `dithering_*` fields, all `shift_*` fields, all `subsampling_*` fields |
 | `traiNNer/models/realesrgan_model.py` | Added shared HF noise methods, `_apply_compression()`, `_apply_shift()`, `_apply_subsampling()`, `_apply_dithering()`; modified `feed_data()` for target GT flow and new degradation pipeline |
 | `traiNNer/models/realesrgan_paired_model.py` | Added validation data pass-through (prefix detection) |
 | `traiNNer/data/otf_degradations.py` | **NEW** — CPU-based degradation functions: compression (WebP, video codecs), dithering, channel shift, chroma subsampling, tensor↔numpy bridge |

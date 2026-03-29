@@ -1,7 +1,8 @@
-"""CPU-based OTF degradation functions.
+"""OTF degradation functions.
 
-Ported from wtp_dataset_destroyer. All degradation functions take/return
-np.ndarray in HWC float32 [0,1] format.
+Ported from wtp_dataset_destroyer. Numpy functions take/return
+np.ndarray in HWC float32 [0,1] format. GPU functions operate
+on BCHW PyTorch tensors directly.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from typing import Callable
 import cv2 as cv
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 logger = logging.getLogger("traiNNer")
@@ -39,6 +41,80 @@ YUV_MAP: dict[str, str] = {
     "601": "ITU-R BT.601",
     "240": "SMPTE-240M",
 }
+
+
+# ── Tensor ↔ Numpy Bridge ─────────────────────────────────────────────────────
+
+
+# ── GPU Denoising ──────────────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def nlmeans_denoise_pt(
+    x: Tensor,
+    h: float = 30.0,
+    template_size: int = 7,
+    search_size: int = 21,
+) -> Tensor:
+    """GPU Non-Local Means denoising on a BCHW tensor.
+
+    Pure PyTorch implementation — no CPU roundtrips.
+
+    Args:
+        x: BCHW float32 tensor on GPU.
+        h: Filter strength on [0,255] scale. Higher = more smoothing.
+        template_size: Patch comparison window size (odd).
+        search_size: Search window size (odd).
+
+    Returns:
+        Denoised BCHW tensor.
+    """
+    _, c, height, width = x.shape
+    t_half = template_size // 2
+    s_half = search_size // 2
+    pad = s_half + t_half
+
+    x_pad = F.pad(x, [pad] * 4, mode="reflect")
+
+    box = torch.ones(
+        1, 1, template_size, template_size, device=x.device, dtype=x.dtype
+    )
+    norm_factor = template_size * template_size * c
+
+    h_scaled = h / 255.0
+    h_sq = h_scaled * h_scaled
+
+    weights_sum = torch.zeros(
+        x.shape[0], 1, height, width, device=x.device, dtype=x.dtype
+    )
+    output = torch.zeros_like(x)
+
+    for dy in range(-s_half, s_half + 1):
+        for dx in range(-s_half, s_half + 1):
+            sy = s_half + dy
+            sx = s_half + dx
+            shifted = x_pad[
+                :, :, sy : sy + height + 2 * t_half, sx : sx + width + 2 * t_half
+            ]
+            center = x_pad[
+                :,
+                :,
+                s_half : s_half + height + 2 * t_half,
+                s_half : s_half + width + 2 * t_half,
+            ]
+
+            diff_sq = (center - shifted).square().sum(dim=1, keepdim=True)
+            patch_dist = F.conv2d(diff_sq, box, padding=0) / norm_factor
+            w = torch.exp(-patch_dist / h_sq)
+
+            shifted_pixel = x_pad[
+                :, :, pad + dy : pad + dy + height, pad + dx : pad + dx + width
+            ]
+
+            weights_sum += w
+            output += w * shifted_pixel
+
+    return output / weights_sum
 
 
 # ── Tensor ↔ Numpy Bridge ─────────────────────────────────────────────────────
