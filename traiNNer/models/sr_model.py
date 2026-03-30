@@ -393,15 +393,6 @@ class SRModel(BaseModel):
 
         print("WARNING: Could not find layer to register entropy hook")
 
-    def _invalidate_reparam_eval_cache(self, module: nn.Module) -> None:
-        # Re-parameterized blocks (e.g. Conv3XC) cache fused eval kernels.
-        # EMA mutates weights outside training forward, so force cache refresh.
-        for submodule in module.modules():
-            if hasattr(submodule, "update_params_flag"):
-                submodule.update_params_flag = False  # pyright: ignore[reportAttributeAccessIssue]
-            if hasattr(submodule, "_cached_param_versions"):
-                submodule._cached_param_versions = None  # pyright: ignore[reportAttributeAccessIssue]
-
     def setup_optimizers(self) -> None:
         train_opt = self.opt.train
         assert train_opt is not None
@@ -724,7 +715,6 @@ class SRModel(BaseModel):
         if self.net_g_ema is not None and apply_gradient:
             if not (self.use_amp and self.optimizers_skipped[0]):
                 self.net_g_ema.update()
-                self._invalidate_reparam_eval_cache(self.net_g_ema.ema_model)
 
     def infer_tiled(self, net: nn.Module, lq: torch.Tensor) -> torch.Tensor:
         assert self.opt.val is not None
