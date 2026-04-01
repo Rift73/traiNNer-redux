@@ -736,6 +736,176 @@ class ReduxOptions(StrictStruct):
         ),
     ] = field(default_factory=lambda: ["601"])
 
+    # ── Ghosting (temporal ghost, before blur1) ──────────────────────────────
+    ghosting_prob: Annotated[
+        float,
+        Meta(description="Probability of applying temporal ghosting, between 0 and 1."),
+    ] = 0
+    ghosting_shift_x: Annotated[
+        list[int],
+        Meta(description="Horizontal ghost displacement range [min, max] pixels."),
+    ] = field(default_factory=lambda: [1, 8])
+    ghosting_shift_y: Annotated[
+        list[int],
+        Meta(description="Vertical ghost displacement range [min, max] pixels."),
+    ] = field(default_factory=lambda: [0, 2])
+    ghosting_opacity: Annotated[
+        list[float],
+        Meta(description="Ghost opacity range [min, max]."),
+    ] = field(default_factory=lambda: [0.05, 0.25])
+
+    # ── Interlace (combing artifact, before blur1) ───────────────────────────
+    interlace_prob: Annotated[
+        float,
+        Meta(description="Probability of applying interlace combing, between 0 and 1."),
+    ] = 0
+    interlace_field_shift: Annotated[
+        list[int],
+        Meta(description="Horizontal pixel shift range between fields [min, max]."),
+    ] = field(default_factory=lambda: [1, 5])
+    interlace_dominant_field: Annotated[
+        list[str],
+        Meta(description="Field dominance options. One is randomly selected. Options: top, bottom."),
+    ] = field(default_factory=lambda: ["top", "bottom"])
+
+    # ── Lowpass (Butterworth, after blur1 before shift) ──────────────────────
+    lowpass_prob: Annotated[
+        float,
+        Meta(description="Probability of applying Butterworth lowpass filter, between 0 and 1."),
+    ] = 0
+    lowpass_cutoff: Annotated[
+        list[float],
+        Meta(description="Cutoff frequency range as fraction of Nyquist [min, max]. 1.0 = barely any filtering, 0.3 = heavy."),
+    ] = field(default_factory=lambda: [0.3, 0.8])
+    lowpass_order: Annotated[
+        list[int],
+        Meta(description="Butterworth filter order range [min, max]. Higher = sharper rolloff = more ringing."),
+    ] = field(default_factory=lambda: [1, 5])
+    lowpass_detail_mask: Annotated[
+        bool,
+        Meta(description="If true, protect edges/detail from lowpass using a detail mask computed from HQ."),
+    ] = False
+    lowpass_mask_lines_brz: Annotated[
+        float,
+        Meta(description="Binarize threshold for the edge/lines component of the detail mask."),
+    ] = 0.08
+
+    # ── NTSC Composite (full simulation, before blur1) ───────────────────────
+    ntsc_prob: Annotated[
+        float,
+        Meta(description="Probability of applying NTSC composite simulation, between 0 and 1."),
+    ] = 0
+    ntsc_preset: Annotated[
+        list[str],
+        Meta(description="NTSC preset(s) to randomly select from. Options: broadcast, vhs_sp, vhs_ep."),
+    ] = field(default_factory=lambda: ["broadcast"])
+    ntsc_comb_mode: Annotated[
+        str,
+        Meta(description="Comb filter mode for luma/chroma separation. Options: 2sample, 1h."),
+    ] = "2sample"
+    ntsc_enable_vhs: Annotated[
+        bool,
+        Meta(description="Enable VHS color-under + luma bandwidth limiting."),
+    ] = False
+    ntsc_noise: Annotated[
+        list[float],
+        Meta(description="Gaussian noise amplitude range [min, max] (0-0.3)."),
+    ] = field(default_factory=lambda: [0.03, 0.03])
+    ntsc_luma_noise: Annotated[
+        list[float],
+        Meta(description="Luminance-dependent noise range [min, max] (0-0.15)."),
+    ] = field(default_factory=lambda: [0.0, 0.0])
+    ntsc_ghost_amplitude: Annotated[
+        list[float],
+        Meta(description="Multipath ghost strength range [min, max] (0-0.5)."),
+    ] = field(default_factory=lambda: [0.0, 0.0])
+    ntsc_ghost_delay_us: Annotated[
+        list[float],
+        Meta(description="Ghost delay range in microseconds [min, max] (0.5-10)."),
+    ] = field(default_factory=lambda: [1.5, 1.5])
+    ntsc_ghost_phase: Annotated[
+        list[float],
+        Meta(description="Ghost phase range in degrees [min, max] (0-360)."),
+    ] = field(default_factory=lambda: [180.0, 180.0])
+    ntsc_jitter: Annotated[
+        list[float],
+        Meta(description="Per-line timing jitter range in subcarrier cycles [min, max] (0-3)."),
+    ] = field(default_factory=lambda: [0.0, 0.0])
+    ntsc_edge_ringing: Annotated[
+        list[float],
+        Meta(description="Edge ringing (unsharp mask gain) range [min, max] (0-3)."),
+    ] = field(default_factory=lambda: [0.0, 0.0])
+    ntsc_vhs_luma_bw: Annotated[
+        list[float],
+        Meta(description="VHS luma bandwidth range in MHz [min, max] (1.5-4.2)."),
+    ] = field(default_factory=lambda: [4.2, 4.2])
+    ntsc_color_under_bw: Annotated[
+        list[float],
+        Meta(description="VHS color-under bandwidth range in kHz [min, max] (200-600)."),
+    ] = field(default_factory=lambda: [500.0, 500.0])
+    ntsc_tape_trailing: Annotated[
+        list[float],
+        Meta(description="Tape trailing IIR strength range [min, max] (0-1)."),
+    ] = field(default_factory=lambda: [0.0, 0.0])
+    ntsc_intensity: Annotated[
+        list[float],
+        Meta(description="NTSC effect blend intensity range [min, max] (0=none, 1=full)."),
+    ] = field(default_factory=lambda: [1.0, 1.0])
+
+    # ── Overshoot (edge ringing, after blur1 before shift) ───────────────────
+    overshoot_prob: Annotated[
+        float,
+        Meta(description="Probability of applying edge overshoot/undershoot, between 0 and 1."),
+    ] = 0
+    overshoot_amount: Annotated[
+        list[float],
+        Meta(description="Sharpening strength range [min, max]. 0 = no effect, 2+ = aggressive."),
+    ] = field(default_factory=lambda: [0.5, 2.0])
+    overshoot_cutoff: Annotated[
+        list[float],
+        Meta(description="Butterworth cutoff range as fraction of Nyquist [min, max]."),
+    ] = field(default_factory=lambda: [0.2, 0.5])
+    overshoot_order: Annotated[
+        list[int],
+        Meta(description="Butterworth filter order range [min, max]."),
+    ] = field(default_factory=lambda: [1, 3])
+
+    # ── Rainbow (NTSC chroma dot crawl, before blur1) ────────────────────────
+    rainbow_prob: Annotated[
+        float,
+        Meta(description="Probability of applying composite rainbow artifact, between 0 and 1."),
+    ] = 0
+    rainbow_subcarrier_freq: Annotated[
+        list[float],
+        Meta(description="Subcarrier frequency range in cycles/pixel [min, max] (0.15-0.35 typical)."),
+    ] = field(default_factory=lambda: [0.20, 0.30])
+    rainbow_chroma_bandwidth: Annotated[
+        list[float],
+        Meta(description="Chroma demodulation bandwidth range in cycles/pixel [min, max]."),
+    ] = field(default_factory=lambda: [0.04, 0.12])
+    rainbow_intensity: Annotated[
+        list[float],
+        Meta(description="Rainbow effect intensity range [min, max] (0-1 blend)."),
+    ] = field(default_factory=lambda: [0.3, 1.0])
+    rainbow_phase_alternation: Annotated[
+        bool,
+        Meta(description="If true, subcarrier phase alternates per scanline (NTSC behavior)."),
+    ] = True
+
+    # ── Scanline (CRT darkening, before blur1) ──────────────────────────────
+    scanline_prob: Annotated[
+        float,
+        Meta(description="Probability of applying CRT scanline darkening, between 0 and 1."),
+    ] = 0
+    scanline_strength: Annotated[
+        list[float],
+        Meta(description="Scanline darkening strength range [min, max] (0 = none, 1 = full black)."),
+    ] = field(default_factory=lambda: [0.1, 0.5])
+    scanline_even_lines: Annotated[
+        bool,
+        Meta(description="If true, darken even rows. If false, darken odd rows."),
+    ] = True
+
     lq_usm: Annotated[
         bool, Meta(description="Whether to enable unsharp mask on the LQ image.")
     ] = False

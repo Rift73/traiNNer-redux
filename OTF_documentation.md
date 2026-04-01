@@ -14,8 +14,15 @@
 5. [Channel Shift](#5-channel-shift)
 6. [Chroma Subsampling](#6-chroma-subsampling)
 7. [Dithering](#7-dithering)
-8. [Pipeline Order](#8-pipeline-order)
-9. [YML Quick Reference](#9-yml-quick-reference)
+8. [NTSC Composite Simulation](#8-ntsc-composite-simulation)
+9. [Composite Rainbow](#9-composite-rainbow)
+10. [Temporal Ghosting](#10-temporal-ghosting)
+11. [Interlace Combing](#11-interlace-combing)
+12. [CRT Scanline Darkening](#12-crt-scanline-darkening)
+13. [Butterworth Lowpass](#13-butterworth-lowpass)
+14. [Edge Overshoot](#14-edge-overshoot)
+15. [Pipeline Order](#15-pipeline-order)
+16. [YML Quick Reference](#16-yml-quick-reference)
 
 ---
 
@@ -697,7 +704,179 @@ dithering_ratio_range: [0.2, 0.8]
 
 ---
 
-## 8. Pipeline Order
+## 8. NTSC Composite Simulation
+
+Full physically-accurate NTSC composite video encode/decode at real sample rate (754x480 scaled). Simulates the complete signal path including bandwidth limiting, chroma modulation, comb filtering, and optional VHS tape effects.
+
+### Pipeline Position
+
+Applied **before Blur1** (source-level capture artifact).
+
+### Config Fields
+
+```yaml
+ntsc_prob: 0.3                     # probability of applying
+ntsc_preset: [broadcast]           # broadcast, vhs_sp, vhs_ep
+ntsc_comb_mode: "2sample"          # 2sample or 1h comb filter
+ntsc_enable_vhs: false             # VHS color-under + luma BW limiting
+ntsc_noise: [0.03, 0.03]          # Gaussian noise range
+ntsc_luma_noise: [0.0, 0.0]       # luminance-dependent noise range
+ntsc_ghost_amplitude: [0.0, 0.0]  # multipath ghost strength range
+ntsc_ghost_delay_us: [1.5, 1.5]   # ghost delay in microseconds
+ntsc_ghost_phase: [180.0, 180.0]  # ghost phase in degrees
+ntsc_jitter: [0.0, 0.0]           # per-line timing jitter
+ntsc_edge_ringing: [0.0, 0.0]     # edge ringing (unsharp mask)
+ntsc_vhs_luma_bw: [4.2, 4.2]      # VHS luma BW in MHz
+ntsc_color_under_bw: [500.0, 500.0] # VHS color-under BW in kHz
+ntsc_tape_trailing: [0.0, 0.0]    # tape trailing IIR strength
+ntsc_intensity: [1.0, 1.0]        # blend intensity
+```
+
+### Implementation
+
+Pure PyTorch GPU. Upsamples to NTSC resolution, encodes to composite, applies effects, decodes, then descales back via bicubic inverse. Optional CUDA kernel for tape trailing IIR.
+
+---
+
+## 9. Composite Rainbow
+
+Simulates NTSC/PAL composite video rainbow artifact (chroma dot crawl). High-frequency luma leaks into chroma through imperfect comb-filter separation, creating rainbow-colored fringes along sharp edges.
+
+### Pipeline Position
+
+Applied **before Blur1** (source-level artifact).
+
+### Config Fields
+
+```yaml
+rainbow_prob: 0.2
+rainbow_subcarrier_freq: [0.20, 0.30]    # cycles/pixel
+rainbow_chroma_bandwidth: [0.04, 0.12]   # chroma demod bandwidth
+rainbow_intensity: [0.3, 1.0]            # 0=no effect, 1=full
+rainbow_phase_alternation: true           # NTSC per-line phase flip
+```
+
+### Implementation
+
+Pure PyTorch GPU. RGB→YIQ, modulate I/Q onto subcarrier, lowpass demodulate, YIQ→RGB.
+
+---
+
+## 10. Temporal Ghosting
+
+Simulates temporal ghosting from residual frame blending in video sources. Motion compensation failures and analog signal persistence create semi-transparent shifted copies.
+
+### Pipeline Position
+
+Applied **before Blur1** (source-level artifact).
+
+### Config Fields
+
+```yaml
+ghosting_prob: 0.15
+ghosting_shift_x: [1, 8]       # horizontal displacement range (pixels)
+ghosting_shift_y: [0, 2]       # vertical displacement range (pixels)
+ghosting_opacity: [0.05, 0.25] # ghost blend strength
+```
+
+### Implementation
+
+Pure PyTorch GPU. `torch.roll` + alpha blend.
+
+---
+
+## 11. Interlace Combing
+
+Simulates interlaced video combing artifact from poorly deinterlaced 480i/576i content. Even scanlines from one field, odd from another, with horizontal shift between fields.
+
+### Pipeline Position
+
+Applied **before Blur1** (source-level artifact).
+
+### Config Fields
+
+```yaml
+interlace_prob: 0.1
+interlace_field_shift: [1, 5]              # horizontal shift between fields
+interlace_dominant_field: [top, bottom]     # field dominance
+```
+
+### Implementation
+
+Pure PyTorch GPU. Shifts alternate scanlines via `torch.roll`.
+
+---
+
+## 12. CRT Scanline Darkening
+
+Simulates CRT display scanline gaps by darkening alternating rows.
+
+### Pipeline Position
+
+Applied **before Blur1** (source-level artifact).
+
+### Config Fields
+
+```yaml
+scanline_prob: 0.1
+scanline_strength: [0.1, 0.5]  # 0=no effect, 1=fully black
+scanline_even_lines: true       # darken even or odd rows
+```
+
+### Implementation
+
+Pure PyTorch GPU. Multiplies alternate rows by `(1 - strength)`.
+
+---
+
+## 13. Butterworth Lowpass
+
+Frequency-domain Butterworth lowpass filter simulating production/mastering lowpass common in anime sources and broadcast video. Produces detail loss with ringing (Gibbs phenomenon) at high filter orders.
+
+### Pipeline Position
+
+Applied **after Blur1, before Shift** (mastering/production artifact).
+
+### Config Fields
+
+```yaml
+lowpass_prob: 0.2
+lowpass_cutoff: [0.3, 0.8]       # fraction of Nyquist (0-1)
+lowpass_order: [1, 5]             # higher = sharper rolloff = more ringing
+lowpass_detail_mask: false        # protect edges/detail using HQ mask
+lowpass_mask_lines_brz: 0.08     # edge threshold for detail mask
+```
+
+### Implementation
+
+Pure PyTorch GPU via FFT (`rfft2` → multiply by Butterworth response → `irfft2`). Optional detail mask uses Prewitt edge detection + bilateral filter (PyTorch port of `vsmasktools.detail_mask_neo`).
+
+---
+
+## 14. Edge Overshoot
+
+Simulates edge overshoot/undershoot from aggressive sharpening (warp sharp, edge enhancement) applied during DVD/broadcast mastering. Boosts high frequencies, creating bright/dark halos adjacent to edges.
+
+### Pipeline Position
+
+Applied **after Blur1, before Shift** (mastering/production artifact).
+
+### Config Fields
+
+```yaml
+overshoot_prob: 0.15
+overshoot_amount: [0.5, 2.0]     # sharpening strength
+overshoot_cutoff: [0.2, 0.5]     # Butterworth cutoff (fraction of Nyquist)
+overshoot_order: [1, 3]          # filter order
+```
+
+### Implementation
+
+Pure PyTorch GPU via FFT. High-boost filter: `H(f) = 1 + amount * (1 - Butterworth(f))`.
+
+---
+
+## 15. Pipeline Order
 
 The complete OTF degradation pipeline with all custom features:
 
@@ -706,7 +885,14 @@ GT Source
   │
   ├─ USM sharpening (optional)
   ├─ ThickLines filter (optional)
+  ├─ ★ NTSC Composite (optional)
+  ├─ ★ Composite Rainbow (optional)
+  ├─ ★ Temporal Ghosting (optional)
+  ├─ ★ Interlace Combing (optional)
+  ├─ ★ CRT Scanline (optional)
   ├─ Blur 1
+  ├─ ★ Butterworth Lowpass (optional)
+  ├─ ★ Edge Overshoot (optional)
   ├─ ★ Channel Shift (optional)
   ├─ ★ Chroma Subsampling (optional)
   ├─ Resize 1
@@ -729,7 +915,7 @@ GT Source
 
 ---
 
-## 9. YML Quick Reference
+## 16. YML Quick Reference
 
 ### All custom fields at a glance
 
@@ -773,6 +959,45 @@ GT Source
 | `dithering_map_size` | top | list[int] | `[4, 8]` | Dithering |
 | `dithering_history_range` | top | [int, int] | `[10, 15]` | Dithering |
 | `dithering_ratio_range` | top | [float, float] | `[0.1, 0.9]` | Dithering |
+| `ntsc_prob` | top | float | `0` | NTSC |
+| `ntsc_preset` | top | list[str] | `[broadcast]` | NTSC |
+| `ntsc_comb_mode` | top | str | `2sample` | NTSC |
+| `ntsc_enable_vhs` | top | bool | `false` | NTSC |
+| `ntsc_noise` | top | [float, float] | `[0.03, 0.03]` | NTSC |
+| `ntsc_luma_noise` | top | [float, float] | `[0.0, 0.0]` | NTSC |
+| `ntsc_ghost_amplitude` | top | [float, float] | `[0.0, 0.0]` | NTSC |
+| `ntsc_ghost_delay_us` | top | [float, float] | `[1.5, 1.5]` | NTSC |
+| `ntsc_ghost_phase` | top | [float, float] | `[180.0, 180.0]` | NTSC |
+| `ntsc_jitter` | top | [float, float] | `[0.0, 0.0]` | NTSC |
+| `ntsc_edge_ringing` | top | [float, float] | `[0.0, 0.0]` | NTSC |
+| `ntsc_vhs_luma_bw` | top | [float, float] | `[4.2, 4.2]` | NTSC |
+| `ntsc_color_under_bw` | top | [float, float] | `[500.0, 500.0]` | NTSC |
+| `ntsc_tape_trailing` | top | [float, float] | `[0.0, 0.0]` | NTSC |
+| `ntsc_intensity` | top | [float, float] | `[1.0, 1.0]` | NTSC |
+| `rainbow_prob` | top | float | `0` | Rainbow |
+| `rainbow_subcarrier_freq` | top | [float, float] | `[0.20, 0.30]` | Rainbow |
+| `rainbow_chroma_bandwidth` | top | [float, float] | `[0.04, 0.12]` | Rainbow |
+| `rainbow_intensity` | top | [float, float] | `[0.3, 1.0]` | Rainbow |
+| `rainbow_phase_alternation` | top | bool | `true` | Rainbow |
+| `ghosting_prob` | top | float | `0` | Ghosting |
+| `ghosting_shift_x` | top | [int, int] | `[1, 8]` | Ghosting |
+| `ghosting_shift_y` | top | [int, int] | `[0, 2]` | Ghosting |
+| `ghosting_opacity` | top | [float, float] | `[0.05, 0.25]` | Ghosting |
+| `interlace_prob` | top | float | `0` | Interlace |
+| `interlace_field_shift` | top | [int, int] | `[1, 5]` | Interlace |
+| `interlace_dominant_field` | top | list[str] | `[top, bottom]` | Interlace |
+| `scanline_prob` | top | float | `0` | Scanline |
+| `scanline_strength` | top | [float, float] | `[0.1, 0.5]` | Scanline |
+| `scanline_even_lines` | top | bool | `true` | Scanline |
+| `lowpass_prob` | top | float | `0` | Lowpass |
+| `lowpass_cutoff` | top | [float, float] | `[0.3, 0.8]` | Lowpass |
+| `lowpass_order` | top | [int, int] | `[1, 5]` | Lowpass |
+| `lowpass_detail_mask` | top | bool | `false` | Lowpass |
+| `lowpass_mask_lines_brz` | top | float | `0.08` | Lowpass |
+| `overshoot_prob` | top | float | `0` | Overshoot |
+| `overshoot_amount` | top | [float, float] | `[0.5, 2.0]` | Overshoot |
+| `overshoot_cutoff` | top | [float, float] | `[0.2, 0.5]` | Overshoot |
+| `overshoot_order` | top | [int, int] | `[1, 3]` | Overshoot |
 
 > **"top"** = same indentation level as `high_order_degradation`, `scale`, `queue_size`, etc.
 > **"datasets.train"** = inside `datasets: train:` block.
@@ -838,10 +1063,16 @@ datasets:
 
 | File | What was modified |
 |---|---|
-| `traiNNer/utils/redux_options.py` | Added `target_dataroot_gt`, `paired_dataroot_gt`, all `otf_hf_noise_*` fields, all `compress_*` fields, all `dithering_*` fields, all `shift_*` fields, all `subsampling_*` fields |
-| `traiNNer/models/realesrgan_model.py` | Added shared HF noise methods, `_apply_compression()`, `_apply_shift()`, `_apply_subsampling()`, `_apply_dithering()`; modified `feed_data()` for target GT flow and new degradation pipeline |
+| `traiNNer/utils/redux_options.py` | Added all custom config fields: `otf_hf_noise_*`, `compress_*`, `dithering_*`, `shift_*`, `subsampling_*`, `ghosting_*`, `interlace_*`, `lowpass_*`, `ntsc_*`, `overshoot_*`, `rainbow_*`, `scanline_*` |
+| `traiNNer/models/realesrgan_model.py` | Added `_apply_*` methods for all degradations; modified `feed_data()` pipeline |
 | `traiNNer/models/realesrgan_paired_model.py` | Added validation data pass-through (prefix detection) |
-| `traiNNer/data/otf_degradations.py` | **NEW** — CPU-based degradation functions: compression (WebP, video codecs), dithering, channel shift, chroma subsampling, tensor↔numpy bridge |
+| `traiNNer/data/otf_degradations.py` | CPU-based degradation functions: WebP, video codecs, dithering, shift, subsampling, NLMeans |
+| `traiNNer/data/gpu_degradations.py` | **NEW** — Pure PyTorch GPU degradation functions: shift, subsampling, dithering, rainbow, lowpass, interlace, overshoot, ghosting, scanline, NTSC, detail mask, bicubic descale |
+| `traiNNer/data/compress_video_batch.py` | **NEW** — TorchCodec/PyAV batch video compression |
+| `traiNNer/data/nlmeans_cuda.py` | **NEW** — JIT-compiled CUDA NLMeans kernel loader |
+| `traiNNer/data/iir_trailing_cuda.py` | **NEW** — JIT-compiled CUDA IIR trailing kernel loader |
+| `traiNNer/csrc/nlmeans_kernel.cu` | **NEW** — NLMeans v3 D-tile CUDA kernel |
+| `traiNNer/csrc/iir_trailing_kernel.cu` | **NEW** — IIR trailing CUDA kernel |
 | `traiNNer/data/realesrgan_dataset.py` | Added target GT loading, paired augmentation, aligned cropping |
 | `traiNNer/data/realesrgan_paired_dataset.py` | Added `paired_dataroot_gt` override, index wrapping |
 | `traiNNer/data/transforms.py` | Added `single_crop_vips()`, `augment_vips_pair()`, `paired_random_crop_multi_gt()` |

@@ -17,8 +17,16 @@ from traiNNer.data.compress_video_batch import compress_video_batch
 from traiNNer.data.gpu_degradations import (
     channel_shift_pt,
     chroma_subsample_pt,
+    composite_rainbow_pt,
+    detail_mask_neo_pt,
+    interlace_pt,
+    lowpass_filter_pt,
+    ntsc_composite_pt,
     ordered_dither_pt,
+    overshoot_pt,
     quantize_pt,
+    scanline_pt,
+    temporal_ghosting_pt,
 )
 from traiNNer.data.otf_degradations import (
     apply_dithering,
@@ -355,6 +363,117 @@ class RealESRGANModel(SRModel):
                 ),
             )
 
+    def _apply_ghosting(self, out: Tensor) -> Tensor:
+        """Apply temporal ghosting degradation (GPU)."""
+        rng = RNG.get_rng()
+        sx = int(rng.integers(*self.opt.ghosting_shift_x))
+        sy = int(rng.integers(*self.opt.ghosting_shift_y))
+        opacity = float(rng.uniform(*self.opt.ghosting_opacity))
+        return temporal_ghosting_pt(out, sx, sy, opacity)
+
+    def _apply_interlace(self, out: Tensor) -> Tensor:
+        """Apply interlace combing degradation (GPU)."""
+        rng = RNG.get_rng()
+        shift = int(rng.integers(*self.opt.interlace_field_shift))
+        field = rng.choice(self.opt.interlace_dominant_field)
+        return interlace_pt(out, shift, field)
+
+    def _apply_lowpass(self, out: Tensor) -> Tensor:
+        """Apply Butterworth lowpass filter degradation (GPU).
+
+        Optionally preserves detail/edges using a mask computed from HQ.
+        """
+        rng = RNG.get_rng()
+        cutoff = float(rng.uniform(*self.opt.lowpass_cutoff))
+        order = int(rng.integers(*self.opt.lowpass_order))
+
+        filtered = lowpass_filter_pt(out, cutoff, order)
+
+        if self.opt.lowpass_detail_mask:
+            mask = detail_mask_neo_pt(
+                self.gt, lines_brz=self.opt.lowpass_mask_lines_brz
+            )
+            # Resize mask to match LQ if sizes differ
+            if mask.shape[2:] != out.shape[2:]:
+                mask = F.interpolate(
+                    mask, size=out.shape[2:], mode="bilinear", align_corners=False
+                )
+            filtered = mask * out + (1.0 - mask) * filtered
+
+        return filtered
+
+    def _apply_ntsc(self, out: Tensor) -> Tensor:
+        """Apply full NTSC composite simulation (GPU)."""
+        _NTSC_PRESETS = {
+            "broadcast": (False, 4.2, 500, 0.03, 0.0, 0.0),
+            "vhs_sp": (True, 3.0, 500, 0.06, 0.03, 0.8),
+            "vhs_ep": (True, 1.6, 300, 0.10, 0.06, 0.5),
+        }
+
+        rng = RNG.get_rng()
+        preset = rng.choice(self.opt.ntsc_preset)
+        enable_vhs, vlbw, cubw, n, ln, er = _NTSC_PRESETS.get(
+            preset, _NTSC_PRESETS["broadcast"]
+        )
+
+        # Override with user config or preset defaults
+        if self.opt.ntsc_enable_vhs:
+            enable_vhs = True
+
+        noise_val = float(rng.uniform(*self.opt.ntsc_noise)) if self.opt.ntsc_noise != [n, n] else n
+        luma_noise_val = float(rng.uniform(*self.opt.ntsc_luma_noise)) if self.opt.ntsc_luma_noise != [ln, ln] else ln
+        ghost_amp = float(rng.uniform(*self.opt.ntsc_ghost_amplitude))
+        ghost_del = float(rng.uniform(*self.opt.ntsc_ghost_delay_us))
+        ghost_ph = float(rng.uniform(*self.opt.ntsc_ghost_phase))
+        jitter_val = float(rng.uniform(*self.opt.ntsc_jitter))
+        ringing_val = float(rng.uniform(*self.opt.ntsc_edge_ringing)) if self.opt.ntsc_edge_ringing != [er, er] else er
+        vlbw_val = float(rng.uniform(*self.opt.ntsc_vhs_luma_bw)) if self.opt.ntsc_vhs_luma_bw != [vlbw, vlbw] else vlbw
+        cubw_val = float(rng.uniform(*self.opt.ntsc_color_under_bw)) if self.opt.ntsc_color_under_bw != [cubw, cubw] else cubw
+        trail_val = float(rng.uniform(*self.opt.ntsc_tape_trailing))
+        intensity_val = float(rng.uniform(*self.opt.ntsc_intensity))
+
+        return ntsc_composite_pt(
+            out,
+            noise=noise_val,
+            luma_noise=luma_noise_val,
+            ghost_amplitude=ghost_amp,
+            ghost_delay_us=ghost_del,
+            ghost_phase=ghost_ph,
+            jitter=jitter_val,
+            edge_ringing=ringing_val,
+            vhs_luma_bw=vlbw_val,
+            color_under_bw=cubw_val,
+            tape_trailing=trail_val,
+            intensity=intensity_val,
+            comb_mode=self.opt.ntsc_comb_mode,
+            enable_vhs=enable_vhs,
+        )
+
+    def _apply_overshoot(self, out: Tensor) -> Tensor:
+        """Apply edge overshoot/undershoot degradation (GPU)."""
+        rng = RNG.get_rng()
+        amount = float(rng.uniform(*self.opt.overshoot_amount))
+        cutoff = float(rng.uniform(*self.opt.overshoot_cutoff))
+        order = int(rng.integers(*self.opt.overshoot_order))
+        return overshoot_pt(out, amount, cutoff, order)
+
+    def _apply_rainbow(self, out: Tensor) -> Tensor:
+        """Apply composite rainbow artifact (GPU)."""
+        rng = RNG.get_rng()
+        freq = float(rng.uniform(*self.opt.rainbow_subcarrier_freq))
+        bw = float(rng.uniform(*self.opt.rainbow_chroma_bandwidth))
+        intensity = float(rng.uniform(*self.opt.rainbow_intensity))
+        phase_offset = float(rng.uniform(0, 2 * 3.141592653589793))
+        return composite_rainbow_pt(
+            out, freq, bw, intensity, self.opt.rainbow_phase_alternation, phase_offset
+        )
+
+    def _apply_scanline(self, out: Tensor) -> Tensor:
+        """Apply CRT scanline darkening (GPU)."""
+        rng = RNG.get_rng()
+        strength = float(rng.uniform(*self.opt.scanline_strength))
+        return scanline_pt(out, strength, self.opt.scanline_even_lines)
+
     @torch.no_grad()
     def feed_data(self, data: DataFeed) -> None:
         """Accept data from dataloader, and then add two-order degradations to obtain LQ images."""
@@ -429,9 +548,34 @@ class RealESRGANModel(SRModel):
                 assert self.thicklines is not None
                 out = self.thicklines(out)
 
+            # ── Source-level artifacts (before blur1) ──
+            # NTSC composite simulation
+            if RNG.get_rng().uniform() < self.opt.ntsc_prob:
+                out = self._apply_ntsc(out)
+            # composite rainbow (chroma dot crawl)
+            if RNG.get_rng().uniform() < self.opt.rainbow_prob:
+                out = self._apply_rainbow(out)
+            # temporal ghosting
+            if RNG.get_rng().uniform() < self.opt.ghosting_prob:
+                out = self._apply_ghosting(out)
+            # interlace combing
+            if RNG.get_rng().uniform() < self.opt.interlace_prob:
+                out = self._apply_interlace(out)
+            # CRT scanline darkening
+            if RNG.get_rng().uniform() < self.opt.scanline_prob:
+                out = self._apply_scanline(out)
+
             # blur
             if RNG.get_rng().uniform() < self.opt.blur_prob:
                 out = filter2d(out, self.kernel1)
+
+            # ── Mastering artifacts (after blur1, before shift) ──
+            # Butterworth lowpass
+            if RNG.get_rng().uniform() < self.opt.lowpass_prob:
+                out = self._apply_lowpass(out)
+            # edge overshoot/undershoot
+            if RNG.get_rng().uniform() < self.opt.overshoot_prob:
+                out = self._apply_overshoot(out)
 
             # channel shift (before resize1)
             if RNG.get_rng().uniform() < self.opt.shift_prob:
