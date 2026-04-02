@@ -41,6 +41,27 @@ _VIDEO_SUBSAMPLING = {
     "420": "yuv420p",
 }
 
+# Supported pixel formats per codec (subset of _VIDEO_SUBSAMPLING keys)
+# Codecs reject unsupported formats at encode time — filter before selection.
+_CODEC_SUPPORTED_SAMPLING: dict[str, set[str]] = {
+    "h264": {"444", "422", "420"},
+    "hevc": {"444", "422", "420"},
+    "mpeg4": {"444", "422", "420"},
+    "vp9": {"444", "422", "420"},
+    "mpeg2": {"422", "420"},  # no yuv444p support
+}
+
+
+def _filter_sampling(
+    video_sampling: list[str], codec: str
+) -> list[str]:
+    """Filter sampling options to only those supported by the codec."""
+    supported = _CODEC_SUPPORTED_SAMPLING.get(codec)
+    if supported is None:
+        return video_sampling
+    filtered = [s for s in video_sampling if s in supported]
+    return filtered if filtered else ["420"]  # fallback to 420 if nothing matches
+
 
 def compress_video_batch_torchcodec(
     tensor: Tensor,
@@ -79,9 +100,10 @@ def compress_video_batch_torchcodec(
     codec_name, fmt = _TC_CODEC_MAP[codec]
     _, _, orig_h, orig_w = tensor.shape
 
-    # Chroma subsampling selection
+    # Chroma subsampling selection (filter to codec-supported formats)
     if video_sampling:
-        sampling_key = np.random.choice(video_sampling)
+        filtered = _filter_sampling(video_sampling, codec)
+        sampling_key = np.random.choice(filtered)
         pix_fmt = _VIDEO_SUBSAMPLING.get(sampling_key, "yuv420p")
     else:
         pix_fmt = None  # codec default
@@ -174,9 +196,10 @@ def compress_video_batch_pyav(
     # BCHW float → numpy uint8
     inp_np = (tensor.clamp(0, 1) * 255).byte().cpu().numpy()
 
-    # Chroma subsampling
+    # Chroma subsampling (filter to codec-supported formats)
     if video_sampling:
-        sampling_key = np.random.choice(video_sampling)
+        filtered = _filter_sampling(video_sampling, codec)
+        sampling_key = np.random.choice(filtered)
         pix_fmt = _VIDEO_SUBSAMPLING.get(sampling_key, "yuv420p")
     else:
         pix_fmt = "yuv420p"
