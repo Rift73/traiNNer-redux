@@ -245,6 +245,44 @@ class RealESRGANModel(SRModel):
         )
         self.lq = torch.clamp(self.lq + shared_noise_lq, 0, 1)
 
+    def _select_active_degradations(self) -> set[str]:
+        """Select which custom degradations are active for this iteration.
+
+        Uses the combo system if configured, otherwise all degradations
+        are eligible (backward-compatible default behavior).
+
+        Returns:
+            Set of active degradation names. A degradation's probability
+            check is only reached if its name is in this set.
+        """
+        combos = self.opt.otf_degradation_combos
+        if combos is None:
+            # No combo system configured — all degradations eligible
+            return {
+                "ntsc", "rainbow", "ghosting", "interlace", "scanline",
+                "lowpass", "overshoot", "shift", "subsampling", "dithering",
+                "compress", "hf_noise", "nlmeans",
+            }
+
+        active: set[str] = set()
+
+        # Always add global degradations
+        if self.opt.otf_global_degradations is not None:
+            active.update(self.opt.otf_global_degradations)
+
+        # Two-step selection: first check if any combo fires, then pick which
+        no_combo_prob = self.opt.otf_no_combo_weight
+        if RNG.get_rng().uniform() >= no_combo_prob:
+            # A combo fires — pick which one using relative weights
+            weights = self.opt.otf_degradation_combo_weights
+            if weights is None:
+                weights = [1.0] * len(combos)
+
+            selected = random.choices(combos, weights=weights, k=1)[0]
+            active.update(selected)
+
+        return active
+
     def _apply_compression(self, out: Tensor, stage: int = 1) -> Tensor:
         """Apply a randomly chosen compression algorithm.
 
@@ -548,21 +586,25 @@ class RealESRGANModel(SRModel):
                 assert self.thicklines is not None
                 out = self.thicklines(out)
 
+            # ── Select which custom degradations are active this iteration ──
+            active = self._select_active_degradations()
+
+            # ── NLMeans denoise source (before all degradations) ──
+            if "nlmeans" in active and self.opt.otf_hf_noise_denoise_lq and self.opt.otf_hf_noise_prob > 0:
+                out = nlmeans_denoise_pt(
+                    out, h=self.opt.otf_hf_noise_denoise_strength
+                )
+
             # ── Source-level artifacts (before blur1) ──
-            # NTSC composite simulation
-            if RNG.get_rng().uniform() < self.opt.ntsc_prob:
+            if "ntsc" in active and RNG.get_rng().uniform() < self.opt.ntsc_prob:
                 out = self._apply_ntsc(out)
-            # composite rainbow (chroma dot crawl)
-            if RNG.get_rng().uniform() < self.opt.rainbow_prob:
+            if "rainbow" in active and RNG.get_rng().uniform() < self.opt.rainbow_prob:
                 out = self._apply_rainbow(out)
-            # temporal ghosting
-            if RNG.get_rng().uniform() < self.opt.ghosting_prob:
+            if "ghosting" in active and RNG.get_rng().uniform() < self.opt.ghosting_prob:
                 out = self._apply_ghosting(out)
-            # interlace combing
-            if RNG.get_rng().uniform() < self.opt.interlace_prob:
+            if "interlace" in active and RNG.get_rng().uniform() < self.opt.interlace_prob:
                 out = self._apply_interlace(out)
-            # CRT scanline darkening
-            if RNG.get_rng().uniform() < self.opt.scanline_prob:
+            if "scanline" in active and RNG.get_rng().uniform() < self.opt.scanline_prob:
                 out = self._apply_scanline(out)
 
             # blur
@@ -570,19 +612,17 @@ class RealESRGANModel(SRModel):
                 out = filter2d(out, self.kernel1)
 
             # ── Mastering artifacts (after blur1, before shift) ──
-            # Butterworth lowpass
-            if RNG.get_rng().uniform() < self.opt.lowpass_prob:
+            if "lowpass" in active and RNG.get_rng().uniform() < self.opt.lowpass_prob:
                 out = self._apply_lowpass(out)
-            # edge overshoot/undershoot
-            if RNG.get_rng().uniform() < self.opt.overshoot_prob:
+            if "overshoot" in active and RNG.get_rng().uniform() < self.opt.overshoot_prob:
                 out = self._apply_overshoot(out)
 
             # channel shift (before resize1)
-            if RNG.get_rng().uniform() < self.opt.shift_prob:
+            if "shift" in active and RNG.get_rng().uniform() < self.opt.shift_prob:
                 out = self._apply_shift(out)
 
             # chroma subsampling (before resize1)
-            if RNG.get_rng().uniform() < self.opt.subsampling_prob:
+            if "subsampling" in active and RNG.get_rng().uniform() < self.opt.subsampling_prob:
                 out = self._apply_subsampling(out)
 
             # random resize
@@ -629,7 +669,7 @@ class RealESRGANModel(SRModel):
                     rounds=False,
                 )
             # compression (stage 1: JPEG, WebP, or video codec)
-            if RNG.get_rng().uniform() < self.opt.jpeg_prob:
+            if "compress" in active and RNG.get_rng().uniform() < self.opt.jpeg_prob:
                 out = self._apply_compression(out, stage=1)
 
             # ----------------------- The second degradation process ----------------------- #
@@ -681,12 +721,6 @@ class RealESRGANModel(SRModel):
                     rounds=False,
                 )
 
-            # NLMeans denoise LQ (before final resize, while resolution is still high)
-            if self.opt.otf_hf_noise_denoise_lq and self.opt.otf_hf_noise_prob > 0:
-                out = nlmeans_denoise_pt(
-                    out, h=self.opt.otf_hf_noise_denoise_strength
-                )
-
             # Compression + the final sinc filter
             # We also need to resize images to desired sizes. We group [resize back + sinc filter] together
             # as one operation.
@@ -711,11 +745,11 @@ class RealESRGANModel(SRModel):
                 )
                 out = filter2d(out, self.sinc_kernel)
                 # compression (stage 2)
-                if RNG.get_rng().uniform() < self.opt.jpeg_prob2:
+                if "compress" in active and RNG.get_rng().uniform() < self.opt.jpeg_prob2:
                     out = self._apply_compression(out, stage=2)
             else:
                 # compression (stage 2)
-                if RNG.get_rng().uniform() < self.opt.jpeg_prob2:
+                if "compress" in active and RNG.get_rng().uniform() < self.opt.jpeg_prob2:
                     out = self._apply_compression(out, stage=2)
                 # resize back + the final sinc filter
                 out = resize_pt(
@@ -740,10 +774,11 @@ class RealESRGANModel(SRModel):
                 self.gt, self.lq = paired_random_crop(
                     self.gt, self.lq, gt_size, self.opt.scale
                 )
-            self._apply_shared_hf_noise()
+            if "hf_noise" in active:
+                self._apply_shared_hf_noise()
 
             # dithering (last degradation, applied to LQ only)
-            if RNG.get_rng().uniform() < self.opt.dithering_prob:
+            if "dithering" in active and RNG.get_rng().uniform() < self.opt.dithering_prob:
                 self.lq = self._apply_dithering(self.lq)
 
             # training pair pool

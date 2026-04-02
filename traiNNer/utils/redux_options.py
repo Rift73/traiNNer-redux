@@ -551,6 +551,43 @@ class ReduxOptions(StrictStruct):
         float,
         Meta(description="Probability of using paired LR data instead of OTF LR data."),
     ] = 0
+
+    # ── Degradation Combo System ─────────────────────────────────────────────
+    otf_degradation_combos: Annotated[
+        list[list[str]] | None,
+        Meta(
+            description="List of degradation combinations. Each combo is a list of degradation names. "
+            "One combo is selected per iteration (mutually exclusive). "
+            "Valid names: ntsc, rainbow, ghosting, interlace, scanline, lowpass, overshoot, "
+            "shift, subsampling, dithering, compress, hf_noise, nlmeans. "
+            "If null, all degradations are eligible independently (default behavior)."
+        ),
+    ] = None
+    otf_degradation_combo_weights: Annotated[
+        list[float] | None,
+        Meta(
+            description="Relative weights for each combo in otf_degradation_combos. "
+            "Higher weight = more likely to be selected. Does not need to sum to 1. "
+            "Must match length of otf_degradation_combos. Null = equal weights."
+        ),
+    ] = None
+    otf_no_combo_weight: Annotated[
+        float,
+        Meta(
+            description="Probability (0-1) that no combo is selected and only global degradations apply. "
+            "0 = always pick a combo, 0.5 = 50% chance of no combo, 1.0 = never pick a combo."
+        ),
+    ] = 0.5
+    otf_global_degradations: Annotated[
+        list[str] | None,
+        Meta(
+            description="Degradations that are always eligible regardless of which combo is selected. "
+            "Valid names: same as otf_degradation_combos. "
+            "If null, no degradations are globally enabled (only combo degradations apply). "
+            "Upstream degradations (blur, resize, noise, jpeg) are always active."
+        ),
+    ] = None
+
     otf_hf_noise_normalize: Annotated[
         bool,
         Meta(

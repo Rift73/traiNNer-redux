@@ -21,8 +21,9 @@
 12. [CRT Scanline Darkening](#12-crt-scanline-darkening)
 13. [Butterworth Lowpass](#13-butterworth-lowpass)
 14. [Edge Overshoot](#14-edge-overshoot)
-15. [Pipeline Order](#15-pipeline-order)
-16. [YML Quick Reference](#16-yml-quick-reference)
+15. [Degradation Combo System](#15-degradation-combo-system)
+16. [Pipeline Order](#16-pipeline-order)
+17. [YML Quick Reference](#17-yml-quick-reference)
 
 ---
 
@@ -876,7 +877,49 @@ Pure PyTorch GPU via FFT. High-boost filter: `H(f) = 1 + amount * (1 - Butterwor
 
 ---
 
-## 15. Pipeline Order
+## 15. Degradation Combo System
+
+Controls which custom degradations can activate together in each iteration. Prevents nonsensical combinations (e.g., NTSC + Rainbow double-applying composite artifacts) and enables coherent degradation themes.
+
+### How It Works
+
+1. **Two-step selection**: First, roll `otf_no_combo_weight` to decide if any combo fires. Then, if yes, pick one combo using relative weights.
+2. **Global degradations** are always eligible regardless of combo selection.
+3. **Upstream degradations** (blur, resize, noise, DiffJPEG) are always active — they're the Real-ESRGAN backbone.
+4. **Backward compatible**: If `otf_degradation_combos` is null, all custom degradations check their probability independently (default behavior).
+
+### Config Fields
+
+```yaml
+# Themed combos (mutually exclusive — one selected per iteration)
+otf_degradation_combos:
+  - [ntsc, ghosting, scanline]           # VHS/broadcast look
+  - [rainbow, interlace, scanline]       # CRT composite look
+  - [lowpass, overshoot]                 # anime mastering
+
+# Relative weights (higher = more likely). Does not need to sum to 1.
+otf_degradation_combo_weights: [3, 3, 2]
+
+# Probability (0-1) that no combo fires. Remainder goes to combo selection.
+otf_no_combo_weight: 0.3    # 30% global only, 70% one of the combos
+
+# Always eligible regardless of combo selection
+otf_global_degradations: [shift, subsampling, dithering, compress]
+```
+
+With the above config and `otf_no_combo_weight: 0.3`:
+- 30% → no combo (only global degradations: shift, subsampling, dithering, compress)
+- 70% × 3/8 = 26.25% → VHS combo (ntsc + ghosting + scanline + globals)
+- 70% × 3/8 = 26.25% → CRT combo (rainbow + interlace + scanline + globals)
+- 70% × 2/8 = 17.5% → anime combo (lowpass + overshoot + globals)
+
+### Valid Degradation Names
+
+`ntsc`, `rainbow`, `ghosting`, `interlace`, `scanline`, `lowpass`, `overshoot`, `shift`, `subsampling`, `dithering`, `compress`, `hf_noise`, `nlmeans`
+
+---
+
+## 16. Pipeline Order
 
 The complete OTF degradation pipeline with all custom features:
 
@@ -885,6 +928,8 @@ GT Source
   │
   ├─ USM sharpening (optional)
   ├─ ThickLines filter (optional)
+  ├─ ★ Select active degradations (combo system)
+  ├─ ★ NLMeans denoise source (optional, before all degradations)
   ├─ ★ NTSC Composite (optional)
   ├─ ★ Composite Rainbow (optional)
   ├─ ★ Temporal Ghosting (optional)
@@ -901,7 +946,6 @@ GT Source
   ├─ Blur 2
   ├─ Resize 2
   ├─ Noise 2 (Gaussian or Poisson)
-  ├─ ★ NLMeans denoise LQ (optional, before final resize)
   ├─ ★ Compression 2 + Final Resize + Final Sinc (interleaved)
   ├─ Clamp & Round
   ├─ Random Crop (paired with GT)
@@ -915,7 +959,7 @@ GT Source
 
 ---
 
-## 16. YML Quick Reference
+## 17. YML Quick Reference
 
 ### All custom fields at a glance
 
@@ -998,6 +1042,10 @@ GT Source
 | `overshoot_amount` | top | [float, float] | `[0.5, 2.0]` | Overshoot |
 | `overshoot_cutoff` | top | [float, float] | `[0.2, 0.5]` | Overshoot |
 | `overshoot_order` | top | [int, int] | `[1, 3]` | Overshoot |
+| `otf_degradation_combos` | top | list[list[str]] \| null | `~` | Combo System |
+| `otf_degradation_combo_weights` | top | list[float] \| null | `~` | Combo System |
+| `otf_no_combo_weight` | top | float | `0.5` | Combo System |
+| `otf_global_degradations` | top | list[str] \| null | `~` | Combo System |
 
 > **"top"** = same indentation level as `high_order_degradation`, `scale`, `queue_size`, etc.
 > **"datasets.train"** = inside `datasets: train:` block.
