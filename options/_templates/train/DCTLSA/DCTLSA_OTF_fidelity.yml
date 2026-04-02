@@ -33,8 +33,8 @@ gaussian_noise_prob: 0.0
 noise_range: [0, 0]
 poisson_scale_range: [0, 0]
 gray_noise_prob: 0.0
-jpeg_prob: 1.0
-jpeg_range: [75, 95]
+compress_prob: 1.0
+compress_jpeg_range: [75, 95]
 
 # The second degradation process.
 blur_prob2: 0.0
@@ -46,8 +46,8 @@ gaussian_noise_prob2: 0
 noise_range2: [0, 0]
 poisson_scale_range2: [0, 0]
 gray_noise_prob2: 0.0
-jpeg_prob2: 1.0
-jpeg_range2: [75, 95]
+compress_prob2: 1.0
+compress_jpeg_range2: [75, 95]
 
 # The final resize to the target resolution.
 resize_mode_list3: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']  # bilinear, bicubic, nearest-exact, lanczos

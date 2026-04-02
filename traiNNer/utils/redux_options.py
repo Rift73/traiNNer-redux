@@ -998,18 +998,12 @@ class ReduxOptions(StrictStruct):
     noise_range: tuple[float, float] = (0, 0)
     poisson_scale_range: tuple[float, float] = (0, 0)
     gray_noise_prob: float = 0
-    jpeg_prob: Annotated[
+    compress_prob: Annotated[
         float,
         Meta(
-            description="The probability of applying compression (JPEG or other configured algorithm) to the LQ in stage 1, between 0 and 1."
+            description="Probability of applying compression in stage 1, between 0 and 1."
         ),
     ] = 1
-    jpeg_range: Annotated[
-        tuple[float, float],
-        Meta(
-            description="The range of JPEG quality to apply for the first JPEG degradation, in the format `[min_quality, max_quality]`."
-        ),
-    ] = (75, 95)
     compress_algorithms: Annotated[
         list[str],
         Meta(
@@ -1022,6 +1016,10 @@ class ReduxOptions(StrictStruct):
             description="Probability weights for each algorithm in compress_algorithms. Must match length of compress_algorithms."
         ),
     ] = field(default_factory=lambda: [1.0])
+    compress_jpeg_range: Annotated[
+        tuple[float, float],
+        Meta(description="Quality range for JPEG compression in stage 1 (0-100)."),
+    ] = (75, 95)
     compress_webp_range: Annotated[
         tuple[int, int],
         Meta(description="Quality range for WebP compression in stage 1 (1-100)."),
@@ -1092,18 +1090,12 @@ class ReduxOptions(StrictStruct):
     noise_range2: tuple[float, float] = (0, 0)
     poisson_scale_range2: tuple[float, float] = (0, 0)
     gray_noise_prob2: float = 0
-    jpeg_prob2: Annotated[
+    compress_prob2: Annotated[
         float,
         Meta(
-            description="The probability of applying compression (JPEG or other configured algorithm) to the LQ in stage 2, between 0 and 1."
+            description="Probability of applying compression in stage 2, between 0 and 1."
         ),
     ] = 1
-    jpeg_range2: Annotated[
-        list[float],
-        Meta(
-            description="The range of JPEG quality to apply for the second JPEG degradation, in the format `[min_quality, max_quality]`."
-        ),
-    ] = field(default_factory=lambda: [75, 95])
     compress_algorithms2: Annotated[
         list[str],
         Meta(
@@ -1116,6 +1108,10 @@ class ReduxOptions(StrictStruct):
             description="Probability weights for each algorithm in compress_algorithms2."
         ),
     ] = field(default_factory=lambda: [1.0])
+    compress_jpeg_range2: Annotated[
+        tuple[float, float],
+        Meta(description="Quality range for JPEG compression in stage 2 (0-100)."),
+    ] = (75, 95)
     compress_webp_range2: Annotated[
         tuple[int, int],
         Meta(description="Quality range for WebP compression in stage 2 (1-100)."),

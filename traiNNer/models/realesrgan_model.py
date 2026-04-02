@@ -303,7 +303,7 @@ class RealESRGANModel(SRModel):
         algo = random.choices(algos, probs)[0]
 
         if algo == "jpeg":
-            jpeg_range = self.opt.jpeg_range if stage == 1 else self.opt.jpeg_range2
+            jpeg_range = self.opt.compress_jpeg_range if stage == 1 else self.opt.compress_jpeg_range2
             jpeg_p = out.new_zeros(out.size(0)).uniform_(*jpeg_range)
             out = torch.clamp(out, 0, 1)
             out = self.jpeger(out, quality=jpeg_p)
@@ -669,7 +669,7 @@ class RealESRGANModel(SRModel):
                     rounds=False,
                 )
             # compression (stage 1: JPEG, WebP, or video codec)
-            if "compress" in active and RNG.get_rng().uniform() < self.opt.jpeg_prob:
+            if "compress" in active and RNG.get_rng().uniform() < self.opt.compress_prob:
                 out = self._apply_compression(out, stage=1)
 
             # ----------------------- The second degradation process ----------------------- #
@@ -745,11 +745,11 @@ class RealESRGANModel(SRModel):
                 )
                 out = filter2d(out, self.sinc_kernel)
                 # compression (stage 2)
-                if "compress" in active and RNG.get_rng().uniform() < self.opt.jpeg_prob2:
+                if "compress" in active and RNG.get_rng().uniform() < self.opt.compress_prob2:
                     out = self._apply_compression(out, stage=2)
             else:
                 # compression (stage 2)
-                if "compress" in active and RNG.get_rng().uniform() < self.opt.jpeg_prob2:
+                if "compress" in active and RNG.get_rng().uniform() < self.opt.compress_prob2:
                     out = self._apply_compression(out, stage=2)
                 # resize back + the final sinc filter
                 out = resize_pt(
