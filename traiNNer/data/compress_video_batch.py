@@ -46,9 +46,9 @@ _VIDEO_SUBSAMPLING = {
 _CODEC_SUPPORTED_SAMPLING: dict[str, set[str]] = {
     "h264": {"444", "422", "420"},
     "hevc": {"444", "422", "420"},
-    "mpeg4": {"444", "422", "420"},
+    "mpeg4": {"420"},              # only yuv420p
     "vp9": {"444", "422", "420"},
-    "mpeg2": {"422", "420"},  # no yuv444p support
+    "mpeg2": {"422", "420"},       # no yuv444p
 }
 
 
