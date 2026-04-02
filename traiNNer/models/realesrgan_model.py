@@ -395,7 +395,7 @@ class RealESRGANModel(SRModel):
         rng = RNG.get_rng()
         dtype = rng.choice(self.opt.dithering_types)
 
-        if self.opt.dithering_palette_mode:
+        if self.opt.dithering_palette_mode and dtype != "order":
             # Palette mode: extract content-adaptive palette, dither to those colors
             num_colors = int(rng.integers(*self.opt.dithering_palette_size))
             map_size = int(rng.choice(self.opt.dithering_map_size))
