@@ -298,6 +298,98 @@ def compress_video(
 # ── Dithering ──────────────────────────────────────────────────────────────────
 
 
+def _extract_palette(img: np.ndarray, num_colors: int) -> np.ndarray:
+    """Extract a content-adaptive color palette using PIL median cut.
+
+    Args:
+        img: HWC float32 [0,1] RGB image.
+        num_colors: Number of palette colors (2-256).
+
+    Returns:
+        Palette as (1, num_colors, C) float32 array for PaletteQuantization.
+    """
+    img_u8 = (img * 255).clip(0, 255).astype(np.uint8)
+    if img.ndim == 2:
+        pil_img = Image.fromarray(img_u8, mode="L")
+    else:
+        pil_img = Image.fromarray(img_u8, mode="RGB")
+
+    quantized = pil_img.quantize(
+        colors=num_colors,
+        method=Image.Quantize.MEDIANCUT,
+        dither=Image.Dither.NONE,
+    )
+
+    palette_raw = quantized.getpalette()
+    if palette_raw is None:
+        raise ValueError(f"Failed to extract palette with {num_colors} colors")
+    channels = 1 if img.ndim == 2 else 3
+    palette = np.array(
+        palette_raw[: num_colors * channels], dtype=np.float32
+    ).reshape(1, num_colors, channels) / 255.0
+    return palette
+
+
+def apply_dithering_palette(
+    img: np.ndarray,
+    dithering_type: str,
+    num_colors: int,
+    map_size: int = 4,
+    history: int = 12,
+    decay_ratio: float = 0.5,
+) -> np.ndarray:
+    """Apply dithering with content-adaptive palette quantization (indexed color).
+
+    Extracts a palette via median cut, then dithers to those colors.
+    Like GIF/PNG8 quantization but with proper error diffusion.
+
+    Args:
+        img: HWC float32 [0,1] image.
+        dithering_type: Algorithm name.
+        num_colors: Number of palette colors (2-256).
+        map_size: Map size for ordered dithering.
+        history: History length for Riemersma dithering.
+        decay_ratio: Decay ratio for Riemersma dithering.
+
+    Returns:
+        HWC float32 [0,1] dithered image.
+    """
+    from chainner_ext import (
+        DiffusionAlgorithm,
+        PaletteQuantization,
+        error_diffusion_dither,
+        quantize,
+        riemersma_dither,
+    )
+
+    error_diffusion_map: dict[str, DiffusionAlgorithm] = {
+        "floydsteinberg": DiffusionAlgorithm.FloydSteinberg,
+        "jarvisjudiceninke": DiffusionAlgorithm.JarvisJudiceNinke,
+        "stucki": DiffusionAlgorithm.Stucki,
+        "atkinson": DiffusionAlgorithm.Atkinson,
+        "burkes": DiffusionAlgorithm.Burkes,
+        "sierra": DiffusionAlgorithm.Sierra,
+        "tworowsierra": DiffusionAlgorithm.TwoRowSierra,
+        "sierralite": DiffusionAlgorithm.SierraLite,
+    }
+
+    palette = _extract_palette(img, num_colors)
+    pq = PaletteQuantization(palette)
+
+    if dithering_type in error_diffusion_map:
+        result = error_diffusion_dither(img, pq, error_diffusion_map[dithering_type])
+    elif dithering_type == "riemersma":
+        result = riemersma_dither(img, pq, history, decay_ratio)
+    elif dithering_type in ("quantize", "order"):
+        # ordered_dither only accepts UniformQuantization — fall back to quantize
+        result = quantize(img, pq)
+    else:
+        logger.warning("Unknown dithering type: %s, skipping", dithering_type)
+        return img
+
+    return np.squeeze(result)
+
+
 def apply_dithering(
     img: np.ndarray,
     dithering_type: str,

@@ -674,6 +674,21 @@ class ReduxOptions(StrictStruct):
             description="Range of decay ratio values for Riemersma dithering."
         ),
     ] = (0.1, 0.9)
+    dithering_palette_mode: Annotated[
+        bool,
+        Meta(
+            description="Use palette-based (indexed color) quantization instead of uniform per-channel. "
+            "Extracts a content-adaptive palette via median cut, like GIF/PNG8. "
+            "When enabled, dithering_palette_size controls the number of colors instead of dithering_quantize_range."
+        ),
+    ] = False
+    dithering_palette_size: Annotated[
+        tuple[int, int],
+        Meta(
+            description="Range of palette colors (2-256) when palette mode is enabled. "
+            "E.g. [64, 256] for 64-256 color indexed dithering."
+        ),
+    ] = (8, 64)
 
     # ── Channel Shift (applied before resize1) ────────────────────────────────
     shift_prob: Annotated[

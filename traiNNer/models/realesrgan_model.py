@@ -30,6 +30,7 @@ from traiNNer.data.gpu_degradations import (
 )
 from traiNNer.data.otf_degradations import (
     apply_dithering,
+    apply_dithering_palette,
     apply_per_image,
     apply_per_image_parallel,
     compress_webp,
@@ -385,12 +386,29 @@ class RealESRGANModel(SRModel):
     def _apply_dithering(self, out: Tensor) -> Tensor:
         """Apply dithering degradation to the LQ tensor.
 
-        GPU path for quantize/ordered dither (5-10x faster).
-        CPU path via chainner_ext for error diffusion and riemersma
-        (causal scan dependency prevents efficient GPU parallelization).
+        Two modes:
+        - Palette mode: content-adaptive indexed color (like GIF/PNG8) via median cut.
+          Always CPU (chainner_ext PaletteQuantization).
+        - Uniform mode: per-channel quantization levels.
+          GPU path for quantize/ordered dither, CPU for error diffusion/riemersma.
         """
         rng = RNG.get_rng()
         dtype = rng.choice(self.opt.dithering_types)
+
+        if self.opt.dithering_palette_mode:
+            # Palette mode: extract content-adaptive palette, dither to those colors
+            num_colors = int(rng.integers(*self.opt.dithering_palette_size))
+            map_size = int(rng.choice(self.opt.dithering_map_size))
+            history = int(rng.integers(*self.opt.dithering_history_range))
+            decay_ratio = float(rng.uniform(*self.opt.dithering_ratio_range))
+            return apply_per_image(
+                out,
+                lambda img: apply_dithering_palette(
+                    img, dtype, num_colors, map_size, history, decay_ratio
+                ),
+            )
+
+        # Uniform quantization mode
         quantize_ch = int(rng.integers(*self.opt.dithering_quantize_range))
 
         if dtype == "quantize":
