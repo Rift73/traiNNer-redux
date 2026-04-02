@@ -324,9 +324,14 @@ def _extract_palette(img: np.ndarray, num_colors: int) -> np.ndarray:
     if palette_raw is None:
         raise ValueError(f"Failed to extract palette with {num_colors} colors")
     channels = 1 if img.ndim == 2 else 3
+    # PIL may return fewer colors than requested if the image has fewer unique colors
+    available = len(palette_raw) // channels
+    actual_colors = min(num_colors, available)
+    if actual_colors < 2:
+        actual_colors = 2
     palette = np.array(
-        palette_raw[: num_colors * channels], dtype=np.float32
-    ).reshape(1, num_colors, channels) / 255.0
+        palette_raw[: actual_colors * channels], dtype=np.float32
+    ).reshape(1, actual_colors, channels) / 255.0
     return palette
 
 
