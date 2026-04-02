@@ -327,8 +327,17 @@ class RealESRGANModel(SRModel):
                 if stage == 1
                 else self.opt.compress_video_sampling2
             )
+            sampling_weights = (
+                self.opt.compress_video_sampling_weights
+                if stage == 1
+                else self.opt.compress_video_sampling_weights2
+            )
+            # Select one sampling format using weights (or uniform if None)
+            selected_sampling = random.choices(
+                video_sampling, weights=sampling_weights, k=1
+            )
             out = torch.clamp(out, 0, 1)
-            out = compress_video_batch(out, algo, quality, video_sampling)
+            out = compress_video_batch(out, algo, quality, selected_sampling)
         return out
 
     def _apply_shift(self, out: Tensor) -> Tensor:

@@ -1050,6 +1050,13 @@ class ReduxOptions(StrictStruct):
             description="List of video chroma subsampling options for video codecs in stage 1. Options: 444, 422, 420."
         ),
     ] = field(default_factory=lambda: ["444", "422", "420"])
+    compress_video_sampling_weights: Annotated[
+        list[float] | None,
+        Meta(
+            description="Relative weights for each option in compress_video_sampling. "
+            "Must match length. Null = equal weights (uniform random)."
+        ),
+    ] = None
 
     blur_prob2: Annotated[
         float,
@@ -1142,6 +1149,13 @@ class ReduxOptions(StrictStruct):
             description="List of video chroma subsampling options for video codecs in stage 2."
         ),
     ] = field(default_factory=lambda: ["444", "422", "420"])
+    compress_video_sampling_weights2: Annotated[
+        list[float] | None,
+        Meta(
+            description="Relative weights for each option in compress_video_sampling2. "
+            "Must match length. Null = equal weights (uniform random)."
+        ),
+    ] = None
 
     resize_mode_list3: Annotated[
         list[Literal["bilinear", "bicubic", "nearest-exact", "lanczos", "area"]],
