@@ -539,6 +539,7 @@ def composite_rainbow_pt(
 # ═══════════════════════════════════════════════════════════════
 
 
+@torch.compiler.disable
 def lowpass_filter_pt(
     tensor: Tensor,
     cutoff: float = 0.5,
@@ -621,6 +622,7 @@ def interlace_pt(
 # ═══════════════════════════════════════════════════════════════
 
 
+@torch.compiler.disable
 def overshoot_pt(
     tensor: Tensor,
     amount: float = 1.5,
@@ -1132,6 +1134,7 @@ def _ntsc_design_fir(
     return kernel
 
 
+@torch.compiler.disable
 def _ntsc_fir_filter_rows(signal: Tensor, kernel: Tensor) -> Tensor:
     """Zero-phase FIR filtering along the last (width) dimension via FFT."""
     b, c, h, w = signal.shape
@@ -1224,6 +1227,7 @@ def _ntsc_iir_trailing(signal: Tensor, strength: float) -> Tensor:
 
 
 @torch.no_grad()
+@torch.compiler.disable
 def ntsc_composite_pt(
     tensor: Tensor,
     noise: float = 0.05,
