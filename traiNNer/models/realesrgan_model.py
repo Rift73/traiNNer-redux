@@ -237,7 +237,8 @@ class RealESRGANModel(SRModel):
             return
 
         noise = self._generate_hf_noise(self.gt)
-        self.gt = torch.clamp(self.gt + noise, 0, 1)
+        noise = torch.max(-self.gt, torch.min(1 - self.gt, noise))
+        self.gt = self.gt + noise
 
     def _select_active_degradations(self) -> set[str]:
         """Select which custom degradations are active for this iteration.
