@@ -324,11 +324,17 @@ def _extract_palette(img: np.ndarray, num_colors: int) -> np.ndarray:
     if palette_raw is None:
         raise ValueError(f"Failed to extract palette with {num_colors} colors")
     channels = 1 if img.ndim == 2 else 3
-    # PIL may return fewer colors than requested if the image has fewer unique colors
-    available = len(palette_raw) // channels
-    actual_colors = min(num_colors, available)
-    if actual_colors < 2:
-        actual_colors = 2
+    # getpalette() always returns 768 values (256×3) but only the first N
+    # entries are meaningful. Count actual unique indices used.
+    actual_colors = len(set(quantized.getdata()))
+    actual_colors = min(actual_colors, num_colors)
+    # Ensure we have enough palette data and at least 2 colors
+    max_from_palette = len(palette_raw) // channels
+    actual_colors = min(actual_colors, max_from_palette)
+    actual_colors = max(actual_colors, 2)
+    # If palette is too small for even 2 colors, skip dithering
+    if len(palette_raw) < actual_colors * channels:
+        return None
     palette = np.array(
         palette_raw[: actual_colors * channels], dtype=np.float32
     ).reshape(1, actual_colors, channels) / 255.0
@@ -379,6 +385,8 @@ def apply_dithering_palette(
     }
 
     palette = _extract_palette(img, num_colors)
+    if palette is None:
+        return img
     pq = PaletteQuantization(palette)
 
     if dithering_type in error_diffusion_map:
