@@ -393,7 +393,7 @@ class RealESRGANModel(SRModel):
           GPU path for quantize/ordered dither, CPU for error diffusion/riemersma.
         """
         rng = RNG.get_rng()
-        dtype = rng.choice(self.opt.dithering_types)
+        dtype = rng.choice(self.opt.dithering_types).lower()
 
         if self.opt.dithering_palette_mode and dtype != "order":
             # Palette mode: extract content-adaptive palette, dither to those colors
