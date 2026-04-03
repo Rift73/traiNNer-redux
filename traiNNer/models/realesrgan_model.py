@@ -156,7 +156,7 @@ class RealESRGANModel(SRModel):
         )
         return distribution.sample().to(device=device, dtype=dtype)
 
-    def _generate_shared_hf_noise(self, img: Tensor) -> Tensor:
+    def _generate_hf_noise(self, img: Tensor) -> Tensor:
         batch_size, channels, height, width = img.shape
         rng = RNG.get_rng()
         sample_dtype = torch.float32
@@ -227,24 +227,17 @@ class RealESRGANModel(SRModel):
 
         return noise.to(dtype=img.dtype)
 
-    def _apply_shared_hf_noise(self) -> None:
+    def _apply_hf_noise(self) -> None:
         if self.opt.otf_hf_noise_prob <= 0:
             return
 
         assert self.gt is not None
-        assert self.lq is not None
 
         if RNG.get_rng().uniform() >= self.opt.otf_hf_noise_prob:
             return
 
-        shared_noise = self._generate_shared_hf_noise(self.gt)
-        self.gt = torch.clamp(self.gt + shared_noise, 0, 1)
-        shared_noise_lq = resize_pt(
-            shared_noise,
-            size=self.lq.shape[-2:],
-            mode="nearest-exact",
-        )
-        self.lq = torch.clamp(self.lq + shared_noise_lq, 0, 1)
+        noise = self._generate_hf_noise(self.gt)
+        self.gt = torch.clamp(self.gt + noise, 0, 1)
 
     def _select_active_degradations(self) -> set[str]:
         """Select which custom degradations are active for this iteration.
@@ -802,7 +795,7 @@ class RealESRGANModel(SRModel):
                     self.gt, self.lq, gt_size, self.opt.scale
                 )
             if "hf_noise" in active:
-                self._apply_shared_hf_noise()
+                self._apply_hf_noise()
 
             # dithering (last degradation, applied to LQ only)
             if "dithering" in active and RNG.get_rng().uniform() < self.opt.dithering_prob:
