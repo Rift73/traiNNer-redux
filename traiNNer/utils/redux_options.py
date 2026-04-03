@@ -675,13 +675,14 @@ class ReduxOptions(StrictStruct):
         ),
     ] = (0.1, 0.9)
     dithering_palette_mode: Annotated[
-        bool,
+        float,
         Meta(
-            description="Use palette-based (indexed color) quantization instead of uniform per-channel. "
-            "Extracts a content-adaptive palette via median cut, like GIF/PNG8. "
-            "When enabled, dithering_palette_size controls the number of colors instead of dithering_quantize_range."
+            description="Probability of using palette-based (indexed color) quantization instead of uniform per-channel. "
+            "0.0 = always uniform, 1.0 = always palette, 0.5 = 50/50 mix. "
+            "Palette mode extracts a content-adaptive palette via median cut, like GIF/PNG8. "
+            "When palette mode fires, dithering_palette_size controls the number of colors instead of dithering_quantize_range."
         ),
-    ] = False
+    ] = 0.0
     dithering_palette_size: Annotated[
         tuple[int, int],
         Meta(
