@@ -330,8 +330,15 @@ def imfrombytes(content: bytes, flag: str = "color", float32: bool = False) -> M
 def vipsimfrompath(path: str) -> pyvips.Image:
     img = pyvips.Image.new_from_file(
         path, access="sequential", fail=True
-    ).icc_transform("srgb")  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    )  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
     assert isinstance(img, pyvips.Image)
+    try:
+        img = img.icc_transform("srgb")
+    except pyvips.error.Error:
+        # Broken ICC profile — strip it and continue with raw pixel data
+        img = img.copy()
+        if img.get_typeof("icc-profile-data") != 0:
+            img.remove("icc-profile-data")
     return img
 
 
