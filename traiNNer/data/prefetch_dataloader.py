@@ -9,6 +9,15 @@ from torch.utils.data import DataLoader
 from traiNNer.utils.redux_options import ReduxOptions
 
 
+def _memory_format_for_tensor(
+    tensor: torch.Tensor, memory_format: torch.memory_format
+) -> torch.memory_format:
+    """Apply channels_last only to rank-4 image tensors."""
+    if memory_format is torch.channels_last and tensor.dim() != 4:
+        return torch.preserve_format
+    return memory_format
+
+
 class PrefetchGenerator(threading.Thread):
     """A general prefetch generator.
 
@@ -122,7 +131,7 @@ class CUDAPrefetcher:
                 if torch.is_tensor(v):
                     self.batch[k] = self.batch[k].to(
                         device=self.device,
-                        memory_format=self.memory_format,
+                        memory_format=_memory_format_for_tensor(v, self.memory_format),
                         non_blocking=True,
                     )
 

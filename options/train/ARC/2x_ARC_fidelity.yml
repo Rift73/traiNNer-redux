@@ -1,0 +1,154 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/the-database/traiNNer-redux/refs/heads/master/schemas/redux-config.schema.json
+#########################################################################################
+# General Settings
+#########################################################################################
+name: 2x_ARC_fidelity
+scale: 2
+use_amp: true
+amp_bf16: true
+use_channels_last: true
+fast_matmul: true
+use_compile: true
+compile_mode: max-autotune-no-cudagraphs
+num_gpu: auto
+
+high_order_degradation: true
+high_order_degradations_debug: false
+high_order_degradations_debug_limit: 100
+
+lq_usm: false
+lq_usm_radius_range: [1, 25]
+
+thicklines_prob: 0.0
+blur_prob: 0.0
+resize_prob: [0.0, 0.0, 1.0]
+resize_mode_list: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+resize_mode_prob: [0.0, 1.0, 0.0, 0.0]
+resize_range: [1.0, 1.0]
+gaussian_noise_prob: 0.0
+noise_range: [0, 0]
+poisson_scale_range: [0, 0]
+gray_noise_prob: 0.0
+compress_prob: 0.0
+compress_jpeg_range: [100, 100]
+
+blur_prob2: 0.0
+resize_prob2: [0.0, 0.0, 1.0]
+resize_mode_list2: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+resize_mode_prob2: [0.0, 1.0, 0.0, 0.0]
+resize_range2: [1.0, 1.0]
+gaussian_noise_prob2: 0
+noise_range2: [0, 0]
+poisson_scale_range2: [0, 0]
+gray_noise_prob2: 0.0
+compress_prob2: 0.0
+compress_jpeg_range2: [100, 100]
+
+resize_mode_list3: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+resize_mode_prob3: [0.0, 1.0, 0.0, 0.0]
+
+queue_size: 64
+
+datasets:
+  train:
+    name: Train Dataset
+    type: realesrgandataset
+    dataroot_gt: [
+      datasets/train/DiverSeg-IP/HR
+    ]
+    lq_size: 128
+    use_hflip: true
+    use_rot: true
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 16
+    accum_iter: 2
+    prefetch_mode: cuda
+    prefetch_factor: 2
+    persistent_workers: true
+    pin_memory: true
+
+  val_1:
+    name: Urban100
+    type: pairedimagedataset
+    dataroot_gt: [
+      datasets/val/dataset7/HR
+    ]
+    dataroot_lq: [
+      datasets/val/dataset7/LR2
+    ]
+    io_backend:
+      type: disk
+
+  val_2:
+    name: Manga109
+    type: pairedimagedataset
+    dataroot_gt: [
+      datasets/val/MANGA109_prep/HR
+    ]
+    dataroot_lq: [
+      datasets/val/MANGA109_prep/LR2
+    ]
+    io_backend:
+      type: disk
+
+network_g:
+  type: arc_s
+  scale: 2
+  window_size: 32
+  rank: 32
+  use_checkpoint: true
+  attn_type: hybrid
+
+path:
+  pretrain_network_g: ~
+  param_key_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  ema_power: 0.75
+  grad_clip: false
+
+  # Resume from 6k with the first decay already applied, then decay again at 56k.
+  optim_g:
+    type: AdamW
+    lr: !!float 2e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [300000, 500000, 650000, 700000, 750000]
+    gamma: 0.5
+
+  total_iter: 800000
+  warmup_iter: -1
+
+  losses:
+    - type: charbonnierloss
+      loss_weight: 1.0
+
+val:
+  val_enabled: true
+  val_freq: 10000
+  save_img: true
+  tile_size: 0
+  tile_overlap: 8
+
+  metrics_enabled: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 4
+      test_y_channel: true
+    ssim:
+      type: calculate_ssim
+      crop_border: 4
+      test_y_channel: true
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 10000
+  save_checkpoint_format: safetensors
+  use_tb_logger: true

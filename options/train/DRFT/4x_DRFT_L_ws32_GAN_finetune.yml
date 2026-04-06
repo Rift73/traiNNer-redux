@@ -1,0 +1,370 @@
+# GENERATE TIME: Wed Mar 25 21:02:19 2026
+# CMD:
+# train.py --auto_resume -opt ./options/train/DRFT/4x_DRFT_L_ws32_GAN_finetune.yml
+
+# GENERATE TIME: Sat Mar 21 09:21:39 2026
+# CMD:
+# train.py --launcher pytorch --auto_resume -opt ./options/train/DRFT/4x_DRFT_L_ws32_GAN_finetune.yml
+
+# GENERATE TIME: Fri Mar 20 15:08:09 2026
+# CMD:
+# train.py --launcher pytorch --auto_resume -opt ./options/train/DRFT/4x_DRFT_L_ws32_GAN_finetune.yml
+
+# yaml-language-server: $schema=https://raw.githubusercontent.com/the-database/traiNNer-redux/refs/heads/master/schemas/redux-config.schema.json
+#########################################################################################
+# General Settings
+# Based on 4x_DRFT_L_fidelity.yml, but tuned for late-stage ws=32 fine-tuning.
+#########################################################################################
+name: 4x_DRFT_L_GAN_finetune
+scale: 4
+use_amp: true
+amp_bf16: true
+use_channels_last: true
+fast_matmul: true
+use_compile: true
+compile_mode: max-autotune-no-cudagraphs
+num_gpu: auto
+
+high_order_degradation: true  # Enable on-the-fly (OTF) degradations, which generates LR tiles from HRs during training.
+high_order_degradations_debug: false  # Save the LR and HR tiles to debug/otf folder inside the root of the training directory.
+high_order_degradations_debug_limit: 100  # The max number of iterations to save LR and HR tiles for.
+
+# ── Degradation Combo System ──────────────────────────────────────────────────
+# Controls which custom degradations can activate together per iteration.
+# If otf_degradation_combos is null, all degradations check their prob independently (default).
+otf_degradation_combos: ~                  # null = all eligible independently (backward compat)
+# otf_degradation_combos:                  # Example: mutually exclusive themed combos
+#   - [ntsc, ghosting, scanline]           #   VHS/broadcast look
+#   - [rainbow, interlace, scanline]       #   CRT composite look
+#   - [lowpass, overshoot]                 #   anime mastering
+# otf_degradation_combo_weights: [3, 3, 2] # relative weights (higher = more likely)
+otf_degradation_combo_weights: ~           # null = equal weights
+otf_no_combo_weight: 0.1                   # 0-1: probability no combo fires (global only)
+otf_global_degradations: ~                 # null = none. Example: [shift, subsampling, dithering, compress]
+# Valid degradation names: ntsc, rainbow, ghosting, interlace, scanline,
+#   lowpass, overshoot, shift, subsampling, dithering, compress, hf_noise, nlmeans
+
+# USM degradation options.
+lq_usm: false  # Apply unsharp mask to LQ image before all other degradations.
+lq_usm_radius_range: [1, 25]  # Range of randomly selected unsharp mask radius to apply.
+
+# The first degradation process.
+thicklines_prob: 0.0
+blur_prob: 0.02
+resize_prob: [0.15, 0.15, 0.7]  # up, down, keep
+resize_mode_list: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']  # bilinear, bicubic, nearest-exact, lanczos
+resize_mode_prob: [0.3, 0.3, 0.1, 0.3]  # Probability each resize mode is selected.
+resize_range: [0.4, 1.5]
+gaussian_noise_prob: 0.0
+noise_range: [0, 0]
+poisson_scale_range: [0, 0]
+gray_noise_prob: 0.0
+
+# The second degradation process.
+blur_prob2: 0.02
+resize_prob2: [0.15, 0.15, 0.7]  # up, down, keep
+resize_mode_list2: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']  # bilinear, bicubic, nearest-exact, lanczos
+resize_mode_prob2: [0.3, 0.3, 0.1, 0.3]  # Probability each resize mode is selected.
+resize_range2: [0.6, 1.2]
+gaussian_noise_prob2: 0
+noise_range2: [0, 0]
+poisson_scale_range2: [0, 0]
+gray_noise_prob2: 0.0
+
+# The final resize to the target resolution.
+resize_mode_list3: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']  # bilinear, bicubic, nearest-exact, lanczos
+resize_mode_prob3: [0.3, 0.3, 0.1, 0.3]  # Probability each resize mode is selected.
+
+# ── Custom OTF Degradations (all disabled by default) ─────────────────────────
+
+# ── Source-level artifacts (applied before blur1) ──
+
+# NTSC composite simulation (full encode/decode at real NTSC sample rate)
+ntsc_prob: 0                           # probability of applying
+ntsc_preset: [broadcast]               # broadcast, vhs_sp, vhs_ep
+ntsc_comb_mode: "2sample"              # 2sample or 1h comb filter
+ntsc_enable_vhs: false                 # enable VHS color-under + luma BW limiting
+ntsc_noise: [0.03, 0.03]              # Gaussian noise amplitude range
+ntsc_luma_noise: [0.0, 0.0]           # luminance-dependent noise range
+ntsc_ghost_amplitude: [0.0, 0.0]      # multipath ghost strength range
+ntsc_ghost_delay_us: [1.5, 1.5]       # ghost delay in microseconds
+ntsc_ghost_phase: [180.0, 180.0]      # ghost phase in degrees
+ntsc_jitter: [0.0, 0.0]              # per-line timing jitter (subcarrier cycles)
+ntsc_edge_ringing: [0.0, 0.0]         # edge ringing (unsharp mask gain)
+ntsc_vhs_luma_bw: [4.2, 4.2]          # VHS luma bandwidth in MHz
+ntsc_color_under_bw: [500.0, 500.0]   # VHS color-under bandwidth in kHz
+ntsc_tape_trailing: [0.0, 0.0]        # tape trailing IIR strength
+ntsc_intensity: [1.0, 1.0]            # blend intensity (0=none, 1=full)
+
+# Composite rainbow (NTSC chroma dot crawl)
+rainbow_prob: 0.1
+rainbow_subcarrier_freq: [0.25, 0.30]     # subcarrier frequency (cycles/pixel)
+rainbow_chroma_bandwidth: [0.06, 0.1]    # chroma demodulation bandwidth
+rainbow_intensity: [0.3, 1.0]             # effect intensity
+rainbow_phase_alternation: true            # NTSC per-line phase alternation
+
+# Temporal ghosting (residual frame blending)
+ghosting_prob: 0
+ghosting_shift_x: [1, 8]              # horizontal displacement range (pixels)
+ghosting_shift_y: [0, 2]              # vertical displacement range (pixels)
+ghosting_opacity: [0.05, 0.25]        # ghost blend strength
+
+# Interlace combing (480i/576i artifact)
+interlace_prob: 0
+interlace_field_shift: [1, 5]          # horizontal shift between fields (pixels)
+interlace_dominant_field: [top, bottom]  # field dominance options
+
+# CRT scanline darkening
+scanline_prob: 0
+scanline_strength: [0.1, 0.5]         # darkening strength (0=none, 1=full black)
+scanline_even_lines: true              # darken even or odd rows
+
+# ── Mastering artifacts (applied after blur1, before shift) ──
+
+# Butterworth lowpass filter (anime mastering / broadcast)
+lowpass_prob: 0.1
+lowpass_cutoff: [0.35, 0.7]            # cutoff as fraction of Nyquist (0-1)
+lowpass_order: [1, 10]                  # filter order (higher = sharper rolloff)
+lowpass_detail_mask: false             # protect edges using HQ detail mask
+lowpass_mask_lines_brz: 0.08          # edge threshold for detail mask
+
+# Edge overshoot/undershoot (aggressive sharpening artifacts)
+overshoot_prob: 0.0
+overshoot_amount: [0.5, 2.0]          # sharpening strength
+overshoot_cutoff: [0.2, 0.5]          # Butterworth cutoff (fraction of Nyquist)
+overshoot_order: [1, 3]               # filter order
+
+# ── Pre-resize artifacts (applied before resize1) ──
+
+# Channel shift (per-channel spatial displacement)
+shift_prob: 0.1
+shift_types: [yuv]                     # rgb, yuv, cmyk
+shift_percent: false                   # true = amounts are % of image dimensions
+shift_rgb_r: [[0, 0], [0, 0]]         # R channel: [[x_min, x_max], [y_min, y_max]]
+shift_rgb_g: [[0, 0], [0, 0]]         # G channel
+shift_rgb_b: [[0, 0], [0, 0]]         # B channel
+shift_yuv_y: [[-2, 2], [-2, 2]]         # Y channel (YUV BT.2020)
+shift_yuv_u: [[-2, 2], [-2, 2]]         # U channel
+shift_yuv_v: [[-2, 2], [-2, 2]]         # V channel
+shift_cmyk_c: [[0, 0], [0, 0]]        # C channel (CMYK)
+shift_cmyk_m: [[0, 0], [0, 0]]        # M channel
+shift_cmyk_y: [[0, 0], [0, 0]]        # Y channel
+shift_cmyk_k: [[0, 0], [0, 0]]        # K channel
+
+# Chroma subsampling
+subsampling_prob: 0
+subsampling_down_algorithms: [nearest]     # nearest, box, hermite, linear, lagrange, cubic_catrom, cubic_mitchell, cubic_bspline, lanczos, gauss
+subsampling_up_algorithms: [nearest]
+subsampling_formats: ["4:4:4"]             # 4:4:4, 4:2:2, 4:1:1, 4:2:0, 4:1:0, 4:4:0, 4:2:1, 4:1:2, 4:1:3
+subsampling_blur_range: ~                  # [min_sigma, max_sigma] or null
+subsampling_ycbcr_type: ["601"]            # 601, 709, 2020, 240
+
+# ── Compression ──────────────────────────────────────────────────────────────
+
+# Stage 1
+compress_prob: 0.85                         # probability compression fires at all
+compress_algorithms: [jpeg, webp, h264, hevc, mpeg2, mpeg4, vp9]                # jpeg, webp, h264, hevc, mpeg2, mpeg4, vp9
+compress_algorithm_probs: [2, 2, 1, 1, 1, 1, 1]            # relative weights (higher = more likely)
+compress_jpeg_range: [40, 100]             # JPEG quality range
+compress_webp_range: [40, 100]
+compress_h264_range: [13, 26]
+compress_hevc_range: [13, 29]
+compress_mpeg2_range: [2, 9]
+compress_mpeg4_range: [2, 9]
+compress_vp9_range: [20, 45]
+compress_video_sampling: ["444", "422", "420"]
+compress_video_sampling_weights: [6, 2, 2]         # null = uniform. Example: [6, 2, 2] for 60%/20%/20%
+
+# Stage 2
+compress_prob2: 0.6
+compress_algorithms2: [jpeg, webp, h264, hevc, mpeg2, mpeg4, vp9]
+compress_algorithm_probs2: [2, 2, 1, 1, 1, 1, 1]
+compress_jpeg_range2: [75, 100]
+compress_webp_range2: [75, 100]
+compress_h264_range2: [13, 20]
+compress_hevc_range2: [13, 23]
+compress_mpeg2_range2: [2, 6]
+compress_mpeg4_range2: [2, 6]
+compress_vp9_range2: [20, 35]
+compress_video_sampling2: ["444", "422", "420"]
+compress_video_sampling_weights2: [6, 2, 2]
+
+# ── Post-crop artifacts ──
+
+# High-frequency noise (GT only, after crop)
+otf_hf_noise_prob: 0.5
+otf_hf_noise_normalize: true
+otf_hf_noise_alpha_range: [0.00, 0.035]        # noise amplitude
+otf_hf_noise_beta_shape_range: [2, 2]         # Beta distribution 'a' param
+otf_hf_noise_beta_offset_range: ~             # 'b = a + offset', null = independent
+otf_hf_noise_gray_prob: 1.0                   # probability noise is grayscale
+otf_hf_noise_denoise_lq: false                # denoise LQ with NLMeans before final resize
+otf_hf_noise_denoise_strength: 30.0           # NLMeans filter strength (0-255 scale)
+
+# Dithering (LQ only, last degradation before dequeue)
+dithering_prob: 0.15
+dithering_types: [quantize, order, floydsteinberg, jarvisjudiceninke, stucki, atkinson, burkes, sierra, tworowsierra, sierraLite, riemersma]                    # quantize, order, floydsteinberg, jarvisjudiceninke, stucki, atkinson, burkes, sierra, tworowsierra, sierraLite, riemersma
+dithering_quantize_range: [4, 7]              # quantization levels per channel
+dithering_map_size: [4, 8]                     # map sizes for ordered dithering
+dithering_history_range: [2, 5]              # history for riemersma
+dithering_ratio_range: [0.1, 0.5]             # decay ratio for riemersma
+dithering_palette_mode: 0.7                   # 0.0 = always uniform, 1.0 = always palette, 0.5 = 50/50 mix
+dithering_palette_size: [128, 256]              # number of palette colors when palette_mode is true
+
+queue_size: 64
+
+datasets:
+  train:
+    name: Train Dataset
+    type: realesrgandataset
+    dataroot_gt: [
+      "datasets/train/Digital Dataset/HR",
+      "datasets/train/Digital Dataset/HR2"
+    ]
+    lq_size: 96
+    use_hflip: true
+    use_rot: true
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 4
+    accum_iter: 8
+
+    blur_kernel_size: 12
+    kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    kernel_range: [5, 17]  # kernel range inclusive, must be odd numbers
+    sinc_prob: 0.0
+    blur_sigma: [0.2, 2]
+    betag_range: [0.5, 4]
+    betap_range: [1, 2]
+
+    blur_kernel_size2: 12
+    kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    kernel_range2: [5, 17]  # kernel range inclusive, must be odd numbers
+    sinc_prob2: 0.0
+    blur_sigma2: [0.2, 1]
+    betag_range2: [0.5, 4]
+    betap_range2: [1, 2]
+
+    final_sinc_prob: 0.0
+    final_kernel_range: [5, 17]  # kernel range inclusive, must be odd numbers
+
+network_g:
+  type: drft_l
+  scale: 4
+  window_size: 32
+  rank: 32
+  use_checkpoint: true
+  # use_checkpoint_ocab: true
+  use_iln: false
+  attn_type: hybrid
+
+# Discriminator model settings
+network_d:
+  type: dunet  # dunet, metagan2, unetdiscriminatorsn
+
+path:
+  # Default: consume the Stage A online checkpoint.
+  # If Stage A EMA validates better, swap this to:
+  # experiments/net_g_ema_31587.safetensors
+  pretrain_network_g: experiments/4x_DRFT_L_GAN_finetune/models/net_g_ema_108000.safetensors
+  param_key_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+  # Resume from 6k with the first decay already applied, then decay again at 56k.
+train:
+  ema_decay: 0.999
+  grad_clip: false  # Gradient clipping allows more stable training when using higher learning rates.
+  # Optimizer for generator model
+  adaptive_d: true
+  optim_g:
+    type: AdamW
+    lr: !!float 2e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  # Optimizer for discriminator model
+  optim_d:
+    type: AdamW
+    lr: !!float 2e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [80000]
+    gamma: 0.5
+
+  total_iter: 200000
+  warmup_iter: -1
+
+  losses:
+    # - type: charbonnierloss
+    #   loss_weight: 0.5
+    # MS-SSIM loss
+    - type: mssimloss
+      loss_weight: 0.5
+    # Perceptual loss
+    - type: perceptualloss
+      criterion: charbonnier  # charbonnier, l1, pd+l1, fd+l1, pd, fd
+      loss_weight: 0.01
+    - type: fliploss
+      loss_weight: 0.3
+    - type: sobeledgeloss
+      loss_weight: 0.4
+    # HSLuv loss (hue, saturation, lightness)
+    - type: hsluvloss
+      criterion: charbonnier
+      loss_weight: 1.0
+    # - type: cosimloss
+    #   loss_weight: 0.0
+    # GAN loss
+    - type: ganloss
+      gan_type: vanilla
+      loss_weight: 0.1
+    # Additional losses - disabled by default.
+    # To enable, change the loss_weight from 0 to the recommended loss_weight which appears as a comment next to the loss weight.
+    # For example to enable DISTS loss, change the loss weight from 0 to 0.25; to enable color loss change loss weight from 0 to 1.
+    # DISTS perceptual loss
+    # - type: distsloss
+    #   loss_weight: 0.3  # 0.3
+    # # LDL loss
+    # - type: ldlloss
+    #   loss_weight: 1.0  # 1.0
+    # # FF loss
+    # - type: ffloss
+    #   loss_weight: 0.2  # 0.2
+    # # linedistillerloss
+    # - type: linedistillerloss
+    #   loss_weight: 0.8
+    # gradientvarianceloss
+    # - type: gradientvarianceloss
+    #   patch_size: 16
+    #   criterion: charbonnier
+    #   loss_weight: 0.25
+
+val:
+  val_enabled: false
+  val_freq: 1000
+  save_img: false
+  tile_size: 0
+  tile_overlap: 8
+
+  metrics_enabled: true
+  metrics:
+    topiq:
+      type: calculate_topiq
+    psnr:
+      type: calculate_psnr
+      crop_border: 4
+      test_y_channel: true
+    ssim:
+      type: calculate_ssim
+      crop_border: 4
+      test_y_channel: true
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 1000
+  save_checkpoint_format: safetensors
+  use_tb_logger: true
