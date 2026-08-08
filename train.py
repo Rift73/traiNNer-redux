@@ -71,6 +71,31 @@ def init_tb_loggers(opt: ReduxOptions) -> SummaryWriter | None:
     return tb_logger
 
 
+def cuda_memory_diagnostics() -> str:
+    """Return allocator and driver memory state without allocating CUDA tensors."""
+    if not torch.cuda.is_available():
+        return "CUDA memory diagnostics unavailable because CUDA is not initialized."
+
+    gib = 1024**3
+    try:
+        device = torch.cuda.current_device()
+        allocated = torch.cuda.memory_allocated(device) / gib
+        reserved = torch.cuda.memory_reserved(device) / gib
+        peak_allocated = torch.cuda.max_memory_allocated(device) / gib
+        peak_reserved = torch.cuda.max_memory_reserved(device) / gib
+        free, total = torch.cuda.mem_get_info(device)
+        return (
+            f"CUDA memory at failure on cuda:{device} "
+            f"({torch.cuda.get_device_name(device)}): "
+            f"{allocated:.2f} GiB allocated, {reserved:.2f} GiB reserved, "
+            f"{peak_allocated:.2f} GiB peak allocated, "
+            f"{peak_reserved:.2f} GiB peak reserved; "
+            f"driver reports {free / gib:.2f} GiB free of {total / gib:.2f} GiB."
+        )
+    except Exception as error:
+        return f"CUDA memory diagnostics unavailable: {error}"
+
+
 def create_train_val_dataloader(
     opt: ReduxOptions,
     args: argparse.Namespace,
@@ -267,7 +292,9 @@ def train_pipeline(root_path: str) -> None:
 
     if opt.deterministic:
         torch.backends.cudnn.benchmark = False
-        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.use_deterministic_algorithms(
+            True, warn_only=opt.deterministic_warn_only
+        )
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     else:
         torch.backends.cudnn.benchmark = True
@@ -298,8 +325,10 @@ def train_pipeline(root_path: str) -> None:
 
     if opt.deterministic:
         logger.info(
-            "Training in deterministic mode with manual_seed=%d. Deterministic mode has reduced training speed.",
+            "Training in deterministic mode with manual_seed=%d (warn_only=%s). "
+            "Deterministic mode has reduced training speed.",
             opt.manual_seed,
+            opt.deterministic_warn_only,
         )
     else:
         logger.info(
@@ -400,6 +429,7 @@ def train_pipeline(root_path: str) -> None:
     signal.signal(signal.SIGINT, handle_keyboard_interrupt)
     epoch = start_epoch
     apply_gradient = False
+    accepted_gradient = False
     crashed = False
     train_data = None
     assert model.opt.path.models is not None
@@ -425,23 +455,26 @@ def train_pipeline(root_path: str) -> None:
                 if current_iter > total_iters:
                     break
                 # training
-                model.feed_data(train_data)
+                with model.data_feed_context():
+                    model.feed_data(train_data)
                 try:
                     model.optimize_parameters(
                         current_iter, current_accum_iter, apply_gradient
                     )
-                except RuntimeError as e:
-                    # Check to see if its actually the CUDA out of memory error
-                    if "allocate" in str(e) or "CUDA" in str(e):
-                        # Collect garbage (clear VRAM)
-                        raise RuntimeError(
-                            "Ran out of VRAM during training. Please reduce lq_size or batch_size_per_gpu and try again."
-                        ) from None
-                    else:
-                        # Re-raise the exception if not an OOM error
-                        raise
+                except torch.cuda.OutOfMemoryError as error:
+                    raise RuntimeError(
+                        "CUDA ran out of memory during training. "
+                        f"{cuda_memory_diagnostics()} "
+                        "The original allocator error is preserved below."
+                    ) from error
+                model.finalize_compile_cache()
+                if model.reset_accumulation_requested:
+                    current_accum_iter = 0
+                accepted_gradient = apply_gradient and model.training_step_accepted
+                if apply_gradient and not accepted_gradient:
+                    current_iter -= 1
                 # update learning rate
-                if apply_gradient:
+                if accepted_gradient:
                     model.update_learning_rate(
                         current_iter, warmup_iter=opt.train.warmup_iter
                     )
@@ -450,7 +483,7 @@ def train_pipeline(root_path: str) -> None:
                     # reset start time in msg_logger for more accurate eta_time
                     msg_logger.reset_start_time()
                 # log
-                if current_iter % opt.logger.print_freq == 0 and apply_gradient:
+                if current_iter % opt.logger.print_freq == 0 and accepted_gradient:
                     log_vars = {"epoch": epoch, "iter": current_iter}
                     log_vars.update({"lrs": model.get_current_learning_rate()})
                     log_vars.update(
@@ -466,7 +499,7 @@ def train_pipeline(root_path: str) -> None:
                 # save models and training states
                 if (
                     current_iter % opt.logger.save_checkpoint_freq == 0
-                    and apply_gradient
+                    and accepted_gradient
                 ):
                     logger.info(
                         "Saving models and training states to %s. Free space: %s",
@@ -485,7 +518,7 @@ def train_pipeline(root_path: str) -> None:
                     assert opt.val.val_freq is not None, (
                         "val_freq must be defined under the val section"
                     )
-                    if current_iter % opt.val.val_freq == 0 and apply_gradient:
+                    if current_iter % opt.val.val_freq == 0 and accepted_gradient:
                         multi_val_datasets = len(val_loaders) > 1
                         for val_loader in val_loaders:
                             model.validation(
@@ -495,6 +528,7 @@ def train_pipeline(root_path: str) -> None:
                                 opt.val.save_img,
                                 multi_val_datasets,
                             )
+                        model.on_validation_boundary(current_iter)
 
                 data_timer.start()
                 iter_timer.start()

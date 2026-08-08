@@ -256,7 +256,6 @@ network_g:
   rank: 32
   use_checkpoint: true
   # use_checkpoint_ocab: true
-  use_iln: false
   attn_type: hybrid
 
 # Discriminator model settings

@@ -4,7 +4,8 @@ import os
 import time
 from abc import abstractmethod
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ from traiNNer.schedulers.cosineannealingwarmuplr_scheduler import (
 )
 from traiNNer.schedulers.kneelr_scheduler import KneeLR
 from traiNNer.utils import get_root_logger
+from traiNNer.utils.compile_cache import configure_compile_cache_runtime
 from traiNNer.utils.dist_util import master_only
 from traiNNer.utils.logger import clickable_file_path
 from traiNNer.utils.misc import is_json_compatible, require_triton
@@ -85,6 +87,11 @@ class BaseModel:
         self.grad_clip: bool = False
         self.grad_clip_max_norm: float = 100.0
         self.nan_count = 0
+        self.training_step_accepted = True
+        self.reset_accumulation_requested = False
+        self.training_step_rejection_reason: str | None = None
+        self._compile_precompile_cache_enabled = False
+        self._compile_precompile_cache_signature = (0, 0)
 
     @abstractmethod
     def feed_data(self, data: DataFeed) -> None:
@@ -132,6 +139,60 @@ class BaseModel:
             self.nondist_validation(
                 dataloader, current_iter, tb_logger, save_img, multi_val_datasets
             )
+
+    def begin_training_attempt(self) -> None:
+        self.training_step_accepted = True
+        self.reset_accumulation_requested = False
+        self.training_step_rejection_reason = None
+
+    @contextmanager
+    def data_feed_context(self) -> Iterator[None]:
+        """Optional isolated RNG context around data synthesis."""
+        yield
+
+    def reject_training_step(self, reason: str) -> None:
+        self.training_step_accepted = False
+        self.reset_accumulation_requested = True
+        self.training_step_rejection_reason = reason
+
+    def finalize_compile_cache(self) -> None:
+        """Persist newly materialized compiled functions for fast restarts."""
+        if not self._compile_precompile_cache_enabled:
+            return
+
+        from torch._dynamo.precompile_context import PrecompileContext
+
+        signature = (
+            len(PrecompileContext._dynamo_cache_entries),  # noqa: SLF001
+            len(PrecompileContext._backend_artifacts_by_key),  # noqa: SLF001
+        )
+        if signature == self._compile_precompile_cache_signature or not signature[0]:
+            return
+
+        try:
+            debug_info = PrecompileContext.save_to_dynamo_cache()
+        except Exception as error:
+            # Cache publication is an optional latency optimization. A new
+            # loss, discriminator, or compiler nightly may be unserializable;
+            # that must never terminate an otherwise healthy training run.
+            self._compile_precompile_cache_enabled = False
+            get_root_logger().warning(
+                "Could not persist compiled-function artifacts; training will "
+                "continue and this process will stop retrying the cache save. "
+                "%s: %s",
+                type(error).__name__,
+                error,
+            )
+            return
+        self._compile_precompile_cache_signature = signature
+        get_root_logger().info(
+            "Saved %d compiled-function cache entr%s for fast training resume.",
+            len(debug_info.get("dynamo", [])),
+            "y" if len(debug_info.get("dynamo", [])) == 1 else "ies",
+        )
+
+    def on_validation_boundary(self, current_iter: int) -> None:
+        """Optional post-validation hook for research instrumentation."""
 
     @abstractmethod
     def dist_validation(
@@ -188,12 +249,20 @@ class BaseModel:
         self.log_dict = {}
         self.loss_samples = 0
 
-    def model_to_device(self, net: nn.Module, compile: bool = False) -> nn.Module:
+    def model_to_device(
+        self,
+        net: nn.Module,
+        compile: bool = False,
+        wrap_distributed: bool = True,
+    ) -> nn.Module:
         """Model to device. It also warps models with DistributedDataParallel
         or DataParallel.
 
         Args:
             net (nn.Module)
+            compile (bool): Compile the module before optional parallel wrapping.
+            wrap_distributed (bool): Apply DDP/DataParallel. Frozen auxiliary
+                networks should leave this disabled and run as one local copy.
         """
         assert isinstance(self.opt.num_gpu, int)
         net = net.to(
@@ -207,21 +276,197 @@ class BaseModel:
         if compile:
             require_triton("torch.compile requires triton.")
             logger = get_root_logger()
+
+            # Some architectures share forward code across differently sized
+            # teacher/student instances while keeping Python float attributes
+            # architecture-constant. Without specialization, Dynamo can lift
+            # those values into CPU scalar inputs on the second compile. The
+            # compiled backward may then disagree with the forward about the
+            # saved scalar device. This opt-in must remain enabled through lazy
+            # tracing, so set the process-wide Dynamo policy before wrapping.
+            specialize_float = getattr(net, "compile_specialize_float", False)
+            if not isinstance(specialize_float, bool):
+                raise ValueError("compile_specialize_float must be a bool when defined")
+            if specialize_float:
+                torch._dynamo.config.specialize_float = True  # noqa: SLF001
+                logger.info(
+                    "Network %s specializes architecture-constant Python floats during compilation.",
+                    net_name,
+                )
+
+            precompile_cache = getattr(net, "compile_precompile_cache", False)
+            if not isinstance(precompile_cache, bool):
+                raise ValueError("compile_precompile_cache must be a bool when defined")
+            if precompile_cache:
+                try:
+                    from torch._dynamo.precompile_context import PrecompileContext
+                except ImportError as error:
+                    raise RuntimeError(
+                        "Fast compile-resume requires PyTorch's precompile-context "
+                        f"API, which is unavailable in torch {torch.__version__}."
+                    ) from error
+
+                required_precompile_api = {
+                    "PrecompileContext._dynamo_cache_entries": hasattr(
+                        PrecompileContext, "_dynamo_cache_entries"
+                    ),
+                    "PrecompileContext._backend_artifacts_by_key": hasattr(
+                        PrecompileContext, "_backend_artifacts_by_key"
+                    ),
+                    "PrecompileContext.save_to_dynamo_cache": hasattr(
+                        PrecompileContext, "save_to_dynamo_cache"
+                    ),
+                    "torch._dynamo.config.caching_precompile": hasattr(
+                        torch._dynamo.config, "caching_precompile"  # noqa: SLF001
+                    ),
+                    "torch._inductor.list_mode_options": hasattr(
+                        torch._inductor, "list_mode_options"  # noqa: SLF001
+                    ),
+                }
+                missing_precompile_api = [
+                    name
+                    for name, available in required_precompile_api.items()
+                    if not available
+                ]
+                if missing_precompile_api:
+                    raise RuntimeError(
+                        "Fast compile-resume is not compatible with torch "
+                        f"{torch.__version__}; missing "
+                        + ", ".join(missing_precompile_api)
+                        + ". Disable torch.compile or use the validated PyTorch build."
+                    )
+
+                # PyTorch 2.14's experimental serializer records the public
+                # SDPBackend enum under its pybind class name. Supply the
+                # missing module alias before Dynamo captures artifacts.
+                import torch.nn.attention as attention_module
+                from torch.nn.attention import SDPBackend
+
+                if not hasattr(attention_module, "_SDPBackend"):
+                    attention_module._SDPBackend = SDPBackend  # noqa: SLF001
+                torch._dynamo.config.caching_precompile = True  # noqa: SLF001
+                # The experimental package deserializer runs before Inductor's
+                # backend receives torch.compile(mode=...). Seed the CUDA-Graph
+                # bit from that mode here so a restored max-autotune package is
+                # post-compiled with the same wrapper as its original process.
+                # Without this, kernels restore quickly but silently run
+                # outside CUDA Graph Trees at lower steady-state throughput.
+                compile_mode_options = torch._inductor.list_mode_options(  # noqa: SLF001
+                    self.opt.compile_mode
+                )
+                torch._inductor.config.triton.cudagraphs = bool(  # noqa: SLF001
+                    compile_mode_options.get("triton.cudagraphs", False)
+                )
+                self._compile_precompile_cache_enabled = True
+                logger.info(
+                    "Network %s will persist compiled-function artifacts for fast resume.",
+                    net_name,
+                )
+
+            # Architecture code may version its compiler-facing graph ABI.
+            # Keep the persistent cache reusable across runs, but prevent a
+            # stale binary produced by an older graph contract from matching.
+            architecture_cache_tag = getattr(net, "compile_cache_key_tag", None)
+            if architecture_cache_tag is not None:
+                if (
+                    not isinstance(architecture_cache_tag, str)
+                    or not architecture_cache_tag
+                ):
+                    raise ValueError(
+                        "compile_cache_key_tag must be a non-empty string when defined"
+                    )
+                train_dataset = self.opt.datasets.get("train")
+                compile_batch = (
+                    train_dataset.batch_size_per_gpu
+                    if train_dataset is not None
+                    else None
+                )
+                compile_crop = (
+                    train_dataset.lq_size if train_dataset is not None else None
+                )
+                architecture_cache_tag = (
+                    f"{architecture_cache_tag}:mode={self.opt.compile_mode}"
+                    f":input={compile_batch}x{compile_crop}x{compile_crop}"
+                    f":amp={self.use_amp}-{self.amp_dtype}"
+                    f":layout={self.memory_format}"
+                    ":autotune-at-compile-time="
+                    f"{torch._inductor.config.triton.autotune_at_compile_time}"  # noqa: SLF001
+                    ":static-triton-launcher="
+                    f"{torch._inductor.config.use_static_triton_launcher}"  # noqa: SLF001
+                )
+                current_cache_tag = torch.compiler.config.cache_key_tag
+                cache_tags = current_cache_tag.split("|") if current_cache_tag else []
+                if architecture_cache_tag not in cache_tags:
+                    # This tag is process-global by PyTorch design, so a
+                    # student+teacher run deliberately has a different cache
+                    # identity from a solo-student run. The coupling can cause
+                    # a safe cold compile, never an unsafe cache hit.
+                    cache_tags.append(architecture_cache_tag)
+                    torch.compiler.config.cache_key_tag = "|".join(cache_tags)
+                logger.info(
+                    "Network %s uses compile cache ABI tag %s.",
+                    net_name,
+                    architecture_cache_tag,
+                )
+
+            compile_runtime_tag = torch.compiler.config.cache_key_tag
+            if not compile_runtime_tag:
+                compile_runtime_tag = (
+                    f"network={net_name}:mode={self.opt.compile_mode}:"
+                    f"torch={torch.__version__}"
+                )
+            compile_cache_path = configure_compile_cache_runtime(compile_runtime_tag)
+            logger.info(
+                "Network %s uses ABI-scoped compiled-function cache %s.",
+                net_name,
+                compile_cache_path,
+            )
+
             logger.info(
                 "Network %s will be compiled with mode %s. The first iteration may take several minutes.",
                 net_name,
                 self.opt.compile_mode,
             )
-            net = torch.compile(net, mode=self.opt.compile_mode)  # pyright: ignore[reportAssignmentType]
+            compile_fullgraph = getattr(net, "compile_fullgraph", False)
+            compile_dynamic = getattr(net, "compile_dynamic", None)
+            if not isinstance(compile_fullgraph, bool):
+                raise ValueError("compile_fullgraph must be a bool when defined")
+            if compile_dynamic not in (None, True, False):
+                raise ValueError("compile_dynamic must be bool or None when defined")
+            prepare_for_compile = getattr(net, "prepare_for_compile", None)
+            if callable(prepare_for_compile):
+                train_dataset = self.opt.datasets.get("train")
+                input_shape = None
+                if (
+                    train_dataset is not None
+                    and train_dataset.batch_size_per_gpu is not None
+                    and train_dataset.lq_size is not None
+                ):
+                    input_shape = (
+                        train_dataset.batch_size_per_gpu,
+                        3,
+                        train_dataset.lq_size,
+                        train_dataset.lq_size,
+                    )
+                prepare_for_compile(
+                    input_shape=input_shape,
+                    input_dtype=self.amp_dtype if self.use_amp else torch.float32,
+                )
+            net = torch.compile(  # pyright: ignore[reportAssignmentType]
+                net,
+                mode=self.opt.compile_mode,
+                fullgraph=compile_fullgraph,
+                dynamic=compile_dynamic,
+            )
 
-        if self.opt.dist:
+        if wrap_distributed and self.opt.dist:
             find_unused_parameters = self.opt.find_unused_parameters
             net = DistributedDataParallel(
                 net,
                 device_ids=[torch.cuda.current_device()],
                 find_unused_parameters=find_unused_parameters,
             )
-        elif self.opt.num_gpu > 1:
+        elif wrap_distributed and self.opt.num_gpu > 1:
             net = DataParallel(net)
 
         return net
@@ -363,7 +608,7 @@ class BaseModel:
             if not self.optimizers_skipped[i]:
                 scheduler.step()
         # set up warm-up learning rate
-        if current_iter < warmup_iter:
+        if current_iter <= warmup_iter:
             # get initial lr for each group
             init_lr_g_l = self._get_init_lr()
             # modify warming-up learning rates
@@ -405,6 +650,7 @@ class BaseModel:
         save_filename = (
             f"{net_label}_{current_iter_str}.{self.opt.logger.save_checkpoint_format}"
         )
+
         save_path = os.path.join(save_dir, save_filename)
 
         bare_net_ = self.get_bare_model(net)

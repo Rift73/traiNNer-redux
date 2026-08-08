@@ -22,7 +22,7 @@ dependencies = [
 "scipy",
 "spandrel>=0.4.0",
 "spandrel-extra-arches>=0.2.0",
-"tb-nightly",
+"tensorboard>=2.21.0",
 "timm",
 "torchcodec>=0.11.0",
 "av>=17.0.0",

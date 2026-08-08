@@ -106,9 +106,13 @@ class RealESRGANModel(SRModel):
             assert self.queue_size % b == 0, (
                 f"queue size {self.queue_size} should be divisible by batch size {b}"
             )
-            self.queue_lr = torch.zeros(self.queue_size, c, h, w).cuda()
+            self.queue_lr = torch.zeros(
+                self.queue_size, c, h, w, device=self.lq.device, dtype=self.lq.dtype
+            )
             _, c, h, w = self.gt.size()
-            self.queue_gt = torch.zeros(self.queue_size, c, h, w).cuda()
+            self.queue_gt = torch.zeros(
+                self.queue_size, c, h, w, device=self.gt.device, dtype=self.gt.dtype
+            )
             self.queue_ptr = 0
         if self.queue_ptr == self.queue_size:  # the pool is full
             # do dequeue and enqueue

@@ -1,3 +1,4 @@
+import inspect
 import os
 import time
 from collections.abc import Sequence
@@ -154,6 +155,32 @@ def parse_input_shape(
     return tuple(dims), tuple(dynamic_flags)
 
 
+def resolve_architecture_export_example_shape(
+    model: torch.nn.Module,
+    example_shape: Sequence[int],
+    dynamic_flags: Sequence[bool],
+) -> tuple[int, ...]:
+    """Apply an architecture's canonical trace size to symbolic H/W axes.
+
+    This changes only the representative tensor used during export. Dynamic
+    axis declarations remain unchanged, so the resulting ONNX is not fixed to
+    the example resolution.
+    """
+    example_size = getattr(model, "onnx_export_example_size", None)
+    if example_size is None or len(example_shape) < 4:
+        return tuple(example_shape)
+    if not isinstance(example_size, int) or example_size < 1:
+        raise ValueError(
+            f"{type(model).__name__}.onnx_export_example_size must be positive"
+        )
+
+    resolved = list(example_shape)
+    for axis in (-2, -1):
+        if dynamic_flags[axis]:
+            resolved[axis] = example_size
+    return tuple(resolved)
+
+
 def convert_onnx_to_low_precision(
     onnx_path: str, bf16_exclude_depthwise: bool, dtype: DType, opset: int
 ) -> ModelProto:
@@ -206,12 +233,13 @@ def convert_and_save_onnx(
     out_dir: str,
     example_shape: Sequence[int],
     dtype: DType,
-) -> tuple[ModelProto, int, str, str | None]:
+) -> tuple[ModelProto, int, str, str | None, bool, bool]:
     assert model.net_g is not None
     assert opt.onnx is not None
 
     is_dynamo = bool(opt.onnx.dynamo)
     requested_opset = opt.onnx.opset
+    bare_export_model = model.get_bare_model(model.net_g)
 
     # Check if we should wrap 5D input to 4D for vsmlrt compatibility
     wrap_5d = opt.onnx.wrap_5d_to_4d and len(example_shape) == 5
@@ -224,7 +252,7 @@ def convert_and_save_onnx(
         export_input = torch_input.view(n, t * c, h, w)
         # Wrap the model
         export_model: torch.nn.Module = VideoModelExportWrapper(
-            model.net_g, num_frames=t, channels=c
+            bare_export_model, num_frames=t, channels=c
         )
         # Convert 5D dynamic flags to 4D: (N, T, C, H, W) -> (N, T*C, H, W)
         # T*C channel dim is static (T and C must both be static for the reshape to work)
@@ -243,13 +271,76 @@ def convert_and_save_onnx(
     else:
         export_shape = example_shape
         export_input = torch_input
-        export_model = model.net_g
+        export_model = bare_export_model
         export_dynamic_flags = dynamic_flags
         axis_names = ["batch_size", "channels", "height", "width"]
         if len(example_shape) == 5:
             axis_names.insert(1, "temporal")
 
     has_dynamic = any(export_dynamic_flags)
+
+    architecture_manages_precision = False
+    prepare_export = getattr(export_model, "prepare_for_onnx_export", None)
+    if callable(prepare_export):
+        prepare_parameters = inspect.signature(prepare_export).parameters
+        supports_dynamic_spatial = "dynamic_spatial" in prepare_parameters
+        dynamic_spatial = bool(
+            len(export_dynamic_flags) == 4
+            and any(export_dynamic_flags[-2:])
+        )
+        unsupported_dynamic_axes = [
+            name
+            for name, is_dynamic in zip(
+                axis_names[:-2], export_dynamic_flags[:-2], strict=False,
+            )
+            if is_dynamic
+        ]
+        if unsupported_dynamic_axes or (has_dynamic and not supports_dynamic_spatial):
+            detail = (
+                f"unsupported dynamic axes: {', '.join(unsupported_dynamic_axes)}"
+                if unsupported_dynamic_axes else "dynamic H/W are not supported"
+            )
+            raise ValueError(
+                f"{type(export_model).__name__}'s optimized ONNX deployment "
+                f"graph cannot represent this shape ({detail})."
+            )
+        dynamic_exporter = getattr(
+            export_model, "onnx_dynamic_spatial_exporter", None,
+        )
+        if dynamic_spatial and is_dynamo and dynamic_exporter == "legacy":
+            logger.warning(
+                "%s requires the legacy ONNX exporter for genuinely dynamic "
+                "H/W. Overriding dynamo=true; the Dynamo exporter specializes "
+                "this architecture's shape algebra to the trace example.",
+                type(export_model).__name__,
+            )
+            is_dynamo = False
+        prepare_kwargs = {}
+        if "precision" in prepare_parameters:
+            prepare_kwargs["precision"] = (
+                "tensorrt_mixed" if dtype == "bf16" else "native"
+            )
+        if supports_dynamic_spatial:
+            prepare_kwargs["dynamic_spatial"] = dynamic_spatial
+        export_model = prepare_export(tuple(export_shape), **prepare_kwargs)
+        architecture_manages_precision = bool(
+            getattr(export_model, "onnx_deployment_precision_handled", False)
+        )
+        if architecture_manages_precision and dtype != "bf16":
+            raise RuntimeError(
+                "architecture-native ONNX precision is only supported for "
+                "a BF16 export request"
+            )
+        inventory = getattr(export_model, "onnx_deployment_inventory", {})
+        inventory_summary = {
+            key: len(value) if isinstance(value, list) else value
+            for key, value in inventory.items()
+        }
+        logger.info(
+            "Prepared %s's architecture-native ONNX deployment graph: %s",
+            type(export_model).__name__,
+            inventory_summary,
+        )
 
     if not has_dynamic:
         logger.info(
@@ -293,7 +384,9 @@ def convert_and_save_onnx(
                 continue
             name = axis_names[axis]
             dynamic_axes[INPUT_NAME][axis] = name
-            dynamic_axes[OUTPUT_NAME][axis] = name
+            dynamic_axes[OUTPUT_NAME][axis] = (
+                f"output_{name}" if name in ("height", "width") else name
+            )
 
     if is_dynamo:
         if requested_opset < MIN_DYNAMO_OPSET:
@@ -347,7 +440,7 @@ def convert_and_save_onnx(
     out_path = get_out_path(
         out_dir,
         opt.name,
-        requested_opset,
+        opset,
         dtype=dtype,
         optimized=False,
         dynamo=is_dynamo,
@@ -369,6 +462,10 @@ def convert_and_save_onnx(
             dynamic_shapes=dynamic_shapes,
             dynamic_axes=dynamic_axes,
             verify=opt.onnx.verify if dtype == "fp32" else False,
+            # PyTorch 2.14's legacy constant folder can misclassify BF16 as
+            # ComplexDouble. OnnxSlim and TensorRT perform the useful folding
+            # later without corrupting the strongly typed graph.
+            do_constant_folding=not architecture_manages_precision,
         )
 
         if is_dynamo:
@@ -384,6 +481,14 @@ def convert_and_save_onnx(
             post_nodes = len(onnx_program.model.graph)
             logger.info("Dynamo export nodes after optimize(): %d", post_nodes)
 
+        elif architecture_manages_precision:
+            model_proto_post = onnx.load(temp_out_path)
+            post_nodes = len(model_proto_post.graph.node)
+            logger.info(
+                "Skipping ONNX Runtime CPU optimization for architecture-native "
+                "BF16/FP16 graph; node count remains %d.",
+                post_nodes,
+            )
         else:
             model_proto_pre = onnx.load(temp_out_path)
             pre_nodes = len(model_proto_pre.graph.node)
@@ -422,7 +527,17 @@ def convert_and_save_onnx(
 
     fp32_saved_path: str | None = None
 
-    if dtype != "fp32":
+    if dtype != "fp32" and architecture_manages_precision:
+        model_proto = onnx.load(temp_out_path)
+        onnx.save(model_proto, out_path)
+        logger.info(
+            "Saved architecture-native mixed-precision ONNX directly to %s; "
+            "generic low-precision conversion was intentionally skipped.",
+            clickable_file_path(Path(out_path).absolute().parent, out_path),
+        )
+        if osp.exists(temp_out_path):
+            os.remove(temp_out_path)
+    elif dtype != "fp32":
         fp32_model_proto = onnx.load(temp_out_path)
         onnx.save(fp32_model_proto, fp32_out_path)
         logger.info(
@@ -448,7 +563,14 @@ def convert_and_save_onnx(
         model_proto = onnx.load(temp_out_path)
 
     assert model_proto is not None
-    return model_proto, opset, out_path, fp32_saved_path
+    return (
+        model_proto,
+        opset,
+        out_path,
+        fp32_saved_path,
+        architecture_manages_precision,
+        is_dynamo,
+    )
 
 
 def verify_onnx(
@@ -561,20 +683,32 @@ def convert_pipeline(root_path: str) -> None:
         opt.onnx.shape, opt.network_g["type"]
     )
 
+    assert model.net_g is not None
+    bare_model = model.get_bare_model(model.net_g)
+    example_shape = resolve_architecture_export_example_shape(
+        bare_model, example_shape, dynamic_flags,
+    )
+
     wrap_5d = opt.onnx.wrap_5d_to_4d and len(example_shape) == 5
 
     torch_input = torch.randn(*example_shape, device="cuda", dtype=torch.float32)
 
     start_time = time.time()
 
-    assert model.net_g is not None
     model.net_g.eval()
     logger = get_root_logger()
 
     out_dir = "./onnx"
     os.makedirs(out_dir, exist_ok=True)
 
-    model_proto, opset, out_path, fp32_path = convert_and_save_onnx(
+    (
+        model_proto,
+        opset,
+        out_path,
+        fp32_path,
+        architecture_manages_precision,
+        used_dynamo,
+    ) = convert_and_save_onnx(
         model, logger, opt, torch_input, dynamic_flags, out_dir, example_shape, dtype
     )
 
@@ -586,7 +720,7 @@ def convert_pipeline(root_path: str) -> None:
         format_duration_min_sec(end_time - start_time),
     )
 
-    if not opt.onnx.dynamo:
+    if not used_dynamo:
         if opt.onnx.verify:
             verify_onnx(model, logger, torch_input, out_path, dtype, wrap_5d)
             if fp32_path is not None:
@@ -620,32 +754,46 @@ def convert_pipeline(root_path: str) -> None:
             opset,
             dtype=dtype,
             optimized=True,
-            dynamo=opt.onnx.dynamo,
+            dynamo=used_dynamo,
             shape=opt_shape,
             dynamic_flags=opt_dynamic_flags,
         )
 
-        session_opt = ort.SessionOptions()
-        session_opt.graph_optimization_level = (
-            ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
-        )
-        session_opt.optimized_model_filepath = optimized_path
-
-        providers = ["CUDAExecutionProvider"]
-
-        try:
-            ort.InferenceSession(out_path, session_opt, providers=providers)
-            if opt.onnx.verify:
-                verify_onnx(model, logger, torch_input, optimized_path, dtype, wrap_5d)
-            model_proto = onnx.load(optimized_path)
+        if architecture_manages_precision:
+            onnx.checker.check_model(model_proto)
+            onnx.save(model_proto, optimized_path)
             logger.info(
-                "Optimized model saved to %s",
+                "OnnxSlim model saved to %s; ONNX Runtime optimization was "
+                "skipped because its CUDA/CPU graph checks do not admit the "
+                "strongly typed architecture-native BF16/FP16 graph.",
                 clickable_file_path(
                     Path(optimized_path).absolute().parent, optimized_path
                 ),
             )
-        except Exception as e:
-            logger.warning("ONNX optimization failed: %s", e)
+        else:
+            session_opt = ort.SessionOptions()
+            session_opt.graph_optimization_level = (
+                ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+            )
+            session_opt.optimized_model_filepath = optimized_path
+
+            providers = ["CUDAExecutionProvider"]
+
+            try:
+                ort.InferenceSession(out_path, session_opt, providers=providers)
+                if opt.onnx.verify:
+                    verify_onnx(
+                        model, logger, torch_input, optimized_path, dtype, wrap_5d,
+                    )
+                model_proto = onnx.load(optimized_path)
+                logger.info(
+                    "Optimized model saved to %s",
+                    clickable_file_path(
+                        Path(optimized_path).absolute().parent, optimized_path
+                    ),
+                )
+            except Exception as e:
+                logger.warning("ONNX optimization failed: %s", e)
 
 
 class SkipDepthwiseConvRule(NodeRuleBase):

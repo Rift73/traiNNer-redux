@@ -228,6 +228,131 @@ class OnnxOptions(StrictStruct):
     wrap_5d_to_4d: bool = True
 
 
+class DistillationOptions(StrictStruct):
+    """Offline knowledge distillation from an immutable pretrained teacher."""
+
+    enabled: bool = False
+    output_weight: Annotated[
+        float,
+        Meta(
+            description="Weight of student regression toward the frozen teacher output."
+        ),
+    ] = 0.5
+    feature_weight: Annotated[
+        float,
+        Meta(
+            description="Weight of sparse block-feature distillation. Set to 0 for output-only distillation."
+        ),
+    ] = 0.0
+    start_iter: Annotated[
+        int,
+        Meta(description="First iteration at which output distillation is active."),
+    ] = 0
+    warmup_iters: Annotated[
+        int,
+        Meta(description="Linear ramp length for output distillation."),
+    ] = 0
+    feature_start_iter: Annotated[
+        int,
+        Meta(
+            description="First iteration at which block-feature distillation is active."
+        ),
+    ] = 0
+    feature_warmup_iters: Annotated[
+        int,
+        Meta(description="Linear ramp length for block-feature distillation."),
+    ] = 0
+    decay_start_iter: Annotated[
+        int | None,
+        Meta(
+            description="Optional iteration at which distillation begins decaying linearly."
+        ),
+    ] = None
+    end_iter: Annotated[
+        int | None,
+        Meta(
+            description="Optional iteration at which all distillation weights reach zero."
+        ),
+    ] = None
+    output_loss: Literal["charbonnier", "l1", "mse"] = "l1"
+    feature_loss: Literal["charbonnier", "l1", "mse"] = "l1"
+    feature_transform: Annotated[
+        Literal["spatial_affinity", "channel_l2", "none"],
+        Meta(
+            description="Feature representation to distill. spatial_affinity implements FAKD-style second-order structural transfer."
+        ),
+    ] = "spatial_affinity"
+    feature_pool_size: Annotated[
+        int,
+        Meta(
+            description="Average-pooling factor applied before spatial-affinity matrices are formed."
+        ),
+    ] = 4
+    epsilon: Annotated[
+        float,
+        Meta(description="Numerical epsilon for loss and feature normalization."),
+    ] = 1e-6
+    compile_teacher: Annotated[
+        bool,
+        Meta(
+            description="Compile the frozen teacher whenever use_compile is enabled for the student."
+        ),
+    ] = True
+
+
+class PerImageOutlierGuardOptions(StrictStruct):
+    enabled: Annotated[
+        bool,
+        Meta(
+            description="Detect destructive per-image reconstruction outliers. Shadow mode is observational; exclude mode removes finite triggered samples consistently from every loss path."
+        ),
+    ] = False
+    action: Annotated[
+        Literal["shadow", "exclude"],
+        Meta(
+            description="Shadow only reports finite outliers. Exclude removes the same finite outlier samples from configured losses, GAN inputs, distillation, and mask-aware model auxiliary losses; non-finite attempts remain rejected."
+        ),
+    ] = "shadow"
+    start_iter: Annotated[
+        int,
+        Meta(
+            description="First candidate iteration on which to run the per-image detector."
+        ),
+    ] = 0
+    charbonnier_epsilon: Annotated[
+        float,
+        Meta(description="FP32 Charbonnier epsilon used by the shadow detector."),
+    ] = 1e-12
+    mean_absolute_floor: Annotated[
+        float,
+        Meta(
+            description="Absolute lower bound for the per-image mean Charbonnier outlier threshold."
+        ),
+    ] = 0.15
+    median_multiple: Annotated[
+        float,
+        Meta(
+            description="Batch-relative per-image mean threshold, expressed as a multiple of the batch median."
+        ),
+    ] = 8.0
+    max_absolute_error: Annotated[
+        float,
+        Meta(description="Absolute per-pixel error threshold for a shadow outlier."),
+    ] = 4.0
+    minimum_kept_samples: Annotated[
+        int,
+        Meta(
+            description="Minimum survivors required across the complete accumulated effective batch for exclusion mode to accept the candidate update. Shadow mode only reports this value."
+        ),
+    ] = 16
+    log_trigger_paths: Annotated[
+        bool,
+        Meta(
+            description="Log source paths and per-image statistics when a shadow trigger occurs. This synchronizes only on rare triggered batches."
+        ),
+    ] = True
+
+
 class TrainOptions(StrictStruct):
     total_iter: Annotated[
         int, Meta(description="The total number of iterations to train.")
@@ -244,6 +369,12 @@ class TrainOptions(StrictStruct):
         dict[str, Any] | None,
         Meta(description="The optimizer to use for the generator model."),
     ] = None
+    distillation: Annotated[
+        DistillationOptions | None,
+        Meta(
+            description="Frozen-teacher output and sparse block-feature distillation settings."
+        ),
+    ] = None
     ema_decay: Annotated[
         float,
         Meta(
@@ -258,6 +389,12 @@ class TrainOptions(StrictStruct):
     ] = 0
     ema_update_after_step: int = 0  # no warmup
     ema_power: float = 10  # no warmup
+    ema_foreach: Annotated[
+        bool,
+        Meta(
+            description="Use PyTorch foreach kernels for EMA parameter and buffer updates."
+        ),
+    ] = False
     grad_clip: Annotated[
         bool,
         Meta(
@@ -267,6 +404,12 @@ class TrainOptions(StrictStruct):
     grad_clip_max_norm: Annotated[
         float, Meta(description="Max norm of gradients for gradient clipping.")
     ] = 100.0
+    per_image_outlier_guard: Annotated[
+        PerImageOutlierGuardOptions | None,
+        Meta(
+            description="Low-overhead detector for destructive per-image reconstruction outliers, with observational shadow and finite-sample exclusion modes."
+        ),
+    ] = None
     warmup_iter: Annotated[
         int,
         Meta(
@@ -479,6 +622,12 @@ class ReduxOptions(StrictStruct):
             description="Enables torch.use_deterministic_algorithms. Slows down training, only use when reproducibility is critical."
         ),
     ] = False
+    deterministic_warn_only: Annotated[
+        bool,
+        Meta(
+            description="When deterministic mode is enabled, warn instead of failing on an operation without a deterministic implementation."
+        ),
+    ] = True
     dist: bool | None = None
     launcher: str | None = None
     rank: int | None = None
@@ -512,6 +661,12 @@ class ReduxOptions(StrictStruct):
         bool,
         Meta(
             description="Enable torch.compile for the generator model, which takes time on startup to compile the model, but can speed up training after the model is compiled. However, compilation must be redone when starting training each time, as the compiled model is not saved, so for models that take too long to compile it may not worth it."
+        ),
+    ] = False
+    compile_discriminator: Annotated[
+        bool,
+        Meta(
+            description="Compile the GAN discriminator with compile_mode. This is independent of use_compile so the generator and discriminator can be controlled separately."
         ),
     ] = False
     compile_mode: Annotated[
@@ -658,21 +813,15 @@ class ReduxOptions(StrictStruct):
     ] = (2, 10)
     dithering_map_size: Annotated[
         list[int],
-        Meta(
-            description="List of map sizes to choose from for ordered dithering."
-        ),
+        Meta(description="List of map sizes to choose from for ordered dithering."),
     ] = field(default_factory=lambda: [4, 8])
     dithering_history_range: Annotated[
         tuple[int, int],
-        Meta(
-            description="Range of history values for Riemersma dithering."
-        ),
+        Meta(description="Range of history values for Riemersma dithering."),
     ] = (10, 15)
     dithering_ratio_range: Annotated[
         tuple[float, float],
-        Meta(
-            description="Range of decay ratio values for Riemersma dithering."
-        ),
+        Meta(description="Range of decay ratio values for Riemersma dithering."),
     ] = (0.1, 0.9)
     dithering_palette_mode: Annotated[
         float,
@@ -712,43 +861,63 @@ class ReduxOptions(StrictStruct):
     ] = False
     shift_rgb_r: Annotated[
         list[list[int]],
-        Meta(description="Shift range for R channel: [[x_min, x_max], [y_min, y_max]]."),
+        Meta(
+            description="Shift range for R channel: [[x_min, x_max], [y_min, y_max]]."
+        ),
     ] = field(default_factory=lambda: [[0, 0], [0, 0]])
     shift_rgb_g: Annotated[
         list[list[int]],
-        Meta(description="Shift range for G channel: [[x_min, x_max], [y_min, y_max]]."),
+        Meta(
+            description="Shift range for G channel: [[x_min, x_max], [y_min, y_max]]."
+        ),
     ] = field(default_factory=lambda: [[0, 0], [0, 0]])
     shift_rgb_b: Annotated[
         list[list[int]],
-        Meta(description="Shift range for B channel: [[x_min, x_max], [y_min, y_max]]."),
+        Meta(
+            description="Shift range for B channel: [[x_min, x_max], [y_min, y_max]]."
+        ),
     ] = field(default_factory=lambda: [[0, 0], [0, 0]])
     shift_yuv_y: Annotated[
         list[list[int]],
-        Meta(description="Shift range for Y channel (YUV): [[x_min, x_max], [y_min, y_max]]."),
+        Meta(
+            description="Shift range for Y channel (YUV): [[x_min, x_max], [y_min, y_max]]."
+        ),
     ] = field(default_factory=lambda: [[0, 0], [0, 0]])
     shift_yuv_u: Annotated[
         list[list[int]],
-        Meta(description="Shift range for U channel (YUV): [[x_min, x_max], [y_min, y_max]]."),
+        Meta(
+            description="Shift range for U channel (YUV): [[x_min, x_max], [y_min, y_max]]."
+        ),
     ] = field(default_factory=lambda: [[0, 0], [0, 0]])
     shift_yuv_v: Annotated[
         list[list[int]],
-        Meta(description="Shift range for V channel (YUV): [[x_min, x_max], [y_min, y_max]]."),
+        Meta(
+            description="Shift range for V channel (YUV): [[x_min, x_max], [y_min, y_max]]."
+        ),
     ] = field(default_factory=lambda: [[0, 0], [0, 0]])
     shift_cmyk_c: Annotated[
         list[list[int]],
-        Meta(description="Shift range for C channel (CMYK): [[x_min, x_max], [y_min, y_max]]."),
+        Meta(
+            description="Shift range for C channel (CMYK): [[x_min, x_max], [y_min, y_max]]."
+        ),
     ] = field(default_factory=lambda: [[0, 0], [0, 0]])
     shift_cmyk_m: Annotated[
         list[list[int]],
-        Meta(description="Shift range for M channel (CMYK): [[x_min, x_max], [y_min, y_max]]."),
+        Meta(
+            description="Shift range for M channel (CMYK): [[x_min, x_max], [y_min, y_max]]."
+        ),
     ] = field(default_factory=lambda: [[0, 0], [0, 0]])
     shift_cmyk_y: Annotated[
         list[list[int]],
-        Meta(description="Shift range for Y channel (CMYK): [[x_min, x_max], [y_min, y_max]]."),
+        Meta(
+            description="Shift range for Y channel (CMYK): [[x_min, x_max], [y_min, y_max]]."
+        ),
     ] = field(default_factory=lambda: [[0, 0], [0, 0]])
     shift_cmyk_k: Annotated[
         list[list[int]],
-        Meta(description="Shift range for K channel (CMYK): [[x_min, x_max], [y_min, y_max]]."),
+        Meta(
+            description="Shift range for K channel (CMYK): [[x_min, x_max], [y_min, y_max]]."
+        ),
     ] = field(default_factory=lambda: [[0, 0], [0, 0]])
 
     # ── Chroma Subsampling (applied before resize1, after shift) ──────────────
@@ -818,43 +987,61 @@ class ReduxOptions(StrictStruct):
     ] = field(default_factory=lambda: [1, 5])
     interlace_dominant_field: Annotated[
         list[str],
-        Meta(description="Field dominance options. One is randomly selected. Options: top, bottom."),
+        Meta(
+            description="Field dominance options. One is randomly selected. Options: top, bottom."
+        ),
     ] = field(default_factory=lambda: ["top", "bottom"])
 
     # ── Lowpass (Butterworth, after blur1 before shift) ──────────────────────
     lowpass_prob: Annotated[
         float,
-        Meta(description="Probability of applying Butterworth lowpass filter, between 0 and 1."),
+        Meta(
+            description="Probability of applying Butterworth lowpass filter, between 0 and 1."
+        ),
     ] = 0
     lowpass_cutoff: Annotated[
         list[float],
-        Meta(description="Cutoff frequency range as fraction of Nyquist [min, max]. 1.0 = barely any filtering, 0.3 = heavy."),
+        Meta(
+            description="Cutoff frequency range as fraction of Nyquist [min, max]. 1.0 = barely any filtering, 0.3 = heavy."
+        ),
     ] = field(default_factory=lambda: [0.3, 0.8])
     lowpass_order: Annotated[
         list[int],
-        Meta(description="Butterworth filter order range [min, max]. Higher = sharper rolloff = more ringing."),
+        Meta(
+            description="Butterworth filter order range [min, max]. Higher = sharper rolloff = more ringing."
+        ),
     ] = field(default_factory=lambda: [1, 5])
     lowpass_detail_mask: Annotated[
         bool,
-        Meta(description="If true, protect edges/detail from lowpass using a detail mask computed from HQ."),
+        Meta(
+            description="If true, protect edges/detail from lowpass using a detail mask computed from HQ."
+        ),
     ] = False
     lowpass_mask_lines_brz: Annotated[
         float,
-        Meta(description="Binarize threshold for the edge/lines component of the detail mask."),
+        Meta(
+            description="Binarize threshold for the edge/lines component of the detail mask."
+        ),
     ] = 0.08
 
     # ── NTSC Composite (full simulation, before blur1) ───────────────────────
     ntsc_prob: Annotated[
         float,
-        Meta(description="Probability of applying NTSC composite simulation, between 0 and 1."),
+        Meta(
+            description="Probability of applying NTSC composite simulation, between 0 and 1."
+        ),
     ] = 0
     ntsc_preset: Annotated[
         list[str],
-        Meta(description="NTSC preset(s) to randomly select from. Options: broadcast, vhs_sp, vhs_ep."),
+        Meta(
+            description="NTSC preset(s) to randomly select from. Options: broadcast, vhs_sp, vhs_ep."
+        ),
     ] = field(default_factory=lambda: ["broadcast"])
     ntsc_comb_mode: Annotated[
         str,
-        Meta(description="Comb filter mode for luma/chroma separation. Options: 2sample, 1h."),
+        Meta(
+            description="Comb filter mode for luma/chroma separation. Options: 2sample, 1h."
+        ),
     ] = "2sample"
     ntsc_enable_vhs: Annotated[
         bool,
@@ -882,7 +1069,9 @@ class ReduxOptions(StrictStruct):
     ] = field(default_factory=lambda: [180.0, 180.0])
     ntsc_jitter: Annotated[
         list[float],
-        Meta(description="Per-line timing jitter range in subcarrier cycles [min, max] (0-3)."),
+        Meta(
+            description="Per-line timing jitter range in subcarrier cycles [min, max] (0-3)."
+        ),
     ] = field(default_factory=lambda: [0.0, 0.0])
     ntsc_edge_ringing: Annotated[
         list[float],
@@ -894,7 +1083,9 @@ class ReduxOptions(StrictStruct):
     ] = field(default_factory=lambda: [4.2, 4.2])
     ntsc_color_under_bw: Annotated[
         list[float],
-        Meta(description="VHS color-under bandwidth range in kHz [min, max] (200-600)."),
+        Meta(
+            description="VHS color-under bandwidth range in kHz [min, max] (200-600)."
+        ),
     ] = field(default_factory=lambda: [500.0, 500.0])
     ntsc_tape_trailing: Annotated[
         list[float],
@@ -902,17 +1093,23 @@ class ReduxOptions(StrictStruct):
     ] = field(default_factory=lambda: [0.0, 0.0])
     ntsc_intensity: Annotated[
         list[float],
-        Meta(description="NTSC effect blend intensity range [min, max] (0=none, 1=full)."),
+        Meta(
+            description="NTSC effect blend intensity range [min, max] (0=none, 1=full)."
+        ),
     ] = field(default_factory=lambda: [1.0, 1.0])
 
     # ── Overshoot (edge ringing, after blur1 before shift) ───────────────────
     overshoot_prob: Annotated[
         float,
-        Meta(description="Probability of applying edge overshoot/undershoot, between 0 and 1."),
+        Meta(
+            description="Probability of applying edge overshoot/undershoot, between 0 and 1."
+        ),
     ] = 0
     overshoot_amount: Annotated[
         list[float],
-        Meta(description="Sharpening strength range [min, max]. 0 = no effect, 2+ = aggressive."),
+        Meta(
+            description="Sharpening strength range [min, max]. 0 = no effect, 2+ = aggressive."
+        ),
     ] = field(default_factory=lambda: [0.5, 2.0])
     overshoot_cutoff: Annotated[
         list[float],
@@ -926,15 +1123,21 @@ class ReduxOptions(StrictStruct):
     # ── Rainbow (NTSC chroma dot crawl, before blur1) ────────────────────────
     rainbow_prob: Annotated[
         float,
-        Meta(description="Probability of applying composite rainbow artifact, between 0 and 1."),
+        Meta(
+            description="Probability of applying composite rainbow artifact, between 0 and 1."
+        ),
     ] = 0
     rainbow_subcarrier_freq: Annotated[
         list[float],
-        Meta(description="Subcarrier frequency range in cycles/pixel [min, max] (0.15-0.35 typical)."),
+        Meta(
+            description="Subcarrier frequency range in cycles/pixel [min, max] (0.15-0.35 typical)."
+        ),
     ] = field(default_factory=lambda: [0.20, 0.30])
     rainbow_chroma_bandwidth: Annotated[
         list[float],
-        Meta(description="Chroma demodulation bandwidth range in cycles/pixel [min, max]."),
+        Meta(
+            description="Chroma demodulation bandwidth range in cycles/pixel [min, max]."
+        ),
     ] = field(default_factory=lambda: [0.04, 0.12])
     rainbow_intensity: Annotated[
         list[float],
@@ -942,17 +1145,23 @@ class ReduxOptions(StrictStruct):
     ] = field(default_factory=lambda: [0.3, 1.0])
     rainbow_phase_alternation: Annotated[
         bool,
-        Meta(description="If true, subcarrier phase alternates per scanline (NTSC behavior)."),
+        Meta(
+            description="If true, subcarrier phase alternates per scanline (NTSC behavior)."
+        ),
     ] = True
 
     # ── Scanline (CRT darkening, before blur1) ──────────────────────────────
     scanline_prob: Annotated[
         float,
-        Meta(description="Probability of applying CRT scanline darkening, between 0 and 1."),
+        Meta(
+            description="Probability of applying CRT scanline darkening, between 0 and 1."
+        ),
     ] = 0
     scanline_strength: Annotated[
         list[float],
-        Meta(description="Scanline darkening strength range [min, max] (0 = none, 1 = full black)."),
+        Meta(
+            description="Scanline darkening strength range [min, max] (0 = none, 1 = full black)."
+        ),
     ] = field(default_factory=lambda: [0.1, 0.5])
     scanline_even_lines: Annotated[
         bool,
@@ -1042,23 +1251,33 @@ class ReduxOptions(StrictStruct):
     ] = (50, 95)
     compress_h264_range: Annotated[
         tuple[int, int],
-        Meta(description="CRF range for H.264 compression in stage 1 (0-51, lower = better)."),
+        Meta(
+            description="CRF range for H.264 compression in stage 1 (0-51, lower = better)."
+        ),
     ] = (20, 40)
     compress_hevc_range: Annotated[
         tuple[int, int],
-        Meta(description="CRF range for HEVC compression in stage 1 (0-51, lower = better)."),
+        Meta(
+            description="CRF range for HEVC compression in stage 1 (0-51, lower = better)."
+        ),
     ] = (20, 40)
     compress_mpeg2_range: Annotated[
         tuple[int, int],
-        Meta(description="qscale range for MPEG-2 compression in stage 1 (1-31, lower = better)."),
+        Meta(
+            description="qscale range for MPEG-2 compression in stage 1 (1-31, lower = better)."
+        ),
     ] = (2, 20)
     compress_mpeg4_range: Annotated[
         tuple[int, int],
-        Meta(description="qscale range for MPEG-4 compression in stage 1 (1-31, lower = better)."),
+        Meta(
+            description="qscale range for MPEG-4 compression in stage 1 (1-31, lower = better)."
+        ),
     ] = (2, 20)
     compress_vp9_range: Annotated[
         tuple[int, int],
-        Meta(description="CRF range for VP9 compression in stage 1 (0-63, lower = better)."),
+        Meta(
+            description="CRF range for VP9 compression in stage 1 (0-63, lower = better)."
+        ),
     ] = (20, 50)
     compress_video_sampling: Annotated[
         list[str],

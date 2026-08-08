@@ -1,13 +1,17 @@
+# ruff: noqa: SLF001
+
 import os
 import shutil
 import sys
 import tempfile
 from os import path as osp
+from types import SimpleNamespace
 
 import torch
+import traiNNer.models.sr_model as sr_model_module
 from pytest import MonkeyPatch
 from spandrel.architectures.ESRGAN import ESRGAN
-from torch import Tensor
+from torch import Tensor, nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from traiNNer.data.paired_image_dataset import PairedImageDataset
@@ -147,3 +151,108 @@ def test_srmodel(monkeypatch: MonkeyPatch) -> None:
         assert isinstance(model.metric_results["topiq"], float | Tensor)
 
     os.remove(options_path)
+
+
+class _CountingIdentity(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.eval_transitions = 0
+        self.train_transitions = 0
+
+    def train(self, mode: bool = True) -> "_CountingIdentity":
+        if mode:
+            self.train_transitions += 1
+        else:
+            self.eval_transitions += 1
+        super().train(mode)
+        return self
+
+    def forward(self, value: Tensor) -> Tensor:
+        return value
+
+
+def _validation_lifecycle_model(
+    network: nn.Module, *, is_train: bool
+) -> SRModel:
+    model = object.__new__(SRModel)
+    model.opt = SimpleNamespace(
+        is_train=is_train,
+        input_pixel_format=None,
+        output_pixel_format=None,
+        val=SimpleNamespace(tile_size=0),
+    )
+    model.device = torch.device("cpu")
+    model.amp_dtype = torch.bfloat16
+    model.use_amp = False
+    model.use_compile = False
+    model.is_train = is_train
+    model.net_g = network
+    model.net_g_ema = None
+    model.optimizers_schedule_free = []
+    model.optimizer_g = None
+    model._validation_inference_net = None
+    model._validation_prepared_key = None
+    model.lq = torch.rand(1, 3, 8, 8)
+    model.gt = None
+    model.output = None
+    return model
+
+
+def test_validation_reuses_one_eval_transition_per_weight_identity(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sr_model_module, "rgb2pixelformat_pt", lambda value, _format: value
+    )
+    monkeypatch.setattr(
+        sr_model_module,
+        "pixelformat2rgb_pt",
+        lambda value, _target, _format: value,
+    )
+    network = _CountingIdentity()
+    model = _validation_lifecycle_model(network, is_train=False)
+
+    with model._validation_inference_context(current_iter=-1):
+        model.test()
+        model.test()
+
+    assert network.eval_transitions == 1
+    assert network.train_transitions == 0
+    assert network.training is False
+
+    # A second dataset using the same weights reuses the prepared eval state.
+    with model._validation_inference_context(current_iter=-1):
+        model.test()
+    assert network.eval_transitions == 1
+
+    # An EMA update invalidates the identity and causes exactly one refresh.
+    model._validation_prepared_key = None
+    with model._validation_inference_context(current_iter=-1):
+        model.test()
+    assert network.eval_transitions == 2
+
+
+def test_training_validation_restores_network_and_model_modes(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sr_model_module, "rgb2pixelformat_pt", lambda value, _format: value
+    )
+    monkeypatch.setattr(
+        sr_model_module,
+        "pixelformat2rgb_pt",
+        lambda value, _target, _format: value,
+    )
+    network = _CountingIdentity()
+    model = _validation_lifecycle_model(network, is_train=True)
+
+    with model._validation_inference_context(current_iter=1000):
+        assert model.is_train is False
+        assert network.training is False
+        model.test()
+        model.test()
+
+    assert model.is_train is True
+    assert network.training is True
+    assert network.eval_transitions == 1
+    assert network.train_transitions == 1

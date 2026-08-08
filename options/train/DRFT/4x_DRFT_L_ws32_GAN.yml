@@ -1,0 +1,243 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/the-database/traiNNer-redux/refs/heads/master/schemas/redux-config.schema.json
+#########################################################################################
+# General Settings
+# Based on 4x_DRFT_L_fidelity.yml, but tuned for late-stage ws=32 fine-tuning.
+#########################################################################################
+name: 4x_DRFT_L_GAN_2
+scale: 4
+use_amp: true
+amp_bf16: true
+use_channels_last: true
+fast_matmul: true
+use_compile: true
+compile_mode: max-autotune-no-cudagraphs
+num_gpu: auto
+
+high_order_degradation: true  # Enable on-the-fly (OTF) degradations, which generates LR tiles from HRs during training.
+high_order_degradations_debug: false  # Save the LR and HR tiles to debug/otf folder inside the root of the training directory.
+high_order_degradations_debug_limit: 100  # The max number of iterations to save LR and HR tiles for.
+
+# USM degradation options.
+lq_usm: false  # Apply unsharp mask to LQ image before all other degradations.
+lq_usm_radius_range: [1, 25]  # Range of randomly selected unsharp mask radius to apply.
+
+# The first degradation process.
+thicklines_prob: 0.0
+blur_prob: 0.0
+resize_prob: [0.15, 0.15, 0.7]  # up, down, keep
+resize_mode_list: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']  # bilinear, bicubic, nearest-exact, lanczos
+resize_mode_prob: [0.3, 0.5, 0.01, 0.19]  # Probability each resize mode is selected.
+resize_range: [0.7, 1.4]
+gaussian_noise_prob: 0.0
+noise_range: [0, 0]
+poisson_scale_range: [0, 0]
+gray_noise_prob: 0.0
+compress_prob: 0.99
+compress_jpeg_range: [30, 100]
+
+# The second degradation process.
+blur_prob2: 0.0
+resize_prob2: [0.2, 0.2, 0.6]  # up, down, keep
+resize_mode_list2: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']  # bilinear, bicubic, nearest-exact, lanczos
+resize_mode_prob2: [0.3, 0.5, 0.01, 0.19]  # Probability each resize mode is selected.
+resize_range2: [0.6, 1.2]
+gaussian_noise_prob2: 0
+noise_range2: [0, 0]
+poisson_scale_range2: [0, 0]
+gray_noise_prob2: 0.0
+compress_prob2: 0.65
+compress_jpeg_range2: [60, 100]
+
+# The final resize to the target resolution.
+resize_mode_list3: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']  # bilinear, bicubic, nearest-exact, lanczos
+resize_mode_prob3: [0.3, 0.5, 0.01, 0.19]  # Probability each resize mode is selected.
+
+queue_size: 64
+
+datasets:
+  train:
+    name: Train Dataset
+    type: realesrgandataset
+    # dataroot_gt: [
+    #   datasets/train/DiverSeg-IP/HR
+    # ]
+    dataroot_gt: [
+      datasets/train/dataset5/HR
+    ]
+    lq_size: 64
+    use_hflip: true
+    use_rot: true
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 8
+    accum_iter: 2
+    prefetch_mode: cuda
+    prefetch_factor: 2
+    persistent_workers: true
+    pin_memory: true
+
+    blur_kernel_size: 12
+    kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    kernel_range: [5, 17]  # kernel range inclusive, must be odd numbers
+    sinc_prob: 0.0
+    blur_sigma: [0.2, 2]
+    betag_range: [0.5, 4]
+    betap_range: [1, 2]
+
+    blur_kernel_size2: 12
+    kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    kernel_range2: [5, 17]  # kernel range inclusive, must be odd numbers
+    sinc_prob2: 0.0
+    blur_sigma2: [0.2, 1]
+    betag_range2: [0.5, 4]
+    betap_range2: [1, 2]
+
+    final_sinc_prob: 0.0
+    final_kernel_range: [5, 17]  # kernel range inclusive, must be odd numbers
+
+  val_1:
+    name: Urban100
+    type: pairedimagedataset
+    dataroot_gt: [
+      datasets/val/dataset7/HR
+    ]
+    dataroot_lq: [
+      datasets/val/dataset7/LR
+    ]
+    io_backend:
+      type: disk
+
+  val_2:
+    name: Manga109
+    type: pairedimagedataset
+    dataroot_gt: [
+      datasets/val/MANGA109_prep/HR
+    ]
+    dataroot_lq: [
+      datasets/val/MANGA109_prep/LR
+    ]
+    io_backend:
+      type: disk
+
+network_g:
+  type: drft_l
+  scale: 4
+  window_size: 32
+  rank: 32
+  use_checkpoint: true
+  # use_checkpoint_ocab: true
+  attn_type: hybrid
+
+# Discriminator model settings
+network_d:
+  type: dunet  # dunet, metagan2, unetdiscriminatorsn
+
+path:
+  # Default: consume the Stage A online checkpoint.
+  # If Stage A EMA validates better, swap this to:
+  # /home/rift/workspace/traiNNer-redux/experiments/4x_DRFT_L_ws32_biaswarm/models/net_g_ema_3000.safetensors
+  pretrain_network_g: /home/rift/workspace/traiNNer-redux/experiments/4x_DRFT_L_r32_mixed_ws32/models/net_g_ema_76000.safetensors
+  param_key_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+  # Resume from 6k with the first decay already applied, then decay again at 56k.
+train:
+  ema_decay: 0.999
+  grad_clip: false  # Gradient clipping allows more stable training when using higher learning rates.
+  # Optimizer for generator model
+  adaptive_d: true
+  optim_g:
+    type: AdamW
+    lr: !!float 2e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  # Optimizer for discriminator model
+  optim_d:
+    type: AdamW
+    lr: !!float 4e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [30000]
+    gamma: 0.5
+
+  total_iter: 50000
+  warmup_iter: -1
+
+  losses:
+    # - type: charbonnierloss
+    #   loss_weight: 0.5
+    # MS-SSIM loss
+    - type: mssimloss
+      loss_weight: 0.35
+    # Perceptual loss
+    - type: perceptualloss
+      criterion: charbonnier  # charbonnier, l1, pd+l1, fd+l1, pd, fd
+      loss_weight: 0.01
+    - type: fliploss
+      loss_weight: 0.2
+    - type: sobeledgeloss
+      loss_weight: 0.3
+    # HSLuv loss (hue, saturation, lightness)
+    - type: hsluvloss
+      criterion: charbonnier
+      loss_weight: 1.0
+    # - type: cosimloss
+    #   loss_weight: 0.0
+    # GAN loss
+    - type: ganloss
+      gan_type: vanilla
+      loss_weight: 0.1
+    # Additional losses - disabled by default.
+    # To enable, change the loss_weight from 0 to the recommended loss_weight which appears as a comment next to the loss weight.
+    # For example to enable DISTS loss, change the loss weight from 0 to 0.25; to enable color loss change loss weight from 0 to 1.
+    # DISTS perceptual loss
+    - type: distsloss
+      loss_weight: 0.3  # 0.3
+    # # LDL loss
+    # - type: ldlloss
+    #   loss_weight: 1.0  # 1.0
+    # FF loss
+    - type: ffloss
+      loss_weight: 0.45  # 0.2
+    # # charbonnierloss
+    # - type: charbonnierloss
+    #   loss_weight: 0.35
+    # # linedistillerloss
+    # - type: linedistillerloss
+    #   loss_weight: 1.0
+    # # gradientvarianceloss
+    # - type: gradientvarianceloss
+    #   patch_size: 16
+    #   criterion: charbonnier
+    #   loss_weight: 0.25
+
+val:
+  val_enabled: false
+  val_freq: 1000
+  save_img: true
+  tile_size: 0
+  tile_overlap: 8
+
+  metrics_enabled: true
+  metrics:
+    topiq:
+      type: calculate_topiq
+    psnr:
+      type: calculate_psnr
+      crop_border: 4
+      test_y_channel: true
+    ssim:
+      type: calculate_ssim
+      crop_border: 4
+      test_y_channel: true
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 1000
+  save_checkpoint_format: safetensors
+  use_tb_logger: true

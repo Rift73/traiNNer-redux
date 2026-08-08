@@ -127,10 +127,23 @@ class MessageLogger:
 
             message += f"[performance: {iter_time:.3f} it/s] [eta: {eta_str}] "
 
-        # peak VRAM
+        # Peak PyTorch caching-allocator usage. Reserved memory includes cached
+        # blocks and CUDA Graph pools, so it is the better OOM-planning figure.
+        gib = 1024**3
+        peak_allocated_gb = torch.cuda.max_memory_allocated() / gib
+        peak_reserved_gb = torch.cuda.max_memory_reserved() / gib
         message += (
-            f"[peak VRAM: {torch.cuda.max_memory_allocated() / (1024**3):.2f} GB] "
+            f"[peak VRAM: {peak_allocated_gb:.2f} GB allocated, "
+            f"{peak_reserved_gb:.2f} GB reserved] "
         )
+
+        if self.tb_logger is not None:
+            self.tb_logger.add_scalar(
+                "memory/peak_allocated_gb", peak_allocated_gb, current_iter
+            )
+            self.tb_logger.add_scalar(
+                "memory/peak_reserved_gb", peak_reserved_gb, current_iter
+            )
 
         # Log any additional variables (typically losses)
         for k, v in log_vars.items():
