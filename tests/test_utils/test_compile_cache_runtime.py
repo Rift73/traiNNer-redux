@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,12 @@ def test_missing_cached_guard_gradient_is_restored_as_none(
 
     assert result is not None
     assert received_grads == [None]
+    method = dynamo_guards.GuardsStatePickler._unpickle_tensor  # noqa: SLF001
+    serialized = pickle.dumps(method)
+    restored = pickle.loads(serialized)
+    assert restored.__func__ is (  # pyright: ignore[reportFunctionMemberAccess]
+        method.__func__
+    )
 
 
 def test_static_autotuner_gets_stable_filename(monkeypatch: Any) -> None:

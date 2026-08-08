@@ -165,6 +165,15 @@ def install_dynamo_guard_grad_compatibility() -> None:
                 grad,
             )
 
+        # Pickle serializes bound classmethods by their function name. Keep the
+        # wrapper addressable through the existing class attribute instead of
+        # leaking its local implementation name into newly recorded guards.
+        functools.update_wrapper(compatible_unpickle_tensor, original)
+        compatible_unpickle_tensor.__name__ = "_unpickle_tensor"
+        compatible_unpickle_tensor.__qualname__ = (
+            f"{pickler.__qualname__}._unpickle_tensor"
+        )
+        compatible_unpickle_tensor.__module__ = pickler.__module__
         setattr(
             compatible_unpickle_tensor,
             _GUARD_GRAD_PATCH_MARKER,
