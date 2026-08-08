@@ -19,6 +19,45 @@ def test_dynamo_precompile_cache_is_scoped_by_abi() -> None:
     assert Path(second).is_dir()
 
 
+def test_missing_cached_guard_gradient_is_restored_as_none(
+    monkeypatch: Any,
+) -> None:
+    from torch._dynamo import guards as dynamo_guards
+
+    received_grads: list[Any] = []
+
+    def capture_unpickle_tensor(
+        cls: type[Any],
+        meta_tensor: Any,
+        device: Any,
+        pytype: type,
+        dispatch_keys_raw: int,
+        grad: Any,
+    ) -> Any:
+        del cls, meta_tensor, device, pytype, dispatch_keys_raw
+        received_grads.append(grad)
+        return object()
+
+    monkeypatch.setattr(
+        dynamo_guards.GuardsStatePickler,
+        "_unpickle_tensor",
+        classmethod(capture_unpickle_tensor),
+    )
+
+    compile_cache.install_dynamo_guard_grad_compatibility()
+    sentinel = dynamo_guards._Missing("tensor guard tree")  # noqa: SLF001
+    result = dynamo_guards.GuardsStatePickler._unpickle_tensor(  # noqa: SLF001
+        object(),
+        object(),
+        object,
+        0,
+        sentinel,
+    )
+
+    assert result is not None
+    assert received_grads == [None]
+
+
 def test_static_autotuner_gets_stable_filename(monkeypatch: Any) -> None:
     from torch._inductor.triton_bundler import TritonBundler
 

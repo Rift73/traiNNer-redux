@@ -16,6 +16,7 @@ import torch
 _INSTALL_LOCK = threading.Lock()
 _COMPILE_CACHE_RUNTIME_ABI = "trainner-compile-cache-v2"
 _PATCH_MARKER = "_trainner_stable_autotune_identity_v2"
+_GUARD_GRAD_PATCH_MARKER = "_trainner_missing_guard_grad_v1"
 
 
 @functools.cache
@@ -118,6 +119,62 @@ def install_stable_triton_autotune_identity() -> None:
         )
 
 
+def install_dynamo_guard_grad_compatibility() -> None:
+    """Restore cached guard tensors whose unguarded grad was omitted.
+
+    PyTorch 2.14's experimental precompile serializer replaces a tensor value
+    outside the guard tree with ``_Missing``. A model parameter can have a
+    populated ``.grad`` when the package is saved, so that gradient is encoded
+    as ``_Missing`` and the stock loader later assigns the sentinel directly to
+    ``Tensor.grad``. Treating an omitted, unguarded gradient as ``None`` matches
+    a freshly constructed parameter and keeps the otherwise-valid package
+    reusable.
+    """
+    from torch._dynamo import guards as dynamo_guards
+
+    pickler = dynamo_guards.GuardsStatePickler
+    current = pickler._unpickle_tensor  # noqa: SLF001
+    current_function = getattr(current, "__func__", current)
+    if getattr(current_function, _GUARD_GRAD_PATCH_MARKER, False):
+        return
+
+    with _INSTALL_LOCK:
+        current = pickler._unpickle_tensor  # noqa: SLF001
+        current_function = getattr(current, "__func__", current)
+        if getattr(current_function, _GUARD_GRAD_PATCH_MARKER, False):
+            return
+
+        original = current_function
+
+        def compatible_unpickle_tensor(
+            cls: type[Any],
+            meta_tensor: torch.Tensor,
+            device: torch.device,
+            pytype: type,
+            dispatch_keys_raw: int,
+            grad: Any,
+        ) -> torch.Tensor:
+            if isinstance(grad, dynamo_guards._Missing):  # noqa: SLF001
+                grad = None
+            return original(
+                cls,
+                meta_tensor,
+                device,
+                pytype,
+                dispatch_keys_raw,
+                grad,
+            )
+
+        setattr(
+            compatible_unpickle_tensor,
+            _GUARD_GRAD_PATCH_MARKER,
+            True,
+        )
+        pickler._unpickle_tensor = classmethod(  # noqa: SLF001
+            compatible_unpickle_tensor
+        )
+
+
 def scope_dynamo_precompile_cache(cache_key_tag: str) -> str:
     """Give Dynamo's package cache the ABI dimension its source key omits."""
     if not cache_key_tag:
@@ -143,5 +200,6 @@ def scope_dynamo_precompile_cache(cache_key_tag: str) -> str:
 
 def configure_compile_cache_runtime(cache_key_tag: str) -> str:
     """Install stable kernel identity and select the matching package scope."""
+    install_dynamo_guard_grad_compatibility()
     install_stable_triton_autotune_identity()
     return scope_dynamo_precompile_cache(cache_key_tag)
