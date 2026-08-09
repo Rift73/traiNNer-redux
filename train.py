@@ -520,12 +520,13 @@ def train_pipeline(root_path: str) -> None:
                     )
                     if current_iter % opt.val.val_freq == 0 and accepted_gradient:
                         multi_val_datasets = len(val_loaders) > 1
+                        save_img = opt.val.should_save_img(current_iter)
                         for val_loader in val_loaders:
                             model.validation(
                                 val_loader,
                                 current_iter,
                                 tb_logger,
-                                opt.val.save_img,
+                                save_img,
                                 multi_val_datasets,
                             )
                         model.on_validation_boundary(current_iter)
@@ -576,7 +577,12 @@ def train_pipeline(root_path: str) -> None:
     )  # -1 stands for the latest
     if opt.val is not None:
         for val_loader in val_loaders:
-            model.validation(val_loader, current_iter, tb_logger, opt.val.save_img)
+            model.validation(
+                val_loader,
+                current_iter,
+                tb_logger,
+                opt.val.should_save_img(current_iter),
+            )
     if tb_logger:
         tb_logger.close()
     if model.opt.dist:

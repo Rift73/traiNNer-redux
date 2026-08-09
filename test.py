@@ -69,7 +69,7 @@ def test_pipeline(root_path: str) -> None:
                 test_loader,
                 current_iter=-1,
                 tb_logger=None,
-                save_img=opt.val.save_img,
+                save_img=opt.val.should_save_img(current_iter=-1),
             )
     except KeyboardInterrupt:
         logger.info("User interrupted.")

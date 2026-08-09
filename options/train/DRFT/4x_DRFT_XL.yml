@@ -46,7 +46,7 @@ compress_jpeg_range2: [100, 100]
 
 resize_mode_list3: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
 resize_mode_prob3: [0.0, 1.0, 0.0, 0.0]
-queue_size: 64
+queue_size: 60
 
 datasets:
   train:
@@ -57,8 +57,8 @@ datasets:
     use_hflip: true
     use_rot: true
     num_worker_per_gpu: 8
-    batch_size_per_gpu: 4
-    accum_iter: 6
+    batch_size_per_gpu: 6
+    accum_iter: 5
     prefetch_mode: cuda
     prefetch_factor: 2
     persistent_workers: true
@@ -86,7 +86,7 @@ network_g:
   window_size: 32
   rank: 32
   iln_eps: !!float 1e-4
-  rhag_layer_scale_init: !!float 1e-4
+  rhag_layer_scale_init: !!float 1e-1
   drop_path_rate: 0.1
   use_checkpoint: true
   use_checkpoint_ocab: false
@@ -130,7 +130,8 @@ train:
 val:
   val_enabled: true
   val_freq: 1000
-  save_img: false
+  save_img: true
+  save_img_iters: [10000, 50000, 100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000]
   tile_size: 0
   tile_overlap: 8
   metrics_enabled: true

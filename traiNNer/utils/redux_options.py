@@ -520,6 +520,12 @@ class ValOptions(StrictStruct):
             description="Whether to save the validation images during validation, in the experiments/<name>/visualization folder."
         ),
     ]
+    save_img_iters: Annotated[
+        list[int] | None,
+        Meta(
+            description="Optional training iterations at which validation images are saved. This filters image saving only; validation must still run at the iteration according to val_freq. Omit to save at every validation when save_img is enabled."
+        ),
+    ] = None
     tile_size: Annotated[
         int,
         Meta(
@@ -544,6 +550,18 @@ class ValOptions(StrictStruct):
     ] = False
     metrics: dict[str, Any] | None = None
     pbar: bool = True
+
+    def should_save_img(self, current_iter: int) -> bool:
+        """Return whether this validation should write images.
+
+        Negative iterations are standalone test runs, where an optional training
+        schedule should not suppress explicitly enabled image output.
+        """
+        return self.save_img and (
+            current_iter < 0
+            or self.save_img_iters is None
+            or current_iter in self.save_img_iters
+        )
 
 
 class LogOptions(StrictStruct):

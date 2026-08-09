@@ -270,6 +270,21 @@ def rewrite_onnx_for_tensorrt_plugins(
         for index, node in enumerate(graph.node)
         for name in node.output
     }
+    constant_tensors: dict[str, tuple[int, Any, Any]] = {}
+    for node_index, node in enumerate(graph.node):
+        if node.op_type != "Constant" or len(node.output) != 1:
+            continue
+        tensor_attributes = [
+            attribute.t
+            for attribute in node.attribute
+            if attribute.type == onnx.AttributeProto.TENSOR
+        ]
+        if len(tensor_attributes) == 1:
+            constant_tensors[node.output[0]] = (
+                node_index,
+                node,
+                tensor_attributes[0],
+            )
     consumers: dict[str, list[Any]] = {}
     for node in graph.node:
         for name in node.input:
@@ -306,19 +321,37 @@ def rewrite_onnx_for_tensorrt_plugins(
     for add_index, add_node in enumerate(graph.node):
         if add_node.op_type != "Add":
             continue
-        bias_name = next(
-            (
-                name
-                for name in add_node.input
-                if name in initializers
-                and name.endswith("._deployment_relative_position_bias")
-            ),
-            None,
-        )
+        bias_name = None
+        bias_tensor = None
+        bias_constant_index = None
+        bias_source = None
+        for name in add_node.input:
+            initializer = initializers.get(name)
+            constant = constant_tensors.get(name)
+            candidate = initializer if initializer is not None else (
+                constant[2] if constant is not None else None
+            )
+            if candidate is None:
+                continue
+            dims = list(candidate.dims)
+            named_deployment_bias = name.endswith(
+                "._deployment_relative_position_bias"
+            )
+            exact_dynamic_constant = (
+                constant is not None
+                and dims[:1] == [1]
+                and dims[-2:] == [q_tokens, kv_tokens]
+                and "/ocab/" in constant[1].name
+            )
+            if named_deployment_bias or exact_dynamic_constant:
+                bias_name = name
+                bias_tensor = candidate
+                bias_constant_index = constant[0] if constant is not None else None
+                bias_source = "constant" if constant is not None else "initializer"
+                break
         if bias_name is None:
             continue
-
-        bias_tensor = initializers[bias_name]
+        assert bias_tensor is not None
         bias_dims = list(bias_tensor.dims)
         if (
             len(bias_dims) != 4
@@ -360,20 +393,48 @@ def rewrite_onnx_for_tensorrt_plugins(
         if score_index is None:
             raise RuntimeError(f"OCAB bias input has no producer: {bias_name}")
         score_node = graph.node[score_index]
-        if score_node.op_type != "MatMul":
-            raise RuntimeError(f"OCAB bias input is not produced by MatMul: {bias_name}")
-        add_users = consumers.get(add_node.output[0], [])
-        if len(add_users) != 1 or add_users[0].op_type != "Softmax":
-            raise RuntimeError(f"OCAB Add does not feed exactly one Softmax: {bias_name}")
-        softmax_node = add_users[0]
-        softmax_index = producer_indices[softmax_node.output[0]]
-        softmax_users = consumers.get(softmax_node.output[0], [])
-        if len(softmax_users) != 1 or softmax_users[0].op_type != "MatMul":
-            raise RuntimeError(f"OCAB Softmax does not feed exactly one PV MatMul: {bias_name}")
-        pv_node = softmax_users[0]
-        pv_index = producer_indices[pv_node.output[0]]
-        if pv_node.input[0] != softmax_node.output[0]:
-            raise RuntimeError(f"OCAB probability tensor is not PV input zero: {bias_name}")
+        if strategy == "compact_bias":
+            score_is_qk = score_node.op_type == "MatMul"
+            if score_node.op_type == "Mul":
+                score_is_qk = any(
+                    (
+                        producer_indices.get(name) is not None
+                        and graph.node[producer_indices[name]].op_type == "MatMul"
+                    )
+                    for name in score_node.input
+                )
+            if not score_is_qk:
+                raise RuntimeError(
+                    f"OCAB bias input is not produced by QK or scaled QK: {bias_name}"
+                )
+            softmax_node = None
+            softmax_index = None
+            pv_node = None
+            pv_index = None
+        else:
+            if score_node.op_type != "MatMul":
+                raise RuntimeError(
+                    "Fused OCAB plugin requires the direct QK graph; "
+                    f"got {score_node.op_type} for {bias_name}"
+                )
+            add_users = consumers.get(add_node.output[0], [])
+            if len(add_users) != 1 or add_users[0].op_type != "Softmax":
+                raise RuntimeError(
+                    f"OCAB Add does not feed exactly one Softmax: {bias_name}"
+                )
+            softmax_node = add_users[0]
+            softmax_index = producer_indices[softmax_node.output[0]]
+            softmax_users = consumers.get(softmax_node.output[0], [])
+            if len(softmax_users) != 1 or softmax_users[0].op_type != "MatMul":
+                raise RuntimeError(
+                    f"OCAB Softmax does not feed exactly one PV MatMul: {bias_name}"
+                )
+            pv_node = softmax_users[0]
+            pv_index = producer_indices[pv_node.output[0]]
+            if pv_node.input[0] != softmax_node.output[0]:
+                raise RuntimeError(
+                    f"OCAB probability tensor is not PV input zero: {bias_name}"
+                )
 
         table_name = bias_name.removesuffix(
             "_deployment_relative_position_bias"
@@ -396,9 +457,19 @@ def rewrite_onnx_for_tensorrt_plugins(
                 q_window_size=q_window,
                 kv_window_size=kv_window,
             )
-            insertions.setdefault(add_index, []).append(plugin_node)
+            insertion_index = (
+                bias_constant_index
+                if bias_constant_index is not None
+                else add_index
+            )
+            insertions.setdefault(insertion_index, []).append(plugin_node)
+            if bias_constant_index is not None:
+                removed_node_indices.add(bias_constant_index)
             plugin_output = bias_name
         else:
+            assert pv_node is not None
+            assert softmax_index is not None
+            assert pv_index is not None
             plugin_node = helper.make_node(
                 "DrftOCABAttention_TRT",
                 [score_node.input[0], score_node.input[1], pv_node.input[1], table_name],
@@ -413,11 +484,15 @@ def rewrite_onnx_for_tensorrt_plugins(
             removed_node_indices.update(
                 (score_index, add_index, softmax_index, pv_index)
             )
+            if bias_constant_index is not None:
+                removed_node_indices.add(bias_constant_index)
             plugin_output = pv_node.output[0]
-        removed_initializers.add(bias_name)
+        if bias_source == "initializer":
+            removed_initializers.add(bias_name)
         reports.append(
             {
                 "bias": bias_name,
+                "source": bias_source,
                 "heads": heads,
                 "dense_bytes": len(bias_tensor.raw_data),
                 "table_bytes": len(table_tensor.raw_data),
@@ -466,7 +541,31 @@ def rewrite_onnx_for_tensorrt_plugins(
         entry.value = value
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    onnx.save_model(model, str(output_path))
+    external_data_path = output_path.with_name(f"{output_path.name}.data")
+    if external_data_path.exists():
+        raise FileExistsError(
+            f"Refusing to overwrite plugin ONNX external data: {external_data_path}"
+        )
+    raw_initializer_bytes = sum(
+        len(tensor.raw_data) for tensor in model.graph.initializer
+    )
+    raw_constant_bytes = sum(
+        len(attribute.t.raw_data)
+        for node in model.graph.node
+        for attribute in node.attribute
+        if attribute.type == onnx.AttributeProto.TENSOR
+    )
+    raw_tensor_bytes = raw_initializer_bytes + raw_constant_bytes
+    uses_external_data = raw_tensor_bytes >= 1536 * 1024 * 1024
+    onnx.save_model(
+        model,
+        str(output_path),
+        save_as_external_data=uses_external_data,
+        all_tensors_to_one_file=uses_external_data,
+        location=external_data_path.name if uses_external_data else None,
+        size_threshold=1024,
+        convert_attribute=uses_external_data,
+    )
     return {
         "source": str(source_path),
         "output": str(output_path),
@@ -476,6 +575,10 @@ def rewrite_onnx_for_tensorrt_plugins(
         "ocab_count": len(reports),
         "dense_bias_bytes": sum(item["dense_bytes"] for item in reports),
         "compact_table_bytes": sum(item["table_bytes"] for item in reports),
+        "external_data": str(external_data_path) if uses_external_data else None,
+        "raw_initializer_bytes": raw_initializer_bytes,
+        "raw_constant_bytes": raw_constant_bytes,
+        "raw_tensor_bytes": raw_tensor_bytes,
         "instances": reports,
     }
 
@@ -1125,7 +1228,10 @@ class ConvSwiGLUFFN(nn.Module):
         x = F.silu(gate) * value
 
         # Reshape for depthwise conv
-        x = x.transpose(1, 2).view(B, -1, H, W)  # (B, hidden, H, W)
+        # Keep the channel dimension explicit. This is equivalent in PyTorch,
+        # but it prevents TensorRT from trying to infer the grouped-convolution
+        # channel count through a symbolic H*W reshape in dynamic ONNX graphs.
+        x = x.transpose(1, 2).view(B, self.hidden_dim, H, W)
         x = self.dwconv(x)
         x = x.flatten(2).transpose(1, 2)  # (B, N, hidden)
 
