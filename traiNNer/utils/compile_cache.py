@@ -14,9 +14,11 @@ from typing import Any
 import torch
 
 _INSTALL_LOCK = threading.Lock()
+_GLOBAL_SCOPE_LOCK = threading.Lock()
 _COMPILE_CACHE_RUNTIME_ABI = "trainner-compile-cache-v2"
 _PATCH_MARKER = "_trainner_stable_autotune_identity_v2"
 _GUARD_GRAD_PATCH_MARKER = "_trainner_missing_guard_grad_v1"
+_GLOBAL_NAME_PATCH_MARKER = "_trainner_existing_dynamo_global_v1"
 
 
 @functools.cache
@@ -184,6 +186,49 @@ def install_dynamo_guard_grad_compatibility() -> None:
         )
 
 
+def install_dynamo_global_name_compatibility() -> None:
+    """Avoid fresh-trace name collisions with restored package globals.
+
+    Dynamo's process-local ``unique_id`` counter restarts from zero, while a
+    precompiled package restores generated names such as
+    ``__builtins_dict___4`` into the target module. If a package guard misses,
+    fallback tracing can generate an already-restored name and fail before the
+    graph is rebuilt. Keep restored state intact and advance until an unused
+    name is found.
+    """
+    from torch._dynamo.bytecode_transformation import unique_id
+    from torch._dynamo.output_graph import OutputGraph
+
+    current = OutputGraph.install_global
+    if getattr(current, _GLOBAL_NAME_PATCH_MARKER, False):
+        return
+
+    with _INSTALL_LOCK:
+        current = OutputGraph.install_global
+        if getattr(current, _GLOBAL_NAME_PATCH_MARKER, False):
+            return
+
+        def collision_safe_install_global(
+            self: OutputGraph,
+            prefix: str,
+            value: Any,
+        ) -> str:
+            with _GLOBAL_SCOPE_LOCK:
+                name = unique_id(prefix)
+                while name in self.global_scope:
+                    name = unique_id(prefix)
+                self.install_global_unsafe(name, value)
+                return name
+
+        functools.update_wrapper(collision_safe_install_global, current)
+        setattr(
+            collision_safe_install_global,
+            _GLOBAL_NAME_PATCH_MARKER,
+            True,
+        )
+        OutputGraph.install_global = collision_safe_install_global
+
+
 def scope_dynamo_precompile_cache(cache_key_tag: str) -> str:
     """Give Dynamo's package cache the ABI dimension its source key omits."""
     if not cache_key_tag:
@@ -210,5 +255,6 @@ def scope_dynamo_precompile_cache(cache_key_tag: str) -> str:
 def configure_compile_cache_runtime(cache_key_tag: str) -> str:
     """Install stable kernel identity and select the matching package scope."""
     install_dynamo_guard_grad_compatibility()
+    install_dynamo_global_name_compatibility()
     install_stable_triton_autotune_identity()
     return scope_dynamo_precompile_cache(cache_key_tag)

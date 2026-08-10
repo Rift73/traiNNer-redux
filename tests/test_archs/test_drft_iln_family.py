@@ -3,6 +3,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 from traiNNer.archs import drft_arch
+from traiNNer.utils.registry import ARCH_REGISTRY
 
 
 def test_drft_uses_iln_at_every_normalization_site() -> None:
@@ -11,8 +12,6 @@ def test_drft_uses_iln_at_every_normalization_site() -> None:
         embed_dim=32,
         depths=(2,),
         num_heads=(1,),
-        unshifted_num_heads=(1,),
-        unshifted_attention_dim=(16,),
         window_size=4,
         overlap_window_size=6,
         mlp_ratio=2.0,
@@ -33,14 +32,14 @@ def test_drft_uses_iln_at_every_normalization_site() -> None:
 
 def test_drft_family_has_balanced_factory_contract() -> None:
     expected = {
-        "drft_nano": (32, 1, 2, 1, 1, 16),
-        "drft_micro": (64, 1, 6, 2, 1, 32),
-        "drft_light": (96, 2, 6, 3, 1, 48),
-        "drft_xs": (128, 4, 6, 4, 2, 64),
-        "drft_s": (160, 6, 6, 5, 3, 96),
-        "drft_m": (192, 8, 6, 6, 3, 96),
-        "drft_l": (224, 10, 6, 7, 4, 128),
-        "drft_xl": (256, 14, 6, 8, 4, 128),
+        "drft_nano": (32, 1, 2, 1),
+        "drft_micro": (64, 1, 6, 2),
+        "drft_light": (96, 2, 6, 3),
+        "drft_xs": (128, 4, 6, 4),
+        "drft_s": (160, 6, 6, 5),
+        "drft_m": (192, 8, 6, 6),
+        "drft_l": (224, 10, 6, 7),
+        "drft_xl": (256, 14, 6, 8),
     }
 
     sentinel = object()
@@ -54,10 +53,10 @@ def test_drft_family_has_balanced_factory_contract() -> None:
             kwargs["groups"],
             kwargs["depth"],
             kwargs["full_heads"],
-            kwargs["unshifted_heads"],
-            kwargs["unshifted_attention_dim"],
         )
         assert observed == contract
+        assert "unshifted_heads" not in kwargs
+        assert "unshifted_attention_dim" not in kwargs
         assert kwargs["rank"] == 32
         assert kwargs["iln_eps"] == 1e-4
         assert "use_iln" not in kwargs
@@ -67,14 +66,72 @@ def test_drft_family_has_balanced_factory_contract() -> None:
             assert "rhag_layer_scale_init" not in kwargs
 
 
+def test_canonical_drft_uses_full_width_attention_and_original_ocab_overlap() -> None:
+    model = drft_arch.drft_nano(scale=2, drop_path_rate=0.0)
+
+    assert model.overlap_window_size == 24
+    assert model.unshifted_num_heads == model.num_heads
+    assert model.unshifted_attention_dim == (model.embed_dim,) * len(model.depths)
+    assert not any(
+        isinstance(module, drft_arch.NarrowWindowAttention)
+        for module in model.modules()
+    )
+
+
+def test_drft_teacher_family_inherits_the_canonical_attention_contract() -> None:
+    expected = {
+        "drft_nano_teacher": (32, 2, 4, 1),
+        "drft_micro_teacher": (64, 2, 6, 2),
+        "drft_light_teacher": (96, 4, 6, 3),
+        "drft_xs_teacher": (128, 6, 6, 4),
+        "drft_s_teacher": (160, 9, 6, 5),
+        "drft_m_teacher": (192, 12, 6, 6),
+        "drft_l_teacher": (224, 15, 6, 7),
+        "drft_xl_teacher": (256, 21, 6, 8),
+    }
+
+    sentinel = object()
+    for name, contract in expected.items():
+        with patch.object(
+            drft_arch,
+            "_build_drft_teacher",
+            return_value=sentinel,
+        ) as build:
+            assert getattr(drft_arch, name)() is sentinel
+
+        kwargs = build.call_args.kwargs
+        observed = (
+            kwargs["embed_dim"],
+            kwargs["groups"],
+            kwargs["depth"],
+            kwargs["full_heads"],
+        )
+        assert observed == contract
+        assert "unshifted_heads" not in kwargs
+        assert "unshifted_attention_dim" not in kwargs
+
+
+def test_only_canonical_drft_names_are_registered() -> None:
+    names = (
+        "drft_nano",
+        "drft_micro",
+        "drft_light",
+        "drft_xs",
+        "drft_s",
+        "drft_m",
+        "drft_l",
+        "drft_xl",
+    )
+    assert all(ARCH_REGISTRY.get(name) is getattr(drft_arch, name) for name in names)
+    assert "drft_m_safe" not in ARCH_REGISTRY
+
+
 def test_rhag_outer_layerscale_is_opt_in() -> None:
     common = {
         "img_size": 8,
         "embed_dim": 32,
         "depths": (2,),
         "num_heads": (1,),
-        "unshifted_num_heads": (1,),
-        "unshifted_attention_dim": (16,),
         "window_size": 4,
         "overlap_window_size": 6,
         "mlp_ratio": 2.0,
@@ -89,7 +146,7 @@ def test_rhag_outer_layerscale_is_opt_in() -> None:
     assert isinstance(unchanged.layers[0].ls_rhag, nn.Identity)
     assert not any("ls_rhag" in key for key in unchanged.state_dict())
     assert unchanged.compile_cache_key_tag.startswith(
-        "drft-iln-family-v11-raw-aot-ocab-flex-op-"
+        "drft-iln-family-v13-prefusion-execution-"
     )
     assert unchanged.compile_cache_key_tag == drft_arch.DRFT(
         **common
@@ -98,7 +155,7 @@ def test_rhag_outer_layerscale_is_opt_in() -> None:
     stabilized = drft_arch.DRFT(**common, rhag_layer_scale_init=1e-4)
     assert isinstance(stabilized.layers[0].ls_rhag, drft_arch.LayerScale)
     assert stabilized.compile_cache_key_tag.startswith(
-        "drft-iln-family-v11-raw-aot-ocab-flex-op-"
+        "drft-iln-family-v13-prefusion-execution-"
     )
     assert stabilized.compile_cache_key_tag != unchanged.compile_cache_key_tag
     assert torch.equal(

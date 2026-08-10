@@ -2,10 +2,10 @@
 #########################################################################################
 # DRFT Light x4 bicubic training. Physical/effective batch: 32/32.
 #########################################################################################
-name: 4x_DRFT_Light_v2
+name: 4x_DRFT_Light_deterministic_post_fusion
 scale: 4
-# manual_seed: 1024
-# deterministic: false
+manual_seed: 1024
+deterministic: true
 use_amp: true
 amp_bf16: true
 use_channels_last: true

@@ -129,7 +129,8 @@ train:
 val:
   val_enabled: true
   val_freq: 1000
-  save_img: false
+  save_img: true
+  save_img_iters: [10000, 50000, 100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000]
   tile_size: 0
   tile_overlap: 8
   metrics_enabled: true
@@ -145,6 +146,6 @@ val:
 
 logger:
   print_freq: 100
-  save_checkpoint_freq: 25000
+  save_checkpoint_freq: 1000
   save_checkpoint_format: safetensors
   use_tb_logger: true

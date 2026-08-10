@@ -311,7 +311,7 @@ def convert_and_save_onnx(
             logger.warning(
                 "%s requires the legacy ONNX exporter for genuinely dynamic "
                 "H/W. Overriding dynamo=true; the Dynamo exporter specializes "
-                "this architecture's shape algebra to the trace example.",
+                "DRFT's pad/window/crop shape algebra to the trace example.",
                 type(export_model).__name__,
             )
             is_dynamo = False
@@ -765,7 +765,7 @@ def convert_pipeline(root_path: str) -> None:
             logger.info(
                 "OnnxSlim model saved to %s; ONNX Runtime optimization was "
                 "skipped because its CUDA/CPU graph checks do not admit the "
-                "strongly typed architecture-native BF16/FP16 graph.",
+                "strongly typed BF16/FP16 DRFT graph.",
                 clickable_file_path(
                     Path(optimized_path).absolute().parent, optimized_path
                 ),

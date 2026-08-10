@@ -2,10 +2,9 @@
 # type: ignore
 """Dense rank-factored transformer for single-image super-resolution.
 
-The residual trunk stays at full channel width. Unshifted local-attention
-blocks use a narrower internal Q/K/V space, while shifted attention and
-overlapping cross-attention retain the full feature width. Position bias is
-rank-factored for local attention and dense for overlapping attention.
+The residual trunk and every local-attention block stay at full channel
+width. Position bias is rank-factored for local attention and dense for the
+original half-window-overlap cross-attention path.
 
 The implementation uses image-wide i-LN throughout and supports masked or
 hybrid shifted-window routing, reparameterizable convolutions, gradient
@@ -28,18 +27,112 @@ import hashlib
 import math
 from collections import OrderedDict
 from collections.abc import Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
-
-from traiNNer.ops.drft_ocab_flex import (
-    ocab_flex_training_op,
-    prepare_ocab_flex_training_kernel,
+from torch.utils.checkpoint import (
+    CheckpointPolicy,
+    checkpoint,
+    create_selective_checkpoint_contexts,
 )
+
+_NATIVE_FLEX_HOP = getattr(torch.ops.higher_order, "flex_attention", None)
+
+
+def _is_checkpointable_attention_op(op: Any) -> bool:
+    return (
+        op is torch.ops.aten._scaled_dot_product_flash_attention.default
+        or (_NATIVE_FLEX_HOP is not None and op is _NATIVE_FLEX_HOP)
+    )
+
+
+def _selective_flash_qkv_policy(
+    _ctx: Any,
+    op: Any,
+    *args: Any,
+    **_kwargs: Any,
+) -> CheckpointPolicy:
+    if _is_checkpointable_attention_op(op):
+        return CheckpointPolicy.MUST_SAVE
+    if op is torch.ops.aten.addmm.default and len(args) >= 3:
+        matrix = args[2]
+        if (
+            isinstance(matrix, torch.Tensor)
+            and matrix.ndim == 2
+            and matrix.shape[1] == 3 * matrix.shape[0]
+        ):
+            return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def _selective_flash_qkv_norm_stats_policy(
+    ctx: Any,
+    op: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> CheckpointPolicy:
+    base_policy = _selective_flash_qkv_policy(ctx, op, *args, **kwargs)
+    if base_policy is CheckpointPolicy.MUST_SAVE:
+        return base_policy
+    return _selective_small_reduction_policy(op, *args)
+
+
+def _selective_small_reduction_policy(
+    op: Any,
+    *args: Any,
+) -> CheckpointPolicy:
+    if op is torch.ops.aten.mean.dim and len(args) >= 2:
+        source = args[0]
+        dimensions = tuple(args[1])
+        if (
+            isinstance(source, torch.Tensor)
+            and source.ndim == 3
+            and dimensions == (1, 2)
+        ):
+            # Each image-wide i-LN statistic is Bx1x1. Retaining it avoids
+            # rerunning the expensive spatial/channel reduction while adding
+            # negligible checkpoint memory.
+            return CheckpointPolicy.MUST_SAVE
+        if (
+            isinstance(source, torch.Tensor)
+            and source.ndim == 4
+            and dimensions in ((2, 3), (-2, -1))
+        ):
+            # SwiGLU channel attention consumes only BxCx1x1 pooled values.
+            # Cache that tiny reduction output, not its full feature input.
+            return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+_FLASH_QKV_NORM_STATS_SELECTIVE_CHECKPOINT_CONTEXT = partial(
+    create_selective_checkpoint_contexts,
+    _selective_flash_qkv_norm_stats_policy,
+)
+try:
+    from traiNNer.ops.drft_ocab_relative_bias import (
+        ocab_bias_dtype_code,
+        ocab_relative_bias,
+    )
+    _OCAB_COMPACT_BIAS_AVAILABLE = True
+except ImportError:
+    _OCAB_COMPACT_BIAS_AVAILABLE = False
+
+try:
+    from traiNNer.ops.drft_ocab_unfold import ocab_unfold2d
+
+    _OCAB_COMPACT_UNFOLD_AVAILABLE = True
+except ImportError:
+    _OCAB_COMPACT_UNFOLD_AVAILABLE = False
+
+try:
+    from traiNNer.ops.drft_ocab_qkv_windows import ocab_qkv_windows
+
+    _OCAB_FUSED_QKV_WINDOWS_AVAILABLE = True
+except ImportError:
+    _OCAB_FUSED_QKV_WINDOWS_AVAILABLE = False
 
 # Flex Attention (hybrid mode only — requires Triton, Linux)
 try:
@@ -187,6 +280,14 @@ def _make_bias_score_mod(bias_flat: torch.Tensor, seq_len: int):
     return score_mod
 
 
+# Keep Flex Attention behind its own compiled boundary.  This is the measured
+# pre-fusion training arrangement: outer DRFT compilation may graph-break at
+# this reusable kernel instead of absorbing every shifted-boundary call into a
+# single monolithic graph.
+if _FLEX_AVAILABLE:
+    _compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
+
+
 _SHARED_OCAB_INDEX_CACHE: dict[tuple[int, int, int, int, str, int], torch.Tensor] = {}
 
 
@@ -221,18 +322,25 @@ def rewrite_onnx_for_tensorrt_plugins(
     source: str | Path,
     output: str | Path,
     *,
-    strategy: Literal["compact_bias", "fused_attention"] = "compact_bias",
+    strategy: Literal[
+        "optimized", "compact_bias", "fused_attention"
+    ] = "optimized",
 ) -> dict[str, Any]:
-    """Create a compact TensorRT-plugin ONNX from a portable DRFT ONNX.
+    """Create a TensorRT-specialized ONNX from a portable DRFT ONNX.
 
     The portable export deliberately materializes OCAB's additive relative
     position bias so ordinary ONNX runtimes can execute the graph. TensorRT
-    otherwise serializes that ``[1, heads, 1024, 1600]`` tensor once per OCAB.
-    This deployment-only rewrite restores the exact learned ``71 x 71`` table.
+    otherwise serializes the dense ``[1, heads, Q^2, KV^2]`` tensor once per
+    OCAB. This deployment-only rewrite restores the exact learned
+    ``(Q + KV - 1)^2`` table for the admitted Q32/K40 and Q32/K48 geometries.
 
-    ``compact_bias`` inserts ``DrftOCABRelativeBias_TRT`` to expand the table
-    at runtime while retaining TensorRT's native fused attention. It is the
-    default fast path. ``fused_attention`` replaces only
+    ``optimized`` is the default fast path. It retains TensorRT's native fused
+    attention and applies the admitted DRFT deployment rewrites in one pass:
+    compact OCAB relative bias, blockwise dense-fusion MatMuls, exact image-LN
+    plugins, and byte-preserving token-major OCAB Q/K/V packing.
+
+    ``compact_bias`` applies only ``DrftOCABRelativeBias_TRT`` while retaining
+    TensorRT's native fused attention. ``fused_attention`` replaces only
     ``QK -> bias -> softmax -> PV`` with ``DrftOCABAttention_TRT`` and is kept
     as a lower-engine-memory fallback. All projections, halo extraction,
     window partition/reversal, residuals, and reconstruction remain normal
@@ -259,8 +367,9 @@ def rewrite_onnx_for_tensorrt_plugins(
         raise ValueError("Plugin ONNX output must differ from the portable source")
     if output_path.exists():
         raise FileExistsError(f"Refusing to overwrite: {output_path}")
-    if strategy not in {"compact_bias", "fused_attention"}:
+    if strategy not in {"optimized", "compact_bias", "fused_attention"}:
         raise ValueError(f"Unknown TensorRT plugin strategy: {strategy}")
+    bias_strategy = "compact_bias" if strategy == "optimized" else strategy
 
     model = onnx.load(str(source_path), load_external_data=True)
     graph = model.graph
@@ -290,33 +399,15 @@ def rewrite_onnx_for_tensorrt_plugins(
         for name in node.input:
             consumers.setdefault(name, []).append(node)
 
-    q_window = 32
-    kv_window = 40
-    q_tokens = q_window * q_window
-    kv_tokens = kv_window * kv_window
-    bias_span = q_window + kv_window - 1
-
-    qy = np.repeat(np.arange(q_window, dtype=np.int64), q_window)
-    qx = np.tile(np.arange(q_window, dtype=np.int64), q_window)
-    ky = np.repeat(np.arange(kv_window, dtype=np.int64), kv_window)
-    kx = np.tile(np.arange(kv_window, dtype=np.int64), kv_window)
-    relative_index = (
-        (ky[None, :] - qy[:, None] + q_window - 1) * bias_span
-        + (kx[None, :] - qx[:, None] + q_window - 1)
-    )
-    unique_index, first_flat_position = np.unique(
-        relative_index.reshape(-1), return_index=True
-    )
-    expected_index = np.arange(bias_span * bias_span, dtype=np.int64)
-    if not np.array_equal(unique_index, expected_index):
-        raise RuntimeError("OCAB relative-position index is not a complete table cover")
-
     removed_node_indices: set[int] = set()
     replacements: dict[int, Any] = {}
     insertions: dict[int, list[Any]] = {}
     removed_initializers: set[str] = set()
     compact_initializers: list[Any] = []
     reports: list[dict[str, Any]] = []
+    relative_geometry: dict[
+        tuple[int, int], tuple[int, Any, Any]
+    ] = {}
 
     for add_index, add_node in enumerate(graph.node):
         if add_node.op_type != "Add":
@@ -337,10 +428,20 @@ def rewrite_onnx_for_tensorrt_plugins(
             named_deployment_bias = name.endswith(
                 "._deployment_relative_position_bias"
             )
+            q_tokens_candidate = int(dims[-2]) if len(dims) == 4 else 0
+            kv_tokens_candidate = int(dims[-1]) if len(dims) == 4 else 0
+            q_window_candidate = math.isqrt(q_tokens_candidate)
+            kv_window_candidate = math.isqrt(kv_tokens_candidate)
+            admitted_geometry = (
+                q_window_candidate == 32
+                and q_window_candidate * q_window_candidate == q_tokens_candidate
+                and kv_window_candidate in {40, 48}
+                and kv_window_candidate * kv_window_candidate == kv_tokens_candidate
+            )
             exact_dynamic_constant = (
                 constant is not None
                 and dims[:1] == [1]
-                and dims[-2:] == [q_tokens, kv_tokens]
+                and admitted_geometry
                 and "/ocab/" in constant[1].name
             )
             if named_deployment_bias or exact_dynamic_constant:
@@ -353,14 +454,49 @@ def rewrite_onnx_for_tensorrt_plugins(
             continue
         assert bias_tensor is not None
         bias_dims = list(bias_tensor.dims)
+        q_tokens = int(bias_dims[2]) if len(bias_dims) == 4 else 0
+        kv_tokens = int(bias_dims[3]) if len(bias_dims) == 4 else 0
+        q_window = math.isqrt(q_tokens)
+        kv_window = math.isqrt(kv_tokens)
         if (
             len(bias_dims) != 4
             or bias_dims[0] != 1
-            or bias_dims[2:] != [q_tokens, kv_tokens]
+            or q_window != 32
+            or q_window * q_window != q_tokens
+            or kv_window not in {40, 48}
+            or kv_window * kv_window != kv_tokens
         ):
             raise RuntimeError(
                 f"Unexpected OCAB bias shape for {bias_name}: {bias_dims}"
             )
+        if bias_strategy == "fused_attention" and kv_window != 40:
+            raise RuntimeError(
+                "The fused OCAB attention plugin admits only Q32/K40; "
+                "use compact_bias for exact Q32/K48 OCAB"
+            )
+        geometry_key = (q_window, kv_window)
+        geometry = relative_geometry.get(geometry_key)
+        if geometry is None:
+            bias_span = q_window + kv_window - 1
+            qy = np.repeat(np.arange(q_window, dtype=np.int64), q_window)
+            qx = np.tile(np.arange(q_window, dtype=np.int64), q_window)
+            ky = np.repeat(np.arange(kv_window, dtype=np.int64), kv_window)
+            kx = np.tile(np.arange(kv_window, dtype=np.int64), kv_window)
+            relative_index = (
+                (ky[None, :] - qy[:, None] + q_window - 1) * bias_span
+                + (kx[None, :] - qx[:, None] + q_window - 1)
+            )
+            unique_index, first_flat_position = np.unique(
+                relative_index.reshape(-1), return_index=True
+            )
+            expected_index = np.arange(bias_span * bias_span, dtype=np.int64)
+            if not np.array_equal(unique_index, expected_index):
+                raise RuntimeError(
+                    "OCAB relative-position index is not a complete table cover"
+                )
+            geometry = (bias_span, relative_index, first_flat_position)
+            relative_geometry[geometry_key] = geometry
+        bias_span, relative_index, first_flat_position = geometry
         heads = int(bias_dims[1])
         if not bias_tensor.raw_data:
             raise RuntimeError(
@@ -393,7 +529,7 @@ def rewrite_onnx_for_tensorrt_plugins(
         if score_index is None:
             raise RuntimeError(f"OCAB bias input has no producer: {bias_name}")
         score_node = graph.node[score_index]
-        if strategy == "compact_bias":
+        if bias_strategy == "compact_bias":
             score_is_qk = score_node.op_type == "MatMul"
             if score_node.op_type == "Mul":
                 score_is_qk = any(
@@ -446,9 +582,14 @@ def rewrite_onnx_for_tensorrt_plugins(
         table_tensor.raw_data = table_bits.tobytes(order="C")
         compact_initializers.append(table_tensor)
 
-        if strategy == "compact_bias":
+        if bias_strategy == "compact_bias":
+            plugin_op = (
+                "DrftOCABRelativeBias_TRT"
+                if kv_window == 40
+                else "DrftOCABRelativeBiasSafe_TRT"
+            )
             plugin_node = helper.make_node(
-                "DrftOCABRelativeBias_TRT",
+                plugin_op,
                 [table_name],
                 [bias_name],
                 name=add_node.name.replace("node_Add", "drft_ocab_relative_bias"),
@@ -467,6 +608,7 @@ def rewrite_onnx_for_tensorrt_plugins(
                 removed_node_indices.add(bias_constant_index)
             plugin_output = bias_name
         else:
+            plugin_op = "DrftOCABAttention_TRT"
             assert pv_node is not None
             assert softmax_index is not None
             assert pv_index is not None
@@ -494,9 +636,12 @@ def rewrite_onnx_for_tensorrt_plugins(
                 "bias": bias_name,
                 "source": bias_source,
                 "heads": heads,
+                "q_window_size": q_window,
+                "kv_window_size": kv_window,
                 "dense_bytes": len(bias_tensor.raw_data),
                 "table_bytes": len(table_tensor.raw_data),
                 "output": plugin_output,
+                "plugin": plugin_op,
             }
         )
 
@@ -520,11 +665,51 @@ def rewrite_onnx_for_tensorrt_plugins(
     graph.initializer.extend(retained_initializers)
     graph.initializer.extend(compact_initializers)
 
-    plugin_name = (
-        "DrftOCABRelativeBias_TRT"
-        if strategy == "compact_bias"
-        else "DrftOCABAttention_TRT"
-    )
+    optimization_reports: dict[str, Any] | None = None
+    if strategy == "optimized":
+        from traiNNer.archs.drft_tensorrt_rewrite import (
+            decompose_dense_fusion,
+            fuse_image_layer_norm,
+            fuse_ocab_qkv_pack,
+        )
+
+        dense_report = decompose_dense_fusion(model)
+        image_ln_report = fuse_image_layer_norm(
+            model,
+            plugin_op="DrftImageLayerNorm_TRT",
+        )
+        channels = {int(item["channels"]) for item in image_ln_report}
+        heads = {int(item["heads"]) for item in reports}
+        geometries = {
+            (int(item["q_window_size"]), int(item["kv_window_size"]))
+            for item in reports
+        }
+        if len(channels) != 1 or len(heads) != 1 or len(geometries) != 1:
+            raise RuntimeError(
+                "Optimized DRFT TensorRT export requires one shared channel, "
+                "head, and OCAB geometry across all residual groups"
+            )
+        q_window, kv_window = next(iter(geometries))
+        qkv_report = fuse_ocab_qkv_pack(
+            model,
+            channels=next(iter(channels)),
+            heads=next(iter(heads)),
+            query_window=q_window,
+            key_window=kv_window,
+            token_major=True,
+        )
+        optimization_reports = {
+            "dense_fusion": dense_report,
+            "image_layer_norm": image_ln_report,
+            "ocab_qkv_pack": qkv_report,
+        }
+
+    plugin_names = sorted({item["plugin"] for item in reports})
+    if len(plugin_names) != 1:
+        raise RuntimeError(
+            f"A plugin ONNX may use only one admitted OCAB geometry: {plugin_names}"
+        )
+    plugin_name = plugin_names[0]
     metadata = {entry.key: entry.value for entry in model.metadata_props}
     metadata.update(
         {
@@ -566,15 +751,28 @@ def rewrite_onnx_for_tensorrt_plugins(
         size_threshold=1024,
         convert_attribute=uses_external_data,
     )
+    plugin_counts: dict[str, int] = {}
+    for node in model.graph.node:
+        if node.op_type.startswith("Drft") and node.op_type.endswith("_TRT"):
+            plugin_counts[node.op_type] = plugin_counts.get(node.op_type, 0) + 1
+
     return {
         "source": str(source_path),
         "output": str(output_path),
         "plugin": plugin_name,
         "plugin_version": "1",
         "strategy": strategy,
+        "plugin_counts": dict(sorted(plugin_counts.items())),
+        "optimization_reports": optimization_reports,
         "ocab_count": len(reports),
         "dense_bias_bytes": sum(item["dense_bytes"] for item in reports),
         "compact_table_bytes": sum(item["table_bytes"] for item in reports),
+        "geometries": sorted(
+            {
+                (item["q_window_size"], item["kv_window_size"])
+                for item in reports
+            }
+        ),
         "external_data": str(external_data_path) if uses_external_data else None,
         "raw_initializer_bytes": raw_initializer_bytes,
         "raw_constant_bytes": raw_constant_bytes,
@@ -982,9 +1180,12 @@ class EDBBConvBlock(nn.Module):
         self.conv1x1_sby = _EDBBSeqConv3x3("conv1x1-sobely", dim)
         self.conv1x1_lpl = _EDBBSeqConv3x3("conv1x1-laplacian", dim)
 
-        identity_weight = torch.zeros(dim, dim, 3, 3)
+        # Keep this three-dimensional so ``model.to(memory_format=...)`` does
+        # not rewrite its strides.  The view below then matches the contiguous
+        # identity tensor formerly created inside every training forward.
+        identity_weight = torch.zeros(dim, dim, 9)
         channel_index = torch.arange(dim)
-        identity_weight[channel_index, channel_index, 1, 1] = 1.0
+        identity_weight[channel_index, channel_index, 4] = 1.0
         self.register_buffer(
             "identity_weight",
             identity_weight,
@@ -1011,7 +1212,8 @@ class EDBBConvBlock(nn.Module):
         k4, b4 = self.conv1x1_sby.rep_params()
         k5, b5 = self.conv1x1_lpl.rep_params()
 
-        rep_kernel = k0 + k1 + k2 + k3 + k4 + k5 + self.identity_weight
+        identity_weight = self.identity_weight.view(self.dim, self.dim, 3, 3)
+        rep_kernel = k0 + k1 + k2 + k3 + k4 + k5 + identity_weight
         rep_bias = b0 + b1 + b2 + b3 + b4 + b5
         return rep_kernel, rep_bias
 
@@ -1025,7 +1227,10 @@ class EDBBConvBlock(nn.Module):
 
     @staticmethod
     def _edge_rep_params_vectorized(branch: _EDBBSeqConv3x3) -> tuple[torch.Tensor, torch.Tensor]:
-        edge_kernel = branch.scale * branch.mask
+        edge_kernel = branch.scale * branch.mask.to(
+            device=branch.scale.device,
+            dtype=branch.scale.dtype,
+        )
         rep_kernel = branch.k0 * edge_kernel
         rep_bias = branch.bias
         return rep_kernel, rep_bias
@@ -1040,7 +1245,8 @@ class EDBBConvBlock(nn.Module):
         k4, b4 = self._edge_rep_params_vectorized(self.conv1x1_sby)
         k5, b5 = self._edge_rep_params_vectorized(self.conv1x1_lpl)
 
-        rep_kernel = k0 + k1 + k2 + k3 + k4 + k5 + self.identity_weight
+        identity_weight = self.identity_weight.view(self.dim, self.dim, 3, 3)
+        rep_kernel = k0 + k1 + k2 + k3 + k4 + k5 + identity_weight
         rep_bias = b0 + b1 + b2 + b3 + b4 + b5
         return rep_kernel, rep_bias
 
@@ -1335,14 +1541,363 @@ class WindowAttentionRFB(nn.Module):
         )
         return self.proj_drop(self.proj(output))
 
-    def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
+    def forward_shifted_boundary_rectangles(
+        self,
+        right_windows: torch.Tensor,
+        bottom_windows: torch.Tensor,
+        corner_windows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate the exact shifted-boundary blocks with Flash Attention.
+
+        Swin's half-window cyclic shift gives the right edge two vertical
+        regions, the bottom edge two horizontal regions, and the corner four
+        quadrants.  The region mask is therefore block diagonal.  Splitting
+        those diagonal blocks into independent sequences is mathematically
+        identical to masked attention, while allowing the ordinary PyTorch
+        Flash backend to process every sequence without a score modifier.
+
+        Results are returned in ``right, bottom, corner`` window order.
+        """
+        if self.attn_drop_p != 0.0:
+            raise RuntimeError(
+                "shifted rectangle Flash training requires attention dropout=0"
+            )
+
+        window_height, window_width = self.window_size
+        if window_height != window_width or window_height % 2 != 0:
+            raise RuntimeError(
+                "shifted rectangle Flash training requires an even square window"
+            )
+        half = window_height // 2
+        token_count = window_height * window_width
+        channels = self.dim
+        right_count = right_windows.shape[0]
+        bottom_count = bottom_windows.shape[0]
+        corner_count = corner_windows.shape[0]
+        boundary_windows = torch.cat(
+            (right_windows, bottom_windows, corner_windows), dim=0,
+        )
+        boundary_count = boundary_windows.shape[0]
+
+        qkv = self.qkv(boundary_windows).reshape(
+            boundary_count,
+            token_count,
+            3,
+            self.num_heads,
+            self.head_dim,
+        )
+        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        right_end = right_count
+        bottom_end = right_end + bottom_count
+
+        def vertical_halves(tensor: torch.Tensor) -> torch.Tensor:
+            count = tensor.shape[0]
+            return (
+                tensor.reshape(
+                    count,
+                    self.num_heads,
+                    window_height,
+                    2,
+                    half,
+                    self.head_dim,
+                )
+                .permute(0, 3, 1, 2, 4, 5)
+                .reshape(
+                    count * 2,
+                    self.num_heads,
+                    window_height * half,
+                    self.head_dim,
+                )
+            )
+
+        def horizontal_halves(tensor: torch.Tensor) -> torch.Tensor:
+            count = tensor.shape[0]
+            return (
+                tensor.reshape(
+                    count,
+                    self.num_heads,
+                    2,
+                    half,
+                    window_width,
+                    self.head_dim,
+                )
+                .permute(0, 2, 1, 3, 4, 5)
+                .reshape(
+                    count * 2,
+                    self.num_heads,
+                    half * window_width,
+                    self.head_dim,
+                )
+            )
+
+        def quadrants(tensor: torch.Tensor) -> torch.Tensor:
+            count = tensor.shape[0]
+            return (
+                tensor.reshape(
+                    count,
+                    self.num_heads,
+                    2,
+                    half,
+                    2,
+                    half,
+                    self.head_dim,
+                )
+                .permute(0, 2, 4, 1, 3, 5, 6)
+                .reshape(
+                    count * 4,
+                    self.num_heads,
+                    half * half,
+                    self.head_dim,
+                )
+            )
+
+        query_halves = torch.cat(
+            (
+                vertical_halves(query[:right_end]),
+                horizontal_halves(query[right_end:bottom_end]),
+            ),
+            dim=0,
+        )
+        key_halves = torch.cat(
+            (
+                vertical_halves(key[:right_end]),
+                horizontal_halves(key[right_end:bottom_end]),
+            ),
+            dim=0,
+        )
+        value_halves = torch.cat(
+            (
+                vertical_halves(value[:right_end]),
+                horizontal_halves(value[right_end:bottom_end]),
+            ),
+            dim=0,
+        )
+        query_quadrants = quadrants(query[bottom_end:])
+        key_quadrants = quadrants(key[bottom_end:])
+        value_quadrants = quadrants(value[bottom_end:])
+
+        bias_query, bias_key = self.neural_bias()
+        bias_rank = bias_query.shape[-1]
+
+        def vertical_bias(tensor: torch.Tensor, count: int) -> torch.Tensor:
+            regions = (
+                tensor.reshape(
+                    self.num_heads,
+                    window_height,
+                    2,
+                    half,
+                    bias_rank,
+                )
+                .permute(2, 0, 1, 3, 4)
+                .reshape(
+                    2,
+                    self.num_heads,
+                    window_height * half,
+                    bias_rank,
+                )
+            )
+            return (
+                regions.unsqueeze(0)
+                .expand(count, -1, -1, -1, -1)
+                .reshape(
+                    count * 2,
+                    self.num_heads,
+                    window_height * half,
+                    bias_rank,
+                )
+            )
+
+        def horizontal_bias(tensor: torch.Tensor, count: int) -> torch.Tensor:
+            regions = (
+                tensor.reshape(
+                    self.num_heads,
+                    2,
+                    half,
+                    window_width,
+                    bias_rank,
+                )
+                .permute(1, 0, 2, 3, 4)
+                .reshape(
+                    2,
+                    self.num_heads,
+                    half * window_width,
+                    bias_rank,
+                )
+            )
+            return (
+                regions.unsqueeze(0)
+                .expand(count, -1, -1, -1, -1)
+                .reshape(
+                    count * 2,
+                    self.num_heads,
+                    half * window_width,
+                    bias_rank,
+                )
+            )
+
+        def quadrant_bias(tensor: torch.Tensor, count: int) -> torch.Tensor:
+            regions = (
+                tensor.reshape(
+                    self.num_heads,
+                    2,
+                    half,
+                    2,
+                    half,
+                    bias_rank,
+                )
+                .permute(1, 3, 0, 2, 4, 5)
+                .reshape(
+                    4,
+                    self.num_heads,
+                    half * half,
+                    bias_rank,
+                )
+            )
+            return (
+                regions.unsqueeze(0)
+                .expand(count, -1, -1, -1, -1)
+                .reshape(
+                    count * 4,
+                    self.num_heads,
+                    half * half,
+                    bias_rank,
+                )
+            )
+
+        query_bias_halves = torch.cat(
+            (
+                vertical_bias(bias_query, right_count),
+                horizontal_bias(bias_query, bottom_count),
+            ),
+            dim=0,
+        ).to(dtype=query.dtype)
+        key_bias_halves = torch.cat(
+            (
+                vertical_bias(bias_key, right_count),
+                horizontal_bias(bias_key, bottom_count),
+            ),
+            dim=0,
+        ).to(dtype=key.dtype)
+        query_bias_quadrants = quadrant_bias(
+            bias_query, corner_count,
+        ).to(dtype=query.dtype)
+        key_bias_quadrants = quadrant_bias(
+            bias_key, corner_count,
+        ).to(dtype=key.dtype)
+
+        def flash_with_rank_bias(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            bq: torch.Tensor,
+            bk: torch.Tensor,
+        ) -> torch.Tensor:
+            q_augmented = torch.cat((q * self.content_scale, bq), dim=-1)
+            k_augmented = torch.cat((k, bk), dim=-1)
+            v_augmented = F.pad(v, (0, self.rank))
+            return _scaled_dot_product_attention_export_safe(
+                q_augmented,
+                k_augmented,
+                v_augmented,
+                attn_mask=None,
+                dropout_p=0.0,
+                scale=1.0,
+                training=self.training,
+                use_export_safe_math=False,
+            )[..., : self.head_dim]
+
+        output_halves = flash_with_rank_bias(
+            query_halves,
+            key_halves,
+            value_halves,
+            query_bias_halves,
+            key_bias_halves,
+        )
+        output_quadrants = flash_with_rank_bias(
+            query_quadrants,
+            key_quadrants,
+            value_quadrants,
+            query_bias_quadrants,
+            key_bias_quadrants,
+        )
+
+        right_output = (
+            output_halves[: right_count * 2]
+            .reshape(
+                right_count,
+                2,
+                self.num_heads,
+                window_height,
+                half,
+                self.head_dim,
+            )
+            .permute(0, 2, 3, 1, 4, 5)
+            .reshape(
+                right_count,
+                self.num_heads,
+                token_count,
+                self.head_dim,
+            )
+        )
+        bottom_output = (
+            output_halves[right_count * 2 :]
+            .reshape(
+                bottom_count,
+                2,
+                self.num_heads,
+                half,
+                window_width,
+                self.head_dim,
+            )
+            .permute(0, 2, 1, 3, 4, 5)
+            .reshape(
+                bottom_count,
+                self.num_heads,
+                token_count,
+                self.head_dim,
+            )
+        )
+        corner_output = (
+            output_quadrants.reshape(
+                corner_count,
+                2,
+                2,
+                self.num_heads,
+                half,
+                half,
+                self.head_dim,
+            )
+            .permute(0, 3, 1, 4, 2, 5, 6)
+            .reshape(
+                corner_count,
+                self.num_heads,
+                token_count,
+                self.head_dim,
+            )
+        )
+        output = torch.cat(
+            (right_output, bottom_output, corner_output), dim=0,
+        )
+        output = output.transpose(1, 2).reshape(
+            boundary_count, token_count, channels,
+        )
+        return self.proj_drop(self.proj(output))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask=None,
+        bias_factors: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         b_windows, n_tokens, c = x.shape
 
         qkv = self.qkv(x).reshape(b_windows, n_tokens, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        bq, bk = self.neural_bias()
+        bq, bk = (
+            self.neural_bias() if bias_factors is None else bias_factors
+        )
         export_mode = torch.onnx.is_in_onnx_export()
         use_export_safe_math = self.force_math_attention or (export_mode and mask is not None)
         force_additive_attention = self.force_additive_attention or use_export_safe_math
@@ -1372,12 +1927,7 @@ class WindowAttentionRFB(nn.Module):
                 bq.shape[0], -1,
             )
             score_mod = _make_bias_score_mod(bias_flat, self._ws_sq)
-            # The enclosing DRFT training graph owns compilation. Calling the
-            # public Flex API directly avoids nesting a separately compiled
-            # OptimizedFunction in that graph, which made PyTorch's persistent
-            # AOT package depend on an unserializable module global. Standalone
-            # eager calls still use Flex Attention's own internal compiler.
-            out = flex_attention(
+            out = _compiled_flex_attention(
                 q, k, v,
                 score_mod=score_mod,
                 block_mask=mask,
@@ -1482,6 +2032,7 @@ class NarrowWindowAttention(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
+        bias_factors: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if mask is not None:
             raise RuntimeError("NarrowWindowAttention only supports unshifted windows")
@@ -1502,7 +2053,9 @@ class NarrowWindowAttention(nn.Module):
         )
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        bq, bk = self.neural_bias()
+        bq, bk = (
+            self.neural_bias() if bias_factors is None else bias_factors
+        )
         use_export_safe_math = self.force_math_attention
         force_additive_attention = self.force_additive_attention or use_export_safe_math
 
@@ -1790,6 +2343,7 @@ class ACTBlock(nn.Module):
         height: int,
         width: int,
         region_mask,
+        bias_factors: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Route shifted windows without index gather/scatter.
 
@@ -1819,8 +2373,14 @@ class ACTBlock(nn.Module):
             batch * (interior_h + n_w), token_count, channels,
         )
 
-        interior_out = self.attn(interior_windows)
-        boundary_out = self.attn(boundary_windows, mask=region_mask)
+        interior_out = self.attn(
+            interior_windows, bias_factors=bias_factors,
+        )
+        boundary_out = self.attn(
+            boundary_windows,
+            mask=region_mask,
+            bias_factors=bias_factors,
+        )
         if interior_out.dtype != x_windows.dtype:
             interior_out = interior_out.to(dtype=x_windows.dtype)
         if boundary_out.dtype != x_windows.dtype:
@@ -1843,7 +2403,83 @@ class ACTBlock(nn.Module):
             batch * n_h * n_w, token_count, channels,
         )
 
-    def forward(self, x: torch.Tensor, x_size: tuple[int, int], hybrid_ctx=None) -> torch.Tensor:
+    def _forward_shifted_windows_flash_rectangles(
+        self,
+        x_windows: torch.Tensor,
+        batch: int,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        """Use PyTorch Flash on the exact shifted-mask diagonal regions."""
+        if not isinstance(self.attn, WindowAttentionRFB):
+            raise RuntimeError(
+                "shifted rectangle Flash requires full-width window attention"
+            )
+        n_h = height // self.window_size
+        n_w = width // self.window_size
+        interior_h = n_h - 1
+        interior_w = n_w - 1
+        token_count = x_windows.shape[1]
+        channels = x_windows.shape[2]
+        grid = x_windows.reshape(
+            batch, n_h, n_w, token_count, channels,
+        )
+        interior_windows = grid[:, :interior_h, :interior_w].reshape(
+            batch * interior_h * interior_w, token_count, channels,
+        )
+        right_windows = grid[:, :interior_h, interior_w].reshape(
+            batch * interior_h, token_count, channels,
+        )
+        bottom_windows = grid[:, interior_h, :interior_w].reshape(
+            batch * interior_w, token_count, channels,
+        )
+        corner_windows = grid[:, interior_h, interior_w].reshape(
+            batch, token_count, channels,
+        )
+
+        interior_output = self.attn(interior_windows)
+        boundary_output = self.attn.forward_shifted_boundary_rectangles(
+            right_windows,
+            bottom_windows,
+            corner_windows,
+        )
+        if interior_output.dtype != x_windows.dtype:
+            interior_output = interior_output.to(dtype=x_windows.dtype)
+        if boundary_output.dtype != x_windows.dtype:
+            boundary_output = boundary_output.to(dtype=x_windows.dtype)
+
+        right_count = batch * interior_h
+        bottom_count = batch * interior_w
+        right_output = boundary_output[:right_count]
+        bottom_output = boundary_output[right_count : right_count + bottom_count]
+        corner_output = boundary_output[right_count + bottom_count :]
+        interior_grid = interior_output.reshape(
+            batch, interior_h, interior_w, token_count, channels,
+        )
+        right_grid = right_output.reshape(
+            batch, interior_h, 1, token_count, channels,
+        )
+        bottom_grid = bottom_output.reshape(
+            batch, 1, interior_w, token_count, channels,
+        )
+        corner_grid = corner_output.reshape(
+            batch, 1, 1, token_count, channels,
+        )
+        top = torch.cat((interior_grid, right_grid), dim=2)
+        final_row = torch.cat((bottom_grid, corner_grid), dim=2)
+        return torch.cat((top, final_row), dim=1).reshape(
+            batch * n_h * n_w, token_count, channels,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_size: tuple[int, int],
+        hybrid_ctx=None,
+        attention_bias_factors: tuple[
+            torch.Tensor, torch.Tensor
+        ] | None = None,
+    ) -> torch.Tensor:
         H, W = x_size
         B, L, C = x.shape
 
@@ -1860,13 +2496,21 @@ class ACTBlock(nn.Module):
         # === Attention Branch ===
         # Cyclic shift for shifted window attention
         if self.shift_size > 0:
-            shifted_x = torch.roll(x_2d, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted_x = torch.roll(
+                x_2d,
+                shifts=(-self.shift_size, -self.shift_size),
+                dims=(1, 2),
+            )
         else:
             shifted_x = x_2d
 
         # Partition windows
-        x_windows = window_partition(shifted_x, self.window_size)  # (nW*B, ws, ws, C)
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+        x_windows = window_partition(
+            shifted_x, self.window_size,
+        )  # (nW*B, ws, ws, C)
+        x_windows = x_windows.view(
+            -1, self.window_size * self.window_size, C,
+        )
 
         # Window attention with per-window routing for shifted blocks.
         # Non-shifted blocks: all windows → Flash path (no contamination risk).
@@ -1877,21 +2521,34 @@ class ACTBlock(nn.Module):
             region_mask, int_idx_full, bnd_idx_full = hybrid_ctx
 
             if self.force_dense_shifted_attention:
-                attn_windows = self.attn(x_windows, mask=region_mask)
+                attn_windows = self.attn(
+                    x_windows,
+                    mask=region_mask,
+                    bias_factors=attention_bias_factors,
+                )
             elif int_idx_full is None or bnd_idx_full is None:
                 if self.force_tensorrt_export_mode:
                     attn_windows = self._forward_shifted_windows_export_split(
                         x_windows, B, H, W, region_mask,
                     )
                 else:
-                    attn_windows = self.attn(x_windows, mask=region_mask)
+                    attn_windows = self.attn(
+                        x_windows,
+                        mask=region_mask,
+                        bias_factors=attention_bias_factors,
+                    )
             elif (
                 self.use_grouped_shifted_routing
                 and H >= 2 * self.window_size
                 and W >= 2 * self.window_size
             ):
                 attn_windows = self._forward_shifted_windows_grouped(
-                    x_windows, B, H, W, region_mask,
+                    x_windows,
+                    B,
+                    H,
+                    W,
+                    region_mask,
+                    attention_bias_factors,
                 )
             else:
                 # Process each group sequentially: gather -> attn -> scatter -> free,
@@ -1903,14 +2560,20 @@ class ACTBlock(nn.Module):
                 # Interior windows: Flash path (no mask needed)
                 if export_mode:
                     interior_windows = x_windows[int_idx_full]
-                    interior_out = self.attn(interior_windows)
+                    interior_out = self.attn(
+                        interior_windows,
+                        bias_factors=attention_bias_factors,
+                    )
                     if interior_out.dtype != attn_windows.dtype:
                         interior_out = interior_out.to(dtype=attn_windows.dtype)
                     attn_windows[int_idx_full] = interior_out
                     del interior_windows, interior_out
                 elif int_idx_full.numel() > 0:
                     interior_windows = x_windows[int_idx_full]
-                    interior_out = self.attn(interior_windows)
+                    interior_out = self.attn(
+                        interior_windows,
+                        bias_factors=attention_bias_factors,
+                    )
                     if interior_out.dtype != attn_windows.dtype:
                         interior_out = interior_out.to(dtype=attn_windows.dtype)
                     attn_windows[int_idx_full] = interior_out
@@ -1919,28 +2582,46 @@ class ACTBlock(nn.Module):
                 # Boundary windows: masked SDPA or Flex (with region mask)
                 if export_mode:
                     boundary_windows = x_windows[bnd_idx_full]
-                    boundary_out = self.attn(boundary_windows, mask=region_mask)
+                    boundary_out = self.attn(
+                        boundary_windows,
+                        mask=region_mask,
+                        bias_factors=attention_bias_factors,
+                    )
                     if boundary_out.dtype != attn_windows.dtype:
                         boundary_out = boundary_out.to(dtype=attn_windows.dtype)
                     attn_windows[bnd_idx_full] = boundary_out
                     del boundary_windows, boundary_out
                 elif bnd_idx_full.numel() > 0:
                     boundary_windows = x_windows[bnd_idx_full]
-                    boundary_out = self.attn(boundary_windows, mask=region_mask)
+                    boundary_out = self.attn(
+                        boundary_windows,
+                        mask=region_mask,
+                        bias_factors=attention_bias_factors,
+                    )
                     if boundary_out.dtype != attn_windows.dtype:
                         boundary_out = boundary_out.to(dtype=attn_windows.dtype)
                     attn_windows[bnd_idx_full] = boundary_out
                     del boundary_windows, boundary_out
         else:
-            attn_windows = self.attn(x_windows)
+            attn_windows = self.attn(
+                x_windows, bias_factors=attention_bias_factors,
+            )
 
         # Merge windows
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+        attn_windows = attn_windows.view(
+            -1, self.window_size, self.window_size, C,
+        )
+        shifted_x = window_reverse(
+            attn_windows, self.window_size, H, W,
+        )
 
         # Reverse cyclic shift
         if self.shift_size > 0:
-            attn_x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            attn_x = torch.roll(
+                shifted_x,
+                shifts=(self.shift_size, self.shift_size),
+                dims=(1, 2),
+            )
         else:
             attn_x = shifted_x
 
@@ -2017,6 +2698,10 @@ class OCAB(nn.Module):
         self.attn_type = attn_type
         self.force_math_attention = False
         self._use_batch_axis_kv = False
+        self.use_compact_relative_bias_training = False
+        self.use_compact_unfold_training = False
+        self.use_fused_qkv_windows_training = False
+        self.use_window_order_projection_training = False
         self.scale = head_dim ** -0.5
 
         self.norm1 = ImageLayerNorm(dim, eps=iln_eps)
@@ -2056,12 +2741,45 @@ class OCAB(nn.Module):
         if static_bias is not None:
             return static_bias.to(device=device, dtype=dtype)
 
+        if self.use_compact_relative_bias_training and self.training and device.type == "cuda":
+            if not _OCAB_COMPACT_BIAS_AVAILABLE:
+                raise RuntimeError(
+                    "compact OCAB training bias requires Triton and torch.library.triton_op"
+                )
+            return ocab_relative_bias(
+                self.relative_position_bias_table,
+                self.q_window_size[0],
+                self.q_window_size[1],
+                self.k_window_size[0],
+                self.k_window_size[1],
+                ocab_bias_dtype_code(dtype),
+            )
+
         index = _get_shared_relative_position_index(self.q_window_size, self.k_window_size, device)
         n_q = self.window_size * self.window_size
         n_k = self.overlap_win_size * self.overlap_win_size
         bias = self.relative_position_bias_table[index.view(-1)]
         bias = bias.view(n_q, n_k, self.num_heads).permute(2, 0, 1).contiguous()
         return bias.to(dtype=dtype).unsqueeze(0)
+
+    def _overlap_unfold(self, kv: torch.Tensor) -> torch.Tensor:
+        if self.use_compact_unfold_training and self.training and kv.is_cuda:
+            if not _OCAB_COMPACT_UNFOLD_AVAILABLE:
+                raise RuntimeError(
+                    "compact OCAB training unfold requires Triton and "
+                    "torch.library.triton_op"
+                )
+            padding = (self.overlap_win_size - self.window_size) // 2
+            return ocab_unfold2d(
+                kv,
+                self.overlap_win_size,
+                self.overlap_win_size,
+                self.window_size,
+                self.window_size,
+                padding,
+                padding,
+            )
+        return self.unfold(kv)
     
     def forward(self, x: torch.Tensor, x_size: tuple[int, int]) -> torch.Tensor:
         H, W = x_size
@@ -2073,31 +2791,66 @@ class OCAB(nn.Module):
         x_norm = x_norm.view(B, H, W, C)
 
         # QKV
-        qkv = self.qkv(x_norm).reshape(B, H, W, 3, C).permute(3, 0, 4, 1, 2)  # 3, B, C, H, W
-        q = qkv[0].permute(0, 2, 3, 1)  # B, H, W, C
-
-        # Partition Q windows
-        q_windows = window_partition(q, self.window_size)
-        q_windows = q_windows.view(-1, self.window_size * self.window_size, C)
-
-        # Unfold KV with overlap
+        qkv = self.qkv(x_norm).reshape(B, H, W, 3, C)
         ow = self.overlap_win_size
-        if self._use_batch_axis_kv:
-            # Keep K/V on a leading 2*batch axis through Unfold.  Unfold acts
-            # independently per batch item, so this is exactly equivalent to
-            # channel concatenation while exporting a simpler TensorRT graph.
-            kv = qkv[1:3].reshape(2 * B, C, H, W)
-            kv_windows = self.unfold(kv)
-            nW = kv_windows.shape[2]
-            kv_windows = kv_windows.view(2, B, C, ow, ow, nW)
-            kv_windows = kv_windows.permute(0, 1, 5, 3, 4, 2).contiguous()
+        if (
+            self.use_fused_qkv_windows_training
+            and self.training
+            and qkv.is_cuda
+        ):
+            if not _OCAB_FUSED_QKV_WINDOWS_AVAILABLE:
+                raise RuntimeError(
+                    "fused OCAB Q/K/V windows require Triton and "
+                    "torch.library.triton_op"
+                )
+            q_windows, kv_windows = ocab_qkv_windows(
+                qkv,
+                self.window_size,
+                ow,
+            )
         else:
-            kv = torch.cat((qkv[1], qkv[2]), dim=1)  # B, 2*C, H, W
-            kv_windows = self.unfold(kv)
-            nW = kv_windows.shape[2]
-            kv_windows = kv_windows.view(B, 2, C, ow, ow, nW)
-            kv_windows = kv_windows.permute(1, 0, 5, 3, 4, 2).contiguous()
-        kv_windows = kv_windows.view(2, B * nW, ow * ow, C)
+            qkv = qkv.permute(3, 0, 4, 1, 2)  # 3, B, C, H, W
+            q = qkv[0].permute(0, 2, 3, 1)  # B, H, W, C
+
+            # Partition Q windows
+            q_windows = window_partition(q, self.window_size)
+            q_windows = q_windows.view(
+                -1,
+                self.window_size * self.window_size,
+                C,
+            )
+
+            # Unfold K/V with overlap.
+            if self._use_batch_axis_kv:
+                # Keep K/V on a leading 2*batch axis through Unfold.  Unfold
+                # acts independently per batch item, so this is exactly
+                # equivalent to channel concatenation.
+                kv = qkv[1:3].reshape(2 * B, C, H, W)
+                kv_windows = self._overlap_unfold(kv)
+                nW = kv_windows.shape[2]
+                kv_windows = kv_windows.view(2, B, C, ow, ow, nW)
+                kv_windows = kv_windows.permute(
+                    0,
+                    1,
+                    5,
+                    3,
+                    4,
+                    2,
+                ).contiguous()
+            else:
+                kv = torch.cat((qkv[1], qkv[2]), dim=1)  # B, 2*C, H, W
+                kv_windows = self._overlap_unfold(kv)
+                nW = kv_windows.shape[2]
+                kv_windows = kv_windows.view(B, 2, C, ow, ow, nW)
+                kv_windows = kv_windows.permute(
+                    1,
+                    0,
+                    5,
+                    3,
+                    4,
+                    2,
+                ).contiguous()
+            kv_windows = kv_windows.view(2, B * nW, ow * ow, C)
         k_windows, v_windows = kv_windows.unbind(0)
 
         # Attention
@@ -2108,8 +2861,8 @@ class OCAB(nn.Module):
         k = k_windows.reshape(B_, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = v_windows.reshape(B_, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        attn_bias = self._relative_position_bias(q.device, q.dtype)
         use_export_safe_math = self.force_math_attention
+        attn_bias = self._relative_position_bias(q.device, q.dtype)
 
         if use_export_safe_math or not _SDPA_BACKEND_AVAILABLE or not q.is_cuda:
             x = _scaled_dot_product_attention_export_safe(
@@ -2121,37 +2874,6 @@ class OCAB(nn.Module):
                 scale=self.scale,
                 training=self.training,
                 use_export_safe_math=use_export_safe_math,
-            )
-        elif (
-            torch.compiler.is_compiling()
-            and self.training
-            and self.attn_type == "hybrid"
-        ):
-            # Dense-bias OCAB is bandwidth-bound under memory-efficient SDPA:
-            # the same [H, Nq, Nk] bias is streamed across every image/window
-            # in B_. Flex indexes that shared trainable bias inside the fused
-            # attention kernel instead. This is training-only; ONNX/TensorRT
-            # preparation forces the export-safe additive route above.
-            bias_flat = attn_bias.reshape(self.num_heads, Nq * Nk)
-            x = ocab_flex_training_op(
-                q,
-                k,
-                v,
-                bias_flat,
-                self.scale,
-            )
-        elif torch.compiler.is_compiling():
-            # prepare_for_compile() installs the same process-wide backend
-            # policy before tracing. Keeping sdpa_kernel's Python context
-            # manager outside the graph makes the complete forward/backward
-            # serializable by AOTAutograd without changing dispatch.
-            x = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_bias,
-                dropout_p=0.0,
-                scale=self.scale,
             )
         else:
             with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
@@ -2166,12 +2888,27 @@ class OCAB(nn.Module):
 
         x = x.transpose(1, 2).reshape(B_, Nq, self.dim)
 
+        # Projection is tokenwise and therefore commutes exactly with window
+        # reversal.  In compiled training, applying it while tokens are still
+        # in contiguous window order lets Inductor fuse the later permutation
+        # into residual/statistics work instead of materializing an extra
+        # spatial-order input for the GEMM.  Keep inference/export ordering
+        # unchanged so their established deployment graph is untouched.
+        project_in_window_order = (
+            self.use_window_order_projection_training
+            and self.training
+            and x.is_cuda
+        )
+        if project_in_window_order:
+            x = self.proj(x)
+
         # Merge windows
         x = x.view(-1, self.window_size, self.window_size, self.dim)
         x = window_reverse(x, self.window_size, H, W)
         x = x.view(B, L, self.dim)
 
-        x = self.proj(x)
+        if not project_in_window_order:
+            x = self.proj(x)
 
         # Apply LayerScale to attention output
         x = self.ls_attn(x) * residual_scale
@@ -2264,6 +3001,7 @@ class AttentionBlocks(nn.Module):
             False if use_checkpoint_ocab is None else use_checkpoint_ocab
         )
         self.dense_skip = dense_skip
+        self.use_compiled_checkpoint_policy = False
 
         # Build ACT blocks
         self.blocks = nn.ModuleList([
@@ -2320,12 +3058,34 @@ class AttentionBlocks(nn.Module):
         x_size: tuple[int, int],
         hybrid_ctx=None,
     ) -> torch.Tensor:
+        checkpoint_options: dict[str, Any] = {"use_reentrant": False}
+        if self.use_compiled_checkpoint_policy:
+            checkpoint_options["context_fn"] = (
+                _FLASH_QKV_NORM_STATS_SELECTIVE_CHECKPOINT_CONTEXT
+            )
         if self.dense_skip:
             # Collect outputs from all blocks
             block_outputs = []
             for blk in self.blocks:
                 if self.use_checkpoint_act and self.training:
-                    x = checkpoint(blk, x, x_size, hybrid_ctx, use_reentrant=False)
+                    attention_bias_factors = (
+                        blk.attn.neural_bias()
+                        if self.use_compiled_checkpoint_policy
+                        else None
+                    )
+                    if attention_bias_factors is not None:
+                        x = checkpoint(
+                            blk,
+                            x,
+                            x_size,
+                            hybrid_ctx,
+                            attention_bias_factors,
+                            **checkpoint_options,
+                        )
+                    else:
+                        x = checkpoint(
+                            blk, x, x_size, hybrid_ctx, **checkpoint_options,
+                        )
                 else:
                     x = blk(x, x_size, hybrid_ctx)
                 block_outputs.append(x)
@@ -2334,7 +3094,7 @@ class AttentionBlocks(nn.Module):
             # This ensures cross-window attention operates on refined sequential features
             # OCAB does not use shifted windows — no block_mask needed
             if self.use_checkpoint_ocab and self.training:
-                x = checkpoint(self.ocab, x, x_size, use_reentrant=False)
+                x = checkpoint(self.ocab, x, x_size, **checkpoint_options)
             else:
                 x = self.ocab(x, x_size)
 
@@ -2345,13 +3105,30 @@ class AttentionBlocks(nn.Module):
         else:
             for blk in self.blocks:
                 if self.use_checkpoint_act and self.training:
-                    x = checkpoint(blk, x, x_size, hybrid_ctx, use_reentrant=False)
+                    attention_bias_factors = (
+                        blk.attn.neural_bias()
+                        if self.use_compiled_checkpoint_policy
+                        else None
+                    )
+                    if attention_bias_factors is not None:
+                        x = checkpoint(
+                            blk,
+                            x,
+                            x_size,
+                            hybrid_ctx,
+                            attention_bias_factors,
+                            **checkpoint_options,
+                        )
+                    else:
+                        x = checkpoint(
+                            blk, x, x_size, hybrid_ctx, **checkpoint_options,
+                        )
                 else:
                     x = blk(x, x_size, hybrid_ctx)
 
             # OCAB — no block_mask needed (no shifted windows)
             if self.use_checkpoint_ocab and self.training:
-                x = checkpoint(self.ocab, x, x_size, use_reentrant=False)
+                x = checkpoint(self.ocab, x, x_size, **checkpoint_options)
             else:
                 x = self.ocab(x, x_size)
         return x
@@ -2577,10 +3354,10 @@ class Upsample(nn.Module):
 class DRFT(nn.Module):
     """Dense rank-factored image-restoration transformer.
 
-    ``embed_dim`` is the width of the trunk and every residual endpoint.
-    ``unshifted_num_heads`` and ``unshifted_attention_dim`` control the reduced
-    Q/K/V space in unshifted local-attention blocks. Shifted blocks and OCAB
-    remain full-width. Every normalization site uses image-wide i-LN.
+    ``embed_dim`` is the width of the trunk, every residual endpoint, and every
+    local-attention block. The canonical defaults keep unshifted and shifted
+    attention full-width, use the original half-window OCAB overlap, and apply
+    image-wide i-LN at every normalization site.
     """
 
     # Bump only when DRFT's compiled graph contract changes incompatibly.
@@ -2591,10 +3368,7 @@ class DRFT(nn.Module):
     # fixed attention scales. Keep Python float attributes specialized so
     # AOTAutograd never lifts those constants into CPU scalar graph inputs.
     compile_specialize_float = True
-    compile_fullgraph = True
-    compile_dynamic = False
-    compile_precompile_cache = True
-    compile_cache_key_tag = "drft-iln-family-v11-raw-aot-ocab-flex-op"
+    compile_cache_key_tag = "drft-iln-family-v17-sdpa-ocab-layout-fusion"
 
     # Dynamic DRFT ONNX exports always trace this representative shape. The
     # dimensions remain symbolic in ONNX; this value is only example data.
@@ -2635,7 +3409,7 @@ class DRFT(nn.Module):
         rank: int = 32,
         attn_type: ATTN_TYPE = 'masked',
         reconstruction: RECONSTRUCTION_TYPE = 'progressive',
-        full_width_unshifted: bool = False,
+        full_width_unshifted: bool = True,
         edbb_depth_multiplier: float = 1.0,
         channel_squeeze_factor: int = 16,
         iln_eps: float = 1e-4,
@@ -2657,11 +3431,7 @@ class DRFT(nn.Module):
 
         num_heads = tuple(num_heads)
         if unshifted_num_heads is None:
-            if any(heads % 2 != 0 for heads in num_heads):
-                raise ValueError(
-                    "unshifted_num_heads is required when a stage has an odd full head count"
-                )
-            unshifted_num_heads = tuple(heads // 2 for heads in num_heads)
+            unshifted_num_heads = num_heads
         else:
             unshifted_num_heads = tuple(unshifted_num_heads)
 
@@ -2670,7 +3440,7 @@ class DRFT(nn.Module):
                 "depths and unshifted_num_heads must have the same length"
             )
         if unshifted_attention_dim is None:
-            unshifted_attention_dim = (embed_dim // 2,) * len(depths)
+            unshifted_attention_dim = (embed_dim,) * len(depths)
         else:
             unshifted_attention_dim = tuple(unshifted_attention_dim)
         if len(unshifted_attention_dim) != len(depths):
@@ -2713,7 +3483,7 @@ class DRFT(nn.Module):
                 )
 
         if overlap_window_size is None:
-            overlap_window_size = window_size + 8
+            overlap_window_size = window_size + window_size // 2
 
         resolved_checkpoint_act = (
             use_checkpoint if use_checkpoint_act is None else use_checkpoint_act
@@ -2722,7 +3492,7 @@ class DRFT(nn.Module):
             False if use_checkpoint_ocab is None else use_checkpoint_ocab
         )
         compile_contract = (
-            "drft-iln-family-v8-training-fusion",
+            "drft-iln-family-v13-prefusion-execution",
             img_size,
             patch_size,
             in_chans,
@@ -2760,7 +3530,7 @@ class DRFT(nn.Module):
             repr(compile_contract).encode("utf-8")
         ).hexdigest()[:20]
         self.compile_cache_key_tag = (
-            "drft-iln-family-v11-raw-aot-ocab-flex-op-"
+            "drft-iln-family-v17-sdpa-ocab-layout-fusion-"
             f"{compile_contract_sha}"
         )
 
@@ -3486,24 +4256,32 @@ class DRFT(nn.Module):
         input_shape: tuple[int, int, int, int] | None = None,
         input_dtype: torch.dtype | None = None,
     ) -> None:
-        """Prime immutable device caches before Dynamo records cache guards.
+        """Prime compile-only training rewrites and immutable device caches.
 
         OCAB's relative-position index is shared by every compatible block and
         does not depend on input data. Creating it during the first compiled
         forward mutates the global cache and otherwise forces a full second
         compilation when the cache changes from cold to warm.
         """
-        if self.mean.is_cuda:
-            # This is the graph-external equivalent of the per-call SDPA
-            # contexts used by eager DRFT. Local unmasked attention still
-            # selects PyTorch Flash Attention; dense-bias OCAB selects memory
-            # efficient attention, with math retained as the safe fallback.
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(True)
-            torch.backends.cuda.enable_cudnn_sdp(False)
-
+        del input_dtype
         device = self.mean.device
+        if self.training and device.type == "cuda":
+            for module in self.modules():
+                if isinstance(module, AttentionBlocks):
+                    module.use_compiled_checkpoint_policy = True
+                elif isinstance(module, OCAB):
+                    module._use_batch_axis_kv = True
+                    module.use_fused_qkv_windows_training = (
+                        _OCAB_FUSED_QKV_WINDOWS_AVAILABLE
+                    )
+                    module.use_window_order_projection_training = True
+                    module.use_compact_relative_bias_training = (
+                        _OCAB_COMPACT_BIAS_AVAILABLE
+                    )
+                    module.use_compact_unfold_training = (
+                        _OCAB_COMPACT_UNFOLD_AVAILABLE
+                    )
+
         for module in self.modules():
             if isinstance(module, OCAB):
                 _get_shared_relative_position_index(
@@ -3543,42 +4321,6 @@ class DRFT(nn.Module):
                 device,
             )
 
-            if self.training and device.type == "cuda":
-                if input_dtype is None:
-                    input_dtype = self.mean.dtype
-                windows_per_image = (
-                    padded_height // self.window_size
-                ) * (padded_width // self.window_size)
-                prepared_specs: set[
-                    tuple[int, int, int, int, int, torch.dtype, float]
-                ] = set()
-                for module in self.modules():
-                    if not isinstance(module, OCAB):
-                        continue
-                    query_tokens = math.prod(module.q_window_size)
-                    key_tokens = math.prod(module.k_window_size)
-                    spec = (
-                        batch * windows_per_image,
-                        module.num_heads,
-                        query_tokens,
-                        key_tokens,
-                        module.head_dim,
-                        input_dtype,
-                        module.scale,
-                    )
-                    if spec in prepared_specs:
-                        continue
-                    prepare_ocab_flex_training_kernel(
-                        batch_windows=spec[0],
-                        num_heads=spec[1],
-                        query_tokens=spec[2],
-                        key_tokens=spec[3],
-                        head_dim=spec[4],
-                        dtype=spec[5],
-                        device=device,
-                        scale=spec[6],
-                    )
-                    prepared_specs.add(spec)
             self._get_batch_indices(
                 batch,
                 padded_height,
@@ -3904,14 +4646,27 @@ class _DRFTTensorRTMixedPrecision(nn.Module):
 # Model Factory Functions
 # =============================================================================
 
+def _resolve_ocab_window_size(
+    window_size: int,
+    overlap_window_size: int | None,
+) -> int:
+    """Resolve the canonical OCAB span with 50% window overlap."""
+    canonical_size = window_size + window_size // 2
+    if overlap_window_size is not None and overlap_window_size != canonical_size:
+        raise ValueError(
+            "canonical DRFT requires overlap_window_size == "
+            f"window_size + window_size // 2 ({canonical_size}), got "
+            f"{overlap_window_size}"
+        )
+    return canonical_size
+
+
 def _build_drft(
     *,
     scale: int,
     embed_dim: int,
     groups: int,
     full_heads: int,
-    unshifted_heads: int,
-    unshifted_attention_dim: int,
     use_checkpoint: bool,
     window_size: int,
     overlap_window_size: int | None,
@@ -3922,20 +4677,23 @@ def _build_drft(
     depth: int = 6,
     dense_skip: bool = True,
     reconstruction: RECONSTRUCTION_TYPE = 'progressive',
-    full_width_unshifted: bool = False,
     edbb_depth_multiplier: float = 1.0,
     channel_squeeze_factor: int = 16,
     iln_eps: float = 1e-4,
     rhag_layer_scale_init: float | None = None,
     **kwargs,
 ) -> DRFT:
+    overlap_window_size = _resolve_ocab_window_size(
+        window_size,
+        overlap_window_size,
+    )
     return DRFT(
         upscale=scale,
         embed_dim=embed_dim,
         depths=(depth,) * groups,
         num_heads=(full_heads,) * groups,
-        unshifted_num_heads=(unshifted_heads,) * groups,
-        unshifted_attention_dim=(unshifted_attention_dim,) * groups,
+        unshifted_num_heads=(full_heads,) * groups,
+        unshifted_attention_dim=(embed_dim,) * groups,
         window_size=window_size,
         overlap_window_size=overlap_window_size,
         mlp_ratio=mlp_ratio,
@@ -3946,7 +4704,7 @@ def _build_drft(
         attn_type=attn_type,
         rank=rank,
         reconstruction=reconstruction,
-        full_width_unshifted=full_width_unshifted,
+        full_width_unshifted=True,
         edbb_depth_multiplier=edbb_depth_multiplier,
         channel_squeeze_factor=channel_squeeze_factor,
         iln_eps=iln_eps,
@@ -3958,21 +4716,19 @@ def drft_nano(
     scale: int = 4,
     use_checkpoint: bool = False,
     window_size: int = 16,
-    overlap_window_size: int | None = 20,
+    overlap_window_size: int | None = None,
     drop_path_rate: float = 0.05,
     attn_type: ATTN_TYPE = 'masked',
     rank: int = 32,
     iln_eps: float = 1e-4,
     **kwargs
 ) -> DRFT:
-    """C32, one two-block RHAG, one head, and direct reconstruction."""
+    """C32, one two-block RHAG, one full-width head, and direct reconstruction."""
     return _build_drft(
         scale=scale,
         embed_dim=32,
         groups=1,
         full_heads=1,
-        unshifted_heads=1,
-        unshifted_attention_dim=16,
         use_checkpoint=use_checkpoint,
         window_size=window_size,
         overlap_window_size=overlap_window_size,
@@ -3998,15 +4754,13 @@ def drft_micro(
     iln_eps: float = 1e-4,
     **kwargs
 ) -> DRFT:
-    """C64, one RHAG, two shifted heads, one unshifted head."""
+    """C64, one RHAG, and two full-width heads in every local block."""
     return _build_drft(
         scale=scale,
         embed_dim=64,
         groups=1,
         depth=6,
         full_heads=2,
-        unshifted_heads=1,
-        unshifted_attention_dim=32,
         use_checkpoint=use_checkpoint,
         window_size=window_size,
         overlap_window_size=overlap_window_size,
@@ -4029,15 +4783,13 @@ def drft_light(
     iln_eps: float = 1e-4,
     **kwargs
 ) -> DRFT:
-    """C96, two RHAGs, three shifted heads, one unshifted head."""
+    """C96, two RHAGs, and three full-width heads in every local block."""
     return _build_drft(
         scale=scale,
         embed_dim=96,
         groups=2,
         depth=6,
         full_heads=3,
-        unshifted_heads=1,
-        unshifted_attention_dim=48,
         use_checkpoint=use_checkpoint,
         window_size=window_size,
         overlap_window_size=overlap_window_size,
@@ -4060,15 +4812,13 @@ def drft_xs(
     iln_eps: float = 1e-4,
     **kwargs
 ) -> DRFT:
-    """C128, four RHAGs, four shifted heads, two unshifted heads."""
+    """C128, four RHAGs, and four full-width heads in every local block."""
     return _build_drft(
         scale=scale,
         embed_dim=128,
         groups=4,
         depth=6,
         full_heads=4,
-        unshifted_heads=2,
-        unshifted_attention_dim=64,
         use_checkpoint=use_checkpoint,
         window_size=window_size,
         overlap_window_size=overlap_window_size,
@@ -4091,15 +4841,13 @@ def drft_s(
     iln_eps: float = 1e-4,
     **kwargs
 ) -> DRFT:
-    """C160/G6 with 5x32 full attention and 96-wide 3x32 narrow attention."""
+    """C160/G6 with 5x32 full-width attention in every local block."""
     return _build_drft(
         scale=scale,
         embed_dim=160,
         groups=6,
         depth=6,
         full_heads=5,
-        unshifted_heads=3,
-        unshifted_attention_dim=96,
         use_checkpoint=use_checkpoint,
         window_size=window_size,
         overlap_window_size=overlap_window_size,
@@ -4122,15 +4870,38 @@ def drft_m(
     iln_eps: float = 1e-4,
     **kwargs
 ) -> DRFT:
-    """C192/G8 with 6x32 full attention and 96-wide 3x32 narrow attention."""
+    """C192/G8 with 6x32 full-width attention in every local block."""
     return _build_drft(
         scale=scale,
         embed_dim=192,
         groups=8,
         depth=6,
         full_heads=6,
-        unshifted_heads=3,
-        unshifted_attention_dim=96,
+        use_checkpoint=use_checkpoint,
+        window_size=window_size,
+        overlap_window_size=overlap_window_size,
+        drop_path_rate=drop_path_rate,
+        attn_type=attn_type,
+        rank=rank,
+        iln_eps=iln_eps,
+        **kwargs,
+    )
+
+
+def drft_m_safe(
+    scale: int = 4,
+    use_checkpoint: bool = False,
+    window_size: int = 32,
+    overlap_window_size: int | None = None,
+    drop_path_rate: float = 0.1,
+    attn_type: ATTN_TYPE = 'masked',
+    rank: int = 32,
+    iln_eps: float = 1e-4,
+    **kwargs,
+) -> DRFT:
+    """Compatibility spelling for the now-canonical full-width DRFT-M."""
+    return drft_m(
+        scale=scale,
         use_checkpoint=use_checkpoint,
         window_size=window_size,
         overlap_window_size=overlap_window_size,
@@ -4153,15 +4924,13 @@ def drft_l(
     iln_eps: float = 1e-4,
     **kwargs
 ) -> DRFT:
-    """C224/G10 with 7x32 full attention and 128-wide 4x32 narrow attention."""
+    """C224/G10 with 7x32 full-width attention in every local block."""
     return _build_drft(
         scale=scale,
         embed_dim=224,
         groups=10,
         depth=6,
         full_heads=7,
-        unshifted_heads=4,
-        unshifted_attention_dim=128,
         use_checkpoint=use_checkpoint,
         window_size=window_size,
         overlap_window_size=overlap_window_size,
@@ -4185,15 +4954,13 @@ def drft_xl(
     rhag_layer_scale_init: float = 1e-4,
     **kwargs,
 ) -> DRFT:
-    """C256/G14 with 8x32 full attention and 128-wide 4x32 narrow attention."""
+    """C256/G14 with 8x32 full-width attention in every local block."""
     return _build_drft(
         scale=scale,
         embed_dim=256,
         groups=14,
         depth=6,
         full_heads=8,
-        unshifted_heads=4,
-        unshifted_attention_dim=128,
         use_checkpoint=use_checkpoint,
         window_size=window_size,
         overlap_window_size=overlap_window_size,
@@ -4213,8 +4980,6 @@ def _build_drft_teacher(
     groups: int,
     depth: int,
     full_heads: int,
-    unshifted_heads: int,
-    unshifted_attention_dim: int,
     use_checkpoint: bool,
     window_size: int,
     overlap_window_size: int | None,
@@ -4241,8 +5006,6 @@ def _build_drft_teacher(
         groups=groups,
         depth=depth,
         full_heads=full_heads,
-        unshifted_heads=unshifted_heads,
-        unshifted_attention_dim=unshifted_attention_dim,
         use_checkpoint=use_checkpoint,
         window_size=window_size,
         overlap_window_size=overlap_window_size,
@@ -4250,7 +5013,6 @@ def _build_drft_teacher(
         attn_type=attn_type,
         rank=rank,
         mlp_ratio=mlp_ratio,
-        full_width_unshifted=True,
         edbb_depth_multiplier=edbb_depth_multiplier,
         channel_squeeze_factor=channel_squeeze_factor,
         rhag_layer_scale_init=rhag_layer_scale_init,
@@ -4264,7 +5026,7 @@ def drft_nano_teacher(
     scale: int = 4,
     use_checkpoint: bool = False,
     window_size: int = 16,
-    overlap_window_size: int | None = 20,
+    overlap_window_size: int | None = None,
     drop_path_rate: float = 0.05,
     attn_type: ATTN_TYPE = 'masked',
     rank: int = 32,
@@ -4277,7 +5039,7 @@ def drft_nano_teacher(
 ) -> DRFT:
     return _build_drft_teacher(
         scale=scale, embed_dim=32, groups=groups, depth=depth,
-        full_heads=1, unshifted_heads=1, unshifted_attention_dim=16,
+        full_heads=1,
         use_checkpoint=use_checkpoint,
         window_size=window_size, overlap_window_size=overlap_window_size,
         drop_path_rate=drop_path_rate, attn_type=attn_type, rank=rank,
@@ -4304,7 +5066,7 @@ def drft_micro_teacher(
 ) -> DRFT:
     return _build_drft_teacher(
         scale=scale, embed_dim=64, groups=groups, depth=depth,
-        full_heads=2, unshifted_heads=1, unshifted_attention_dim=32,
+        full_heads=2,
         use_checkpoint=use_checkpoint,
         window_size=window_size, overlap_window_size=overlap_window_size,
         drop_path_rate=drop_path_rate, attn_type=attn_type, rank=rank,
@@ -4330,7 +5092,7 @@ def drft_light_teacher(
 ) -> DRFT:
     return _build_drft_teacher(
         scale=scale, embed_dim=96, groups=groups, depth=depth,
-        full_heads=3, unshifted_heads=1, unshifted_attention_dim=48,
+        full_heads=3,
         use_checkpoint=use_checkpoint,
         window_size=window_size, overlap_window_size=overlap_window_size,
         drop_path_rate=drop_path_rate, attn_type=attn_type, rank=rank,
@@ -4356,7 +5118,7 @@ def drft_xs_teacher(
 ) -> DRFT:
     return _build_drft_teacher(
         scale=scale, embed_dim=128, groups=groups, depth=depth,
-        full_heads=4, unshifted_heads=2, unshifted_attention_dim=64,
+        full_heads=4,
         use_checkpoint=use_checkpoint,
         window_size=window_size, overlap_window_size=overlap_window_size,
         drop_path_rate=drop_path_rate, attn_type=attn_type, rank=rank,
@@ -4382,7 +5144,7 @@ def drft_s_teacher(
 ) -> DRFT:
     return _build_drft_teacher(
         scale=scale, embed_dim=160, groups=groups, depth=depth,
-        full_heads=5, unshifted_heads=3, unshifted_attention_dim=96,
+        full_heads=5,
         use_checkpoint=use_checkpoint,
         window_size=window_size, overlap_window_size=overlap_window_size,
         drop_path_rate=drop_path_rate, attn_type=attn_type, rank=rank,
@@ -4408,7 +5170,7 @@ def drft_m_teacher(
 ) -> DRFT:
     return _build_drft_teacher(
         scale=scale, embed_dim=192, groups=groups, depth=depth,
-        full_heads=6, unshifted_heads=3, unshifted_attention_dim=96,
+        full_heads=6,
         use_checkpoint=use_checkpoint,
         window_size=window_size, overlap_window_size=overlap_window_size,
         drop_path_rate=drop_path_rate, attn_type=attn_type, rank=rank,
@@ -4435,7 +5197,7 @@ def drft_l_teacher(
 ) -> DRFT:
     return _build_drft_teacher(
         scale=scale, embed_dim=224, groups=groups, depth=depth,
-        full_heads=7, unshifted_heads=4, unshifted_attention_dim=128,
+        full_heads=7,
         use_checkpoint=use_checkpoint,
         window_size=window_size, overlap_window_size=overlap_window_size,
         drop_path_rate=drop_path_rate, attn_type=attn_type, rank=rank,
@@ -4463,7 +5225,7 @@ def drft_xl_teacher(
 ) -> DRFT:
     return _build_drft_teacher(
         scale=scale, embed_dim=256, groups=groups, depth=depth,
-        full_heads=8, unshifted_heads=4, unshifted_attention_dim=128,
+        full_heads=8,
         use_checkpoint=use_checkpoint,
         window_size=window_size, overlap_window_size=overlap_window_size,
         drop_path_rate=drop_path_rate, attn_type=attn_type, rank=rank,
