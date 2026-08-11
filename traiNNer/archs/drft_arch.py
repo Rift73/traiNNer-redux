@@ -176,13 +176,36 @@ def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
 
 
 class ImageLayerNorm(nn.Module):
-    """Paper i-LN: normalize each image over all tokens and channels."""
+    """Paper i-LN with a training-only upper-tail residual-scale cap."""
 
     def __init__(self, dim: int, eps: float = 1e-4) -> None:
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
         self.bias = nn.Parameter(torch.zeros(dim))
+        # Training-only state: abnormal residual scales are capped relative to
+        # the layer's recent normal range. These buffers intentionally stay out
+        # of checkpoints because eval/export always use raw paper i-LN.
+        self.register_buffer("std_ema", torch.ones(1), persistent=False)
+        self.register_buffer("_last_std_buf", torch.ones(1), persistent=False)
+        self._std_ema_initialized = False
+
+    def update_std_ema(self) -> None:
+        """Update the guarded training reference from the previous forward."""
+        if not self.training:
+            return
+        with torch.no_grad():
+            batch_std = self._last_std_buf
+            if not self._std_ema_initialized:
+                self.std_ema.copy_(batch_std)
+                self._std_ema_initialized = True
+            else:
+                safe_std = torch.where(
+                    batch_std < 2.0 * self.std_ema,
+                    batch_std,
+                    self.std_ema,
+                )
+                self.std_ema.lerp_(safe_std, 1e-3)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mean = x.mean(dim=(1, 2), keepdim=True)
@@ -190,7 +213,24 @@ class ImageLayerNorm(nn.Module):
         variance = (centered * centered).mean(dim=(1, 2), keepdim=True)
         std = torch.sqrt(variance + self.eps)
         normalized = centered / std
-        return normalized * self.weight + self.bias, std
+        scale = std
+        if self.training:
+            with torch.no_grad():
+                self._last_std_buf.copy_(std.detach().mean())
+            scale = torch.minimum(std, 2.0 * self.std_ema.detach())
+        return normalized * self.weight + self.bias, scale
+
+
+def _update_image_layer_norm_ema(
+    module: nn.Module,
+    _inputs: tuple[object, ...],
+) -> None:
+    """Advance DRFT's i-LN references before each training forward."""
+    if not module.training:
+        return
+    for child in module.modules():
+        if isinstance(child, ImageLayerNorm):
+            child.update_std_ema()
 
 
 class AffineTransform(nn.Module):
@@ -3368,7 +3408,9 @@ class DRFT(nn.Module):
     # fixed attention scales. Keep Python float attributes specialized so
     # AOTAutograd never lifts those constants into CPU scalar graph inputs.
     compile_specialize_float = True
-    compile_cache_key_tag = "drft-iln-family-v17-sdpa-ocab-layout-fusion"
+    compile_cache_key_tag = (
+        "drft-iln-family-v18-sdpa-ocab-layout-fusion-train-ema-cap"
+    )
 
     # Dynamic DRFT ONNX exports always trace this representative shape. The
     # dimensions remain symbolic in ONNX; this value is only example data.
@@ -3530,7 +3572,7 @@ class DRFT(nn.Module):
             repr(compile_contract).encode("utf-8")
         ).hexdigest()[:20]
         self.compile_cache_key_tag = (
-            "drft-iln-family-v17-sdpa-ocab-layout-fusion-"
+            "drft-iln-family-v18-sdpa-ocab-layout-fusion-train-ema-cap-"
             f"{compile_contract_sha}"
         )
 
@@ -3664,6 +3706,8 @@ class DRFT(nn.Module):
             self._dense_mask_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
         elif attn_type == 'hybrid':
             self._block_mask_cache: OrderedDict[tuple, object] = OrderedDict()
+
+        self.register_forward_pre_hook(_update_image_layer_norm_ema)
 
     def _compute_region_ids(self, H: int, W: int, device: torch.device) -> torch.Tensor:
         """Compute Swin-style region IDs for shifted window masking.

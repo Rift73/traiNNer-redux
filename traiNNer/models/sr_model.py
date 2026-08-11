@@ -1,10 +1,9 @@
-import math
 import os
 import re
 import shutil
 import warnings
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from os import path as osp
@@ -34,12 +33,7 @@ from traiNNer.utils import get_root_logger, imwrite, tensor2img
 from traiNNer.utils.color_util import pixelformat2rgb_pt, rgb2pixelformat_pt
 from traiNNer.utils.logger import clickable_file_path
 from traiNNer.utils.misc import loss_type_to_label
-from traiNNer.utils.per_image_outlier_guard import (
-    PerImageOutlierStats,
-    PerImageOutlierTensorStats,
-    evaluate_per_image_outlier_tensors,
-)
-from traiNNer.utils.redux_options import PerImageOutlierGuardOptions, ReduxOptions
+from traiNNer.utils.redux_options import ReduxOptions
 from traiNNer.utils.types import DataFeed
 
 
@@ -102,16 +96,6 @@ class SRModel(BaseModel):
         self.distillation = self.distillation_opt is not None
         self.cudagraph_stable_gradients = False
         self.cudagraph_stable_discriminator_gradients = False
-        self.per_image_outlier_guard_opt: PerImageOutlierGuardOptions | None = None
-        self._per_image_outlier_detector: (
-            Callable[[Tensor, Tensor], PerImageOutlierTensorStats] | None
-        ) = None
-        self.per_image_outlier_triggers = 0
-        self._outlier_guard_accum_kept_samples = 0
-        self._outlier_guard_accum_seen_samples = 0
-        self._outlier_guard_accum_d_kept_samples = 0
-        self._outlier_guard_accum_reference_samples = 0
-        self.batch_sample_paths: list[str] | None = None
         self._validation_inference_net: nn.Module | None = None
         self._validation_prepared_key: tuple[int, int] | None = None
 
@@ -269,224 +253,11 @@ class SRModel(BaseModel):
 
             self.init_training_settings()
 
-    def _initialize_per_image_outlier_guard(self) -> None:
-        train_opt = self.opt.train
-        assert train_opt is not None
-        guard_opt = train_opt.per_image_outlier_guard
-        if guard_opt is None or not guard_opt.enabled:
-            return
-        if guard_opt.start_iter < 0:
-            raise ValueError("per-image guard start_iter must be at least 0")
-        if not math.isfinite(guard_opt.charbonnier_epsilon) or (
-            guard_opt.charbonnier_epsilon <= 0
-        ):
-            raise ValueError(
-                "per-image guard charbonnier_epsilon must be finite and > 0"
-            )
-        if not math.isfinite(guard_opt.mean_absolute_floor) or (
-            guard_opt.mean_absolute_floor < 0
-        ):
-            raise ValueError(
-                "per-image guard mean_absolute_floor must be finite and >= 0"
-            )
-        if not math.isfinite(guard_opt.median_multiple) or (
-            guard_opt.median_multiple <= 0
-        ):
-            raise ValueError("per-image guard median_multiple must be finite and > 0")
-        if not math.isfinite(guard_opt.max_absolute_error) or (
-            guard_opt.max_absolute_error <= 0
-        ):
-            raise ValueError(
-                "per-image guard max_absolute_error must be finite and > 0"
-            )
-        if guard_opt.minimum_kept_samples < 1:
-            raise ValueError("per-image guard minimum_kept_samples must be at least 1")
-
-        charbonnier_epsilon = guard_opt.charbonnier_epsilon
-        mean_absolute_floor = guard_opt.mean_absolute_floor
-        median_multiple = guard_opt.median_multiple
-        max_absolute_error = guard_opt.max_absolute_error
-
-        def detector(prediction: Tensor, target: Tensor) -> PerImageOutlierTensorStats:
-            return evaluate_per_image_outlier_tensors(
-                prediction,
-                target,
-                charbonnier_epsilon=charbonnier_epsilon,
-                mean_absolute_floor=mean_absolute_floor,
-                median_multiple=median_multiple,
-                max_absolute_error=max_absolute_error,
-            )
-
-        logger = get_root_logger()
-        self._per_image_outlier_detector = detector
-        if self.use_compile:
-            self._per_image_outlier_detector = torch.compile(
-                detector,
-                mode=self.opt.compile_mode,
-                fullgraph=True,
-                dynamic=False,
-            )
-            logger.info(
-                "Per-image outlier statistics will use a dedicated full-graph "
-                "TorchInductor detector. Its first active iteration may compile."
-            )
-
-        self.per_image_outlier_guard_opt = guard_opt
-        logger.info(
-            "Per-image outlier guard is enabled in %s mode "
-            "from candidate iter %d (mean=max(%.6g, %.6g x median), "
-            "max_abs=%.6g).",
-            guard_opt.action,
-            guard_opt.start_iter,
-            guard_opt.mean_absolute_floor,
-            guard_opt.median_multiple,
-            guard_opt.max_absolute_error,
-        )
-        if guard_opt.action == "shadow":
-            get_root_logger().info(
-                "Shadow mode cannot change losses, gradients, optimizer steps, "
-                "EMA, scheduler, or iterations."
-            )
-
-    def _record_per_image_outlier_trigger(
-        self,
-        current_iter: int,
-        stats: PerImageOutlierStats,
-    ) -> tuple[int, bool]:
-        guard_opt = self.per_image_outlier_guard_opt
-        assert guard_opt is not None
-        self.per_image_outlier_triggers += 1
-
-        summary = torch.stack(
-            (
-                stats.outliers.sum().float(),
-                stats.nonfinite.sum().float(),
-                stats.batch_median,
-                stats.mean_threshold,
-            )
-        ).cpu()
-        bad_count, nonfinite_count, batch_median, mean_threshold = summary.tolist()
-        batch_size = stats.outliers.numel()
-        kept = batch_size - int(bad_count)
-
-        sample_details: list[dict[str, Any]] | str = "disabled"
-        if guard_opt.log_trigger_paths:
-            bad_slots = stats.outliers.nonzero(as_tuple=False).flatten()
-            bad_values = torch.stack(
-                (
-                    stats.charbonnier_mean,
-                    stats.max_abs_error,
-                    stats.nonfinite.float(),
-                ),
-                dim=1,
-            )[bad_slots].cpu()
-            slot_list = bad_slots.cpu().tolist()
-            value_list = bad_values.tolist()
-            paths = self.batch_sample_paths
-            sample_details = []
-            for slot, (sample_mean, sample_max, sample_nonfinite) in zip(
-                slot_list, value_list, strict=True
-            ):
-                path = (
-                    paths[slot]
-                    if paths is not None and slot < len(paths)
-                    else "<unavailable>"
-                )
-                sample_details.append(
-                    {
-                        "slot": slot,
-                        "path": path,
-                        "charbonnier_mean": sample_mean,
-                        "max_abs_error": sample_max,
-                        "nonfinite": bool(sample_nonfinite),
-                    }
-                )
-
-        get_root_logger().warning(
-            "Per-image outlier %s trigger #%d at candidate iter %d: "
-            "kept=%d/%d, median=%.8g, "
-            "mean_threshold=%.8g, samples=%s",
-            guard_opt.action,
-            self.per_image_outlier_triggers,
-            current_iter,
-            kept,
-            batch_size,
-            batch_median,
-            mean_threshold,
-            sample_details,
-        )
-        return kept, bool(nonfinite_count)
-
-    def _validate_per_image_outlier_exclusion_contract(self) -> None:
-        guard_opt = self.per_image_outlier_guard_opt
-        if guard_opt is None or guard_opt.action != "exclude":
-            return
-        get_root_logger().info(
-            "Finite outlier samples will be removed from every configured loss, "
-            "distillation target, discriminator input, and model auxiliary loss "
-            "across %d accumulation step(s). Non-finite attempts still reject the "
-            "whole accumulated update.",
-            self.accum_iters,
-        )
-
-    @staticmethod
-    def _select_guarded_batch_tensor(
-        tensor: Tensor,
-        keep_mask: Tensor | None,
-        *,
-        name: str,
-    ) -> Tensor:
-        if keep_mask is None:
-            return tensor
-        if tensor.ndim == 0 or tensor.shape[0] != keep_mask.numel():
-            raise ValueError(
-                f"per-image exclusion expected {name} to have batch dimension "
-                f"{keep_mask.numel()}, got shape={tuple(tensor.shape)}"
-            )
-        return tensor[keep_mask]
-
-    def _reset_per_image_outlier_accumulation(self) -> None:
-        self._outlier_guard_accum_kept_samples = 0
-        self._outlier_guard_accum_seen_samples = 0
-        self._outlier_guard_accum_d_kept_samples = 0
-        self._outlier_guard_accum_reference_samples = 0
-
-    def _discard_guarded_accumulation(self) -> None:
+    def _discard_accumulated_gradients(self) -> None:
         if self.optimizer_g is not None:
             self._zero_generator_optimizer(self.optimizer_g)
         if self.optimizer_d is not None:
             self._zero_discriminator_optimizer(self.optimizer_d)
-        self._reset_per_image_outlier_accumulation()
-
-    @staticmethod
-    def _guarded_accumulation_loss_weight(
-        kept_samples: int, accum_iters: int, reference_samples: int
-    ) -> float:
-        return kept_samples / (accum_iters * reference_samples)
-
-    @staticmethod
-    def _guarded_accumulation_gradient_scale(
-        total_kept_samples: int, accum_iters: int, reference_samples: int
-    ) -> float:
-        return accum_iters * reference_samples / total_kept_samples
-
-    @staticmethod
-    def _scale_optimizer_gradients(optimizer: Optimizer, factor: float) -> None:
-        dense_gradients: list[Tensor] = []
-        seen_parameters: set[int] = set()
-        with torch.no_grad():
-            for parameter_group in optimizer.param_groups:
-                for parameter in parameter_group["params"]:
-                    parameter_id = id(parameter)
-                    if parameter_id in seen_parameters or parameter.grad is None:
-                        continue
-                    seen_parameters.add(parameter_id)
-                    if parameter.grad.is_sparse:
-                        parameter.grad.mul_(factor)
-                    else:
-                        dense_gradients.append(parameter.grad)
-            if dense_gradients:
-                torch._foreach_mul_(dense_gradients, factor)
 
     def init_training_settings(self) -> None:
         self.net_g.train()
@@ -499,7 +270,6 @@ class SRModel(BaseModel):
         assert train_opt is not None
 
         logger = get_root_logger()
-        self._initialize_per_image_outlier_guard()
 
         enable_gradscaler = self.use_amp and not self.opt.amp_bf16
 
@@ -671,7 +441,6 @@ class SRModel(BaseModel):
                     self.losses[label] = torch.compile(self.losses[label])
 
         assert self.losses, "At least one loss must be defined."
-        self._validate_per_image_outlier_exclusion_contract()
 
         if not self.has_gan:
             # warn that discriminator network / optimizer won't be used if enabled
@@ -967,15 +736,6 @@ class SRModel(BaseModel):
                 non_blocking=True,
             )
 
-        if self.per_image_outlier_guard_opt is not None:
-            raw_paths: Any = data.get("gt_path", data.get("lq_path"))
-            if isinstance(raw_paths, str):
-                self.batch_sample_paths = [raw_paths]
-            elif isinstance(raw_paths, (list, tuple)):
-                self.batch_sample_paths = [str(path) for path in raw_paths]
-            else:
-                self.batch_sample_paths = None
-
         # moa
         if self.is_train and self.batch_augment and self.gt is not None:
             self.gt, self.lq = self.batch_augment(self.gt, self.lq)
@@ -993,17 +753,8 @@ class SRModel(BaseModel):
         assert isinstance(output, Tensor)
         return output
 
-    def _generator_auxiliary_losses(
-        self, keep_mask: Tensor | None = None
-    ) -> dict[str, Tensor]:
-        """Return already-weighted generator-only auxiliary losses.
-
-        Model-specific implementations must apply ``keep_mask`` to every
-        batch-shaped tensor before reducing a loss. This keeps future internal
-        losses inside the same per-image exclusion contract as configured
-        losses, GAN training, and distillation.
-        """
-        del keep_mask
+    def _generator_auxiliary_losses(self) -> dict[str, Tensor]:
+        """Return already-weighted generator-only auxiliary losses."""
         return {}
 
     @staticmethod
@@ -1190,31 +941,9 @@ class SRModel(BaseModel):
         n_samples = self.gt.shape[0]
         loss_dict: dict[str, Tensor | float] = OrderedDict()
 
-        # ``current_iter`` advances only on the final accumulation microbatch.
-        # Give every microbatch in one effective batch the same candidate id so
-        # a delayed guard start cannot split an accumulation window.
-        candidate_iter = current_iter if apply_gradient else current_iter + 1
-        guard_opt = self.per_image_outlier_guard_opt
-        guard_detector_active = (
-            guard_opt is not None and candidate_iter >= guard_opt.start_iter
-        )
-        guard_exclusion_active = bool(
-            guard_detector_active
-            and guard_opt is not None
-            and guard_opt.action == "exclude"
-        )
-        guard_keep_mask: Tensor | None = None
-        guard_current_kept = n_samples
-        guard_backward_weight = 1.0 / self.accum_iters
-        guard_g_gradient_scale = 1.0
-        loss_gt = self.gt
-        loss_output: Tensor | None = None
-
         lq = rgb2pixelformat_pt(
             self.lq, self.opt.input_pixel_format
         )  # lq: input_pixel_format
-        loss_lq = lq
-        loss_lq_rgb = self.lq
 
         teacher_output_target: Tensor | None = None
         teacher_feature_targets: tuple[Tensor, ...] | None = None
@@ -1299,160 +1028,6 @@ class SRModel(BaseModel):
                 assert isinstance(self.output, Tensor)
                 l_g_total = self.output.sum() * 0.0
 
-                outlier_stats: PerImageOutlierStats | None = None
-                outlier_triggered = False
-                if guard_detector_active:
-                    assert guard_opt is not None
-                    assert self._per_image_outlier_detector is not None
-                    outlier_stats = PerImageOutlierStats(
-                        *self._per_image_outlier_detector(self.output, self.gt)
-                    )
-                    loss_dict["outlier_shadow_bad_fraction"] = (
-                        outlier_stats.outliers.float().mean()
-                    )
-                    loss_dict["outlier_shadow_nonfinite_fraction"] = (
-                        outlier_stats.nonfinite.float().mean()
-                    )
-                    loss_dict["outlier_shadow_peak_charbonnier"] = (
-                        outlier_stats.charbonnier_mean.amax()
-                    )
-                    loss_dict["outlier_shadow_peak_max_abs"] = (
-                        outlier_stats.max_abs_error.amax()
-                    )
-                    loss_dict["outlier_shadow_mean_threshold"] = (
-                        outlier_stats.mean_threshold
-                    )
-
-                    outlier_triggered = bool(outlier_stats.outliers.any().item())
-                    contains_nonfinite = False
-                    if outlier_triggered:
-                        guard_current_kept, contains_nonfinite = (
-                            self._record_per_image_outlier_trigger(
-                                candidate_iter, outlier_stats
-                            )
-                        )
-
-                    # A finite but extreme image can be excluded. A NaN/Inf is
-                    # never trusted: reject and clear the complete accumulated
-                    # update so it cannot leak through another loss or branch.
-                    if contains_nonfinite:
-                        self.nan_count += 1
-                        self.reject_training_step("nonfinite_guard_sample")
-                        for index in range(len(self.optimizers_skipped)):
-                            self.optimizers_skipped[index] = True
-                        self._discard_guarded_accumulation()
-                        get_root_logger().warning(
-                            "NaN/Inf in a guarded sample (count: %d); rejected "
-                            "the complete accumulated candidate iter %d.",
-                            self.nan_count,
-                            candidate_iter,
-                        )
-                        if self.nan_count > 10:
-                            raise RuntimeError(
-                                "Training failed: more than 10 consecutive "
-                                "NaN/Inf attempts were rejected."
-                            )
-                        return
-
-                if guard_exclusion_active:
-                    assert guard_opt is not None
-                    assert outlier_stats is not None
-                    if outlier_triggered:
-                        guard_keep_mask = ~outlier_stats.outliers
-                    else:
-                        guard_current_kept = n_samples
-
-                    if self._outlier_guard_accum_reference_samples == 0:
-                        self._outlier_guard_accum_reference_samples = n_samples
-                    reference_samples = self._outlier_guard_accum_reference_samples
-                    self._outlier_guard_accum_seen_samples += n_samples
-                    self._outlier_guard_accum_kept_samples += guard_current_kept
-                    guard_backward_weight = self._guarded_accumulation_loss_weight(
-                        guard_current_kept,
-                        self.accum_iters,
-                        reference_samples,
-                    )
-
-                    if outlier_triggered:
-                        loss_dict["outlier_guard_excluded_fraction"] = (
-                            outlier_stats.outliers.float().mean()
-                        )
-
-                    if apply_gradient:
-                        required_samples = min(
-                            guard_opt.minimum_kept_samples,
-                            self._outlier_guard_accum_seen_samples,
-                        )
-                        accumulated_kept = self._outlier_guard_accum_kept_samples
-                        if accumulated_kept < required_samples:
-                            self.reject_training_step(
-                                "per_image_outlier_insufficient_survivors"
-                            )
-                            for index in range(len(self.optimizers_skipped)):
-                                self.optimizers_skipped[index] = True
-                            self._discard_guarded_accumulation()
-                            get_root_logger().warning(
-                                "Rejected candidate iter %d because per-image "
-                                "exclusion kept only %d/%d required samples "
-                                "across the accumulated effective batch.",
-                                candidate_iter,
-                                accumulated_kept,
-                                required_samples,
-                            )
-                            return
-                        guard_g_gradient_scale = (
-                            self._guarded_accumulation_gradient_scale(
-                                accumulated_kept,
-                                self.accum_iters,
-                                reference_samples,
-                            )
-                        )
-
-                loss_output = self._select_guarded_batch_tensor(
-                    self.output,
-                    guard_keep_mask,
-                    name="generator output",
-                )
-                loss_gt = self._select_guarded_batch_tensor(
-                    self.gt,
-                    guard_keep_mask,
-                    name="ground truth",
-                )
-                loss_lq = self._select_guarded_batch_tensor(
-                    lq,
-                    guard_keep_mask,
-                    name="pixel-format input",
-                )
-                loss_lq_rgb = self._select_guarded_batch_tensor(
-                    self.lq,
-                    guard_keep_mask,
-                    name="RGB input",
-                )
-                if teacher_output_target is not None:
-                    teacher_output_target = self._select_guarded_batch_tensor(
-                        teacher_output_target,
-                        guard_keep_mask,
-                        name="teacher output",
-                    )
-                if teacher_feature_targets is not None:
-                    teacher_feature_targets = tuple(
-                        self._select_guarded_batch_tensor(
-                            feature,
-                            guard_keep_mask,
-                            name="teacher distillation feature",
-                        )
-                        for feature in teacher_feature_targets
-                    )
-                if student_features is not None:
-                    student_features = tuple(
-                        self._select_guarded_batch_tensor(
-                            feature,
-                            guard_keep_mask,
-                            name="student distillation feature",
-                        )
-                        for feature in student_features
-                    )
-
                 lq_target = None
 
                 # Log entropy if hook captured it
@@ -1464,18 +1039,15 @@ class SRModel(BaseModel):
                         self._feature_entropy, device=self.device
                     )
 
-                can_reduce_losses = not guard_exclusion_active or guard_current_kept > 0
                 for label, loss in self.losses.items():
-                    if not can_reduce_losses:
-                        break
-                    target = loss_gt
+                    target = self.gt
 
                     if loss.loss_weight < 0:
                         if lq_target is None:
                             with torch.inference_mode():
                                 lq_target = torch.clamp(
                                     F.interpolate(
-                                        loss_lq_rgb,
+                                        self.lq,
                                         scale_factor=self.opt.scale,
                                         mode="bicubic",
                                         antialias=True,
@@ -1487,7 +1059,7 @@ class SRModel(BaseModel):
 
                     if label == "l_g_gan":
                         assert self.net_d is not None
-                        fake_g_pred = self.net_d(loss_output)
+                        fake_g_pred = self.net_d(self.output)
                         l_g_loss = loss(fake_g_pred, True, is_disc=False)
 
                         if self.adaptive_d:
@@ -1513,13 +1085,13 @@ class SRModel(BaseModel):
                         )
                         with torch.inference_mode():
                             output_ema = pixelformat2rgb_pt(
-                                self.net_g_ema(loss_lq),
-                                loss_gt,
+                                self.net_g_ema(lq),
+                                self.gt,
                                 self.opt.output_pixel_format,
                             )
-                        l_g_loss = loss(loss_output, output_ema, target)
+                        l_g_loss = loss(self.output, output_ema, target)
                     else:
-                        l_g_loss = loss(loss_output, target)
+                        l_g_loss = loss(self.output, target)
 
                     if isinstance(l_g_loss, dict):
                         for sublabel, loss_val in l_g_loss.items():
@@ -1532,12 +1104,12 @@ class SRModel(BaseModel):
                         l_g_total += weighted_l_g_loss
                         loss_dict[label] = weighted_l_g_loss
 
-                if output_distillation_active and can_reduce_losses:
+                if output_distillation_active:
                     assert self.distillation_opt is not None
                     assert teacher_output_target is not None
                     output_distillation = (
                         self._distillation_distance(
-                            loss_output,
+                            self.output,
                             teacher_output_target,
                             self.distillation_opt.output_loss,
                             self.distillation_opt.epsilon,
@@ -1549,7 +1121,7 @@ class SRModel(BaseModel):
                     loss_dict["l_g_distill_output"] = output_distillation
                     loss_dict["distill_output_scale"] = output_distillation_scale
 
-                if feature_distillation_active and can_reduce_losses:
+                if feature_distillation_active:
                     assert self.distillation_opt is not None
                     assert teacher_feature_targets is not None
                     assert student_features is not None
@@ -1564,18 +1136,15 @@ class SRModel(BaseModel):
                     loss_dict["l_g_distill_features"] = feature_distillation
                     loss_dict["distill_feature_scale"] = feature_distillation_scale
 
-                if can_reduce_losses:
-                    for label, auxiliary_loss in self._generator_auxiliary_losses(
-                        guard_keep_mask
-                    ).items():
-                        if label in loss_dict:
-                            raise RuntimeError(
-                                f"duplicate generator auxiliary loss label: {label}"
-                            )
-                        l_g_total += auxiliary_loss
-                        loss_dict[label] = auxiliary_loss
+                for label, auxiliary_loss in self._generator_auxiliary_losses().items():
+                    if label in loss_dict:
+                        raise RuntimeError(
+                            f"duplicate generator auxiliary loss label: {label}"
+                        )
+                    l_g_total += auxiliary_loss
+                    loss_dict[label] = auxiliary_loss
 
-                backward_g_loss = l_g_total * guard_backward_weight
+                backward_g_loss = l_g_total / self.accum_iters
 
                 loss_is_finite_value = bool(backward_g_loss.isfinite().item())
 
@@ -1588,7 +1157,7 @@ class SRModel(BaseModel):
                     self.reject_training_step("nonfinite_generator_loss")
                     for index in range(len(self.optimizers_skipped)):
                         self.optimizers_skipped[index] = True
-                    self._discard_guarded_accumulation()
+                    self._discard_accumulated_gradients()
                     if self.nan_count > 10:
                         raise RuntimeError(
                             "Training failed: more than 10 consecutive NaN/Inf "
@@ -1610,10 +1179,6 @@ class SRModel(BaseModel):
                         else None
                     )
                     self.scaler_g.unscale_(self.optimizer_g)
-                    if guard_exclusion_active and guard_g_gradient_scale != 1.0:
-                        self._scale_optimizer_gradients(
-                            self.optimizer_g, guard_g_gradient_scale
-                        )
                     grad_norm_g = _get_total_gradient_norm(self.net_g.parameters())
 
                     loss_dict["grad_norm_g"] = grad_norm_g
@@ -1623,7 +1188,7 @@ class SRModel(BaseModel):
                         self.reject_training_step("nonfinite_generator_gradient")
                         for index in range(len(self.optimizers_skipped)):
                             self.optimizers_skipped[index] = True
-                        self._discard_guarded_accumulation()
+                        self._discard_accumulated_gradients()
                         if scaler_state_before is not None:
                             # Clear GradScaler's per-optimizer UNSCALED phase, then
                             # restore its public state so the rejected attempt is
@@ -1670,53 +1235,30 @@ class SRModel(BaseModel):
             assert cri_gan is not None
 
             if not skip_d_update:
-                # optimize net_d. When the current guarded microbatch has no
-                # survivors, retain earlier accumulated gradients and finalize
-                # them at the boundary without invoking a loss on an empty batch.
-                if not guard_exclusion_active or guard_current_kept > 0:
-                    assert loss_output is not None
-                    for p in self.net_d.parameters():
-                        p.requires_grad = True
+                for p in self.net_d.parameters():
+                    p.requires_grad = True
 
-                    with torch.autocast(
-                        device_type=self.device.type,
-                        dtype=self.amp_dtype,
-                        enabled=self.use_amp,
-                    ):
-                        # real
-                        real_d_pred = self.net_d(loss_gt)
-                        l_d_real = cri_gan(real_d_pred, True, is_disc=True)
-                        loss_dict["l_d_real"] = l_d_real
-                        loss_dict["out_d_real"] = torch.mean(real_d_pred.detach())
-                        # fake
-                        fake_d_pred = self.net_d(loss_output.detach())
-                        l_d_fake = cri_gan(fake_d_pred, False, is_disc=True)
-                        loss_dict["l_d_fake"] = l_d_fake
-                        loss_dict["out_d_fake"] = torch.mean(fake_d_pred.detach())
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=self.amp_dtype,
+                    enabled=self.use_amp,
+                ):
+                    # real
+                    real_d_pred = self.net_d(self.gt)
+                    l_d_real = cri_gan(real_d_pred, True, is_disc=True)
+                    loss_dict["l_d_real"] = l_d_real
+                    loss_dict["out_d_real"] = torch.mean(real_d_pred.detach())
+                    # fake
+                    assert self.output is not None
+                    fake_d_pred = self.net_d(self.output.detach())
+                    l_d_fake = cri_gan(fake_d_pred, False, is_disc=True)
+                    loss_dict["l_d_fake"] = l_d_fake
+                    loss_dict["out_d_fake"] = torch.mean(fake_d_pred.detach())
 
-                    if guard_exclusion_active:
-                        self._outlier_guard_accum_d_kept_samples += guard_current_kept
-                    self.scaler_d.scale(
-                        (l_d_real + l_d_fake) * guard_backward_weight
-                    ).backward()
+                self.scaler_d.scale((l_d_real + l_d_fake) / self.accum_iters).backward()
 
-                d_has_accumulated_gradients = (
-                    not guard_exclusion_active
-                    or self._outlier_guard_accum_d_kept_samples > 0
-                )
-                if apply_gradient and d_has_accumulated_gradients:
+                if apply_gradient:
                     self.scaler_d.unscale_(self.optimizer_d)
-                    if guard_exclusion_active:
-                        reference_samples = self._outlier_guard_accum_reference_samples
-                        d_gradient_scale = self._guarded_accumulation_gradient_scale(
-                            self._outlier_guard_accum_d_kept_samples,
-                            self.accum_iters,
-                            reference_samples,
-                        )
-                        if d_gradient_scale != 1.0:
-                            self._scale_optimizer_gradients(
-                                self.optimizer_d, d_gradient_scale
-                            )
                     grad_norm_d = _get_total_gradient_norm(self.net_d.parameters())
 
                     loss_dict["grad_norm_d"] = grad_norm_d
@@ -1737,8 +1279,6 @@ class SRModel(BaseModel):
                     self.optimizers_skipped[self.optimizer_d_index] = (
                         scale_after < scale_before
                     )
-                    self._zero_discriminator_optimizer(self.optimizer_d)
-                elif apply_gradient:
                     self._zero_discriminator_optimizer(self.optimizer_d)
             elif apply_gradient:
                 # A final adaptive-D skip must not leak partial gradients into
@@ -1763,9 +1303,6 @@ class SRModel(BaseModel):
                 # mode. Force one fresh inference preparation before the next
                 # validation sweep, then reuse it for every dataset and image.
                 self._validation_prepared_key = None
-
-        if apply_gradient and guard_exclusion_active:
-            self._reset_per_image_outlier_accumulation()
 
     def infer_tiled(self, net: nn.Module, lq: torch.Tensor) -> torch.Tensor:
         assert self.opt.val is not None

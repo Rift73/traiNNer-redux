@@ -300,59 +300,6 @@ class DistillationOptions(StrictStruct):
     ] = True
 
 
-class PerImageOutlierGuardOptions(StrictStruct):
-    enabled: Annotated[
-        bool,
-        Meta(
-            description="Detect destructive per-image reconstruction outliers. Shadow mode is observational; exclude mode removes finite triggered samples consistently from every loss path."
-        ),
-    ] = False
-    action: Annotated[
-        Literal["shadow", "exclude"],
-        Meta(
-            description="Shadow only reports finite outliers. Exclude removes the same finite outlier samples from configured losses, GAN inputs, distillation, and mask-aware model auxiliary losses; non-finite attempts remain rejected."
-        ),
-    ] = "shadow"
-    start_iter: Annotated[
-        int,
-        Meta(
-            description="First candidate iteration on which to run the per-image detector."
-        ),
-    ] = 0
-    charbonnier_epsilon: Annotated[
-        float,
-        Meta(description="FP32 Charbonnier epsilon used by the shadow detector."),
-    ] = 1e-12
-    mean_absolute_floor: Annotated[
-        float,
-        Meta(
-            description="Absolute lower bound for the per-image mean Charbonnier outlier threshold."
-        ),
-    ] = 0.15
-    median_multiple: Annotated[
-        float,
-        Meta(
-            description="Batch-relative per-image mean threshold, expressed as a multiple of the batch median."
-        ),
-    ] = 8.0
-    max_absolute_error: Annotated[
-        float,
-        Meta(description="Absolute per-pixel error threshold for a shadow outlier."),
-    ] = 4.0
-    minimum_kept_samples: Annotated[
-        int,
-        Meta(
-            description="Minimum survivors required across the complete accumulated effective batch for exclusion mode to accept the candidate update. Shadow mode only reports this value."
-        ),
-    ] = 16
-    log_trigger_paths: Annotated[
-        bool,
-        Meta(
-            description="Log source paths and per-image statistics when a shadow trigger occurs. This synchronizes only on rare triggered batches."
-        ),
-    ] = True
-
-
 class TrainOptions(StrictStruct):
     total_iter: Annotated[
         int, Meta(description="The total number of iterations to train.")
@@ -404,12 +351,6 @@ class TrainOptions(StrictStruct):
     grad_clip_max_norm: Annotated[
         float, Meta(description="Max norm of gradients for gradient clipping.")
     ] = 100.0
-    per_image_outlier_guard: Annotated[
-        PerImageOutlierGuardOptions | None,
-        Meta(
-            description="Low-overhead detector for destructive per-image reconstruction outliers, with observational shadow and finite-sample exclusion modes."
-        ),
-    ] = None
     warmup_iter: Annotated[
         int,
         Meta(

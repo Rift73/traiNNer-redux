@@ -103,11 +103,6 @@ train:
   ema_power: 0.75
   ema_foreach: true
   grad_clip: false
-  per_image_outlier_guard:
-    enabled: true
-    action: exclude
-    start_iter: 10000
-    max_absolute_error: 10.0
 
   optim_g:
     type: AdamW

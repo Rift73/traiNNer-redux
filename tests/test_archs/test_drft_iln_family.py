@@ -1,3 +1,5 @@
+# ruff: noqa: SLF001
+
 from unittest.mock import patch
 
 import torch
@@ -28,6 +30,56 @@ def test_drft_uses_iln_at_every_normalization_site() -> None:
     ) == 6
     assert isinstance(model.norm, drft_arch.AffineTransform)
     assert not any(isinstance(module, nn.LayerNorm) for module in model.modules())
+
+
+def test_iln_caps_only_the_abnormal_training_tail() -> None:
+    layer = drft_arch.ImageLayerNorm(dim=1, eps=0.0)
+    layer.train()
+
+    # Mirror the model pre-hook that initializes the training reference before
+    # the first forward. A raw standard deviation of 3 is capped at 2.
+    layer.update_std_ema()
+    x = torch.tensor([[[-3.0], [-3.0], [3.0], [3.0]]])
+    normalized, scale = layer(x)
+
+    assert torch.equal(normalized, torch.tensor([[[-1.0], [-1.0], [1.0], [1.0]]]))
+    assert torch.equal(scale, torch.tensor([[[2.0]]]))
+    assert torch.equal(layer._last_std_buf, torch.tensor([3.0]))
+
+    # The guarded update rejects the abnormal observation instead of letting it
+    # raise the cap for the following image.
+    layer.update_std_ema()
+    assert torch.equal(layer.std_ema, torch.ones(1))
+
+    normal = torch.tensor([[[-1.5], [-1.5], [1.5], [1.5]]])
+    _, normal_scale = layer(normal)
+    assert torch.equal(normal_scale, torch.tensor([[[1.5]]]))
+
+
+def test_iln_eval_is_raw_and_does_not_mutate_training_state() -> None:
+    layer = drft_arch.ImageLayerNorm(dim=2, eps=1e-4)
+    layer.train()
+    layer.update_std_ema()
+    layer(torch.tensor([[[-1.0, -2.0], [1.0, 2.0]]]))
+
+    ema_before = layer.std_ema.clone()
+    observation_before = layer._last_std_buf.clone()
+    x = torch.tensor([[[-9.0, -3.0], [3.0, 9.0]]])
+
+    layer.eval()
+    output, scale = layer(x)
+    mean = x.mean(dim=(1, 2), keepdim=True)
+    centered = x - mean
+    expected_std = torch.sqrt(
+        (centered * centered).mean(dim=(1, 2), keepdim=True) + layer.eps
+    )
+    expected_output = centered / expected_std * layer.weight + layer.bias
+
+    assert torch.equal(output, expected_output)
+    assert torch.equal(scale, expected_std)
+    assert torch.equal(layer.std_ema, ema_before)
+    assert torch.equal(layer._last_std_buf, observation_before)
+    assert set(layer.state_dict()) == {"weight", "bias"}
 
 
 def test_drft_family_has_balanced_factory_contract() -> None:
@@ -146,7 +198,7 @@ def test_rhag_outer_layerscale_is_opt_in() -> None:
     assert isinstance(unchanged.layers[0].ls_rhag, nn.Identity)
     assert not any("ls_rhag" in key for key in unchanged.state_dict())
     assert unchanged.compile_cache_key_tag.startswith(
-        "drft-iln-family-v13-prefusion-execution-"
+        "drft-iln-family-v18-sdpa-ocab-layout-fusion-train-ema-cap-"
     )
     assert unchanged.compile_cache_key_tag == drft_arch.DRFT(
         **common
@@ -155,7 +207,7 @@ def test_rhag_outer_layerscale_is_opt_in() -> None:
     stabilized = drft_arch.DRFT(**common, rhag_layer_scale_init=1e-4)
     assert isinstance(stabilized.layers[0].ls_rhag, drft_arch.LayerScale)
     assert stabilized.compile_cache_key_tag.startswith(
-        "drft-iln-family-v13-prefusion-execution-"
+        "drft-iln-family-v18-sdpa-ocab-layout-fusion-train-ema-cap-"
     )
     assert stabilized.compile_cache_key_tag != unchanged.compile_cache_key_tag
     assert torch.equal(
