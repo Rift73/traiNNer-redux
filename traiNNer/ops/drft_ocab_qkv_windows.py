@@ -108,11 +108,7 @@ def _ocab_kv_windows_forward_kernel(
     input_y = window_y * window_size + overlap_y - padding
     input_x = window_x * window_size + overlap_x - padding
     valid_input = (
-        valid
-        & (input_y >= 0)
-        & (input_y < height)
-        & (input_x >= 0)
-        & (input_x < width)
+        valid & (input_y >= 0) & (input_y < height) & (input_x >= 0) & (input_x < width)
     )
 
     input_offset = (

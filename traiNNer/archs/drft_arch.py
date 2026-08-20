@@ -176,61 +176,28 @@ def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
 
 
 class ImageLayerNorm(nn.Module):
-    """Paper i-LN with a training-only upper-tail residual-scale cap."""
+    """Paper i-LN with raw FP32 statistics in training and inference."""
 
     def __init__(self, dim: int, eps: float = 1e-4) -> None:
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
         self.bias = nn.Parameter(torch.zeros(dim))
-        # Training-only state: abnormal residual scales are capped relative to
-        # the layer's recent normal range. These buffers intentionally stay out
-        # of checkpoints because eval/export always use raw paper i-LN.
-        self.register_buffer("std_ema", torch.ones(1), persistent=False)
-        self.register_buffer("_last_std_buf", torch.ones(1), persistent=False)
-        self._std_ema_initialized = False
-
-    def update_std_ema(self) -> None:
-        """Update the guarded training reference from the previous forward."""
-        if not self.training:
-            return
-        with torch.no_grad():
-            batch_std = self._last_std_buf
-            if not self._std_ema_initialized:
-                self.std_ema.copy_(batch_std)
-                self._std_ema_initialized = True
-            else:
-                safe_std = torch.where(
-                    batch_std < 2.0 * self.std_ema,
-                    batch_std,
-                    self.std_ema,
-                )
-                self.std_ema.lerp_(safe_std, 1e-3)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        mean = x.mean(dim=(1, 2), keepdim=True)
-        centered = x - mean
+        # AMP inputs still use FP32 accumulation for the image-wide statistics.
+        # Cast the normalized result and raw scale back to the activation dtype
+        # so i-LN does not turn the rest of the mixed-precision trunk into an
+        # FP32 island. Every finite scale is preserved: NaN/Inf deliberately
+        # propagates to the trainer's existing whole-step rejection checks.
+        stats_x = x.float()
+        mean = stats_x.mean(dim=(1, 2), keepdim=True)
+        centered = stats_x - mean
         variance = (centered * centered).mean(dim=(1, 2), keepdim=True)
         std = torch.sqrt(variance + self.eps)
-        normalized = centered / std
-        scale = std
-        if self.training:
-            with torch.no_grad():
-                self._last_std_buf.copy_(std.detach().mean())
-            scale = torch.minimum(std, 2.0 * self.std_ema.detach())
+        normalized = (centered / std).to(dtype=x.dtype)
+        scale = std.to(dtype=x.dtype)
         return normalized * self.weight + self.bias, scale
-
-
-def _update_image_layer_norm_ema(
-    module: nn.Module,
-    _inputs: tuple[object, ...],
-) -> None:
-    """Advance DRFT's i-LN references before each training forward."""
-    if not module.training:
-        return
-    for child in module.modules():
-        if isinstance(child, ImageLayerNorm):
-            child.update_std_ema()
 
 
 class AffineTransform(nn.Module):
@@ -270,10 +237,9 @@ def _scaled_dot_product_attention_export_safe(
 ) -> torch.Tensor:
     """SDPA wrapper with math-attention fallback for ONNX/TensorRT export.
 
-    The fallback path avoids emitting ONNX Attention op by using explicit
-    matmul/softmax/matmul. Matmuls stay in input dtype (BF16 tensor cores)
-    while only softmax is upcast to FP32 for accumulation stability.
-    Pre-softmax clamping prevents exp() overflow in reduced precision.
+    The fallback path avoids emitting an ONNX Attention op by using explicit
+    matmul/softmax/matmul. Matmuls and softmax remain in the attention tensor
+    dtype, so TensorRT mixed-precision export keeps this path in BF16.
     """
     if not use_export_safe_math:
         return F.scaled_dot_product_attention(
@@ -291,12 +257,9 @@ def _scaled_dot_product_attention_export_safe(
         attn = attn * scale
     if attn_mask is not None:
         attn = attn + attn_mask.to(dtype=attn.dtype)
-    # Pre-softmax clamp: prevents exp() overflow in BF16/FP16.
-    # exp(50) ≈ 5.2e21 is safely within BF16 range (max 3.4e38).
-    # Region mask -inf is clamped to -50: exp(-50) ≈ 0 — masking preserved.
-    attn = attn.clamp(-50.0, 50.0)
-    # Only softmax needs FP32 (accumulation over N tokens loses precision in BF16)
-    attn = torch.softmax(attn.float(), dim=-1).to(dtype=v.dtype)
+    # Softmax is numerically stable without clipping finite logits. Keep it in
+    # the attention dtype; clamping would alter the trained attention weights.
+    attn = torch.softmax(attn, dim=-1).to(dtype=v.dtype)
     if dropout_p > 0.0 and training:
         attn = F.dropout(attn, p=dropout_p, training=True)
     # A@V matmul stays in input dtype
@@ -847,7 +810,7 @@ def _get_shared_relative_position_index(
 
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample."""
-    
+
     def __init__(self, drop_prob: float = 0.) -> None:
         super().__init__()
         self.drop_prob = drop_prob
@@ -858,11 +821,11 @@ class DropPath(nn.Module):
 
 def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
     """Partition into windows.
-    
+
     Args:
         x: (B, H, W, C)
         window_size: window size
-        
+
     Returns:
         windows: (num_windows*B, window_size, window_size, C)
     """
@@ -874,13 +837,13 @@ def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
 
 def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int) -> torch.Tensor:
     """Reverse window partition.
-    
+
     Args:
         windows: (num_windows*B, window_size, window_size, C)
         window_size: Window size
         H: Height of image
         W: Width of image
-        
+
     Returns:
         x: (B, H, W, C)
     """
@@ -1545,6 +1508,15 @@ class WindowAttentionRFB(nn.Module):
         if attn_type == 'hybrid':
             self._ws_sq = window_size[0] * window_size[1]
 
+    def _prepare_query_key(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Hook for architecture variants that condition Q/K before SDPA."""
+
+        return query, key
+
     def _forward_with_static_bias(
         self,
         x: torch.Tensor,
@@ -1565,6 +1537,7 @@ class WindowAttentionRFB(nn.Module):
             self.head_dim,
         )
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        query, key = self._prepare_query_key(query, key)
         bias = additive_bias.to(device=query.device, dtype=query.dtype)
         output = _scaled_dot_product_attention_export_safe(
             query,
@@ -1581,348 +1554,6 @@ class WindowAttentionRFB(nn.Module):
         )
         return self.proj_drop(self.proj(output))
 
-    def forward_shifted_boundary_rectangles(
-        self,
-        right_windows: torch.Tensor,
-        bottom_windows: torch.Tensor,
-        corner_windows: torch.Tensor,
-    ) -> torch.Tensor:
-        """Evaluate the exact shifted-boundary blocks with Flash Attention.
-
-        Swin's half-window cyclic shift gives the right edge two vertical
-        regions, the bottom edge two horizontal regions, and the corner four
-        quadrants.  The region mask is therefore block diagonal.  Splitting
-        those diagonal blocks into independent sequences is mathematically
-        identical to masked attention, while allowing the ordinary PyTorch
-        Flash backend to process every sequence without a score modifier.
-
-        Results are returned in ``right, bottom, corner`` window order.
-        """
-        if self.attn_drop_p != 0.0:
-            raise RuntimeError(
-                "shifted rectangle Flash training requires attention dropout=0"
-            )
-
-        window_height, window_width = self.window_size
-        if window_height != window_width or window_height % 2 != 0:
-            raise RuntimeError(
-                "shifted rectangle Flash training requires an even square window"
-            )
-        half = window_height // 2
-        token_count = window_height * window_width
-        channels = self.dim
-        right_count = right_windows.shape[0]
-        bottom_count = bottom_windows.shape[0]
-        corner_count = corner_windows.shape[0]
-        boundary_windows = torch.cat(
-            (right_windows, bottom_windows, corner_windows), dim=0,
-        )
-        boundary_count = boundary_windows.shape[0]
-
-        qkv = self.qkv(boundary_windows).reshape(
-            boundary_count,
-            token_count,
-            3,
-            self.num_heads,
-            self.head_dim,
-        )
-        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-        right_end = right_count
-        bottom_end = right_end + bottom_count
-
-        def vertical_halves(tensor: torch.Tensor) -> torch.Tensor:
-            count = tensor.shape[0]
-            return (
-                tensor.reshape(
-                    count,
-                    self.num_heads,
-                    window_height,
-                    2,
-                    half,
-                    self.head_dim,
-                )
-                .permute(0, 3, 1, 2, 4, 5)
-                .reshape(
-                    count * 2,
-                    self.num_heads,
-                    window_height * half,
-                    self.head_dim,
-                )
-            )
-
-        def horizontal_halves(tensor: torch.Tensor) -> torch.Tensor:
-            count = tensor.shape[0]
-            return (
-                tensor.reshape(
-                    count,
-                    self.num_heads,
-                    2,
-                    half,
-                    window_width,
-                    self.head_dim,
-                )
-                .permute(0, 2, 1, 3, 4, 5)
-                .reshape(
-                    count * 2,
-                    self.num_heads,
-                    half * window_width,
-                    self.head_dim,
-                )
-            )
-
-        def quadrants(tensor: torch.Tensor) -> torch.Tensor:
-            count = tensor.shape[0]
-            return (
-                tensor.reshape(
-                    count,
-                    self.num_heads,
-                    2,
-                    half,
-                    2,
-                    half,
-                    self.head_dim,
-                )
-                .permute(0, 2, 4, 1, 3, 5, 6)
-                .reshape(
-                    count * 4,
-                    self.num_heads,
-                    half * half,
-                    self.head_dim,
-                )
-            )
-
-        query_halves = torch.cat(
-            (
-                vertical_halves(query[:right_end]),
-                horizontal_halves(query[right_end:bottom_end]),
-            ),
-            dim=0,
-        )
-        key_halves = torch.cat(
-            (
-                vertical_halves(key[:right_end]),
-                horizontal_halves(key[right_end:bottom_end]),
-            ),
-            dim=0,
-        )
-        value_halves = torch.cat(
-            (
-                vertical_halves(value[:right_end]),
-                horizontal_halves(value[right_end:bottom_end]),
-            ),
-            dim=0,
-        )
-        query_quadrants = quadrants(query[bottom_end:])
-        key_quadrants = quadrants(key[bottom_end:])
-        value_quadrants = quadrants(value[bottom_end:])
-
-        bias_query, bias_key = self.neural_bias()
-        bias_rank = bias_query.shape[-1]
-
-        def vertical_bias(tensor: torch.Tensor, count: int) -> torch.Tensor:
-            regions = (
-                tensor.reshape(
-                    self.num_heads,
-                    window_height,
-                    2,
-                    half,
-                    bias_rank,
-                )
-                .permute(2, 0, 1, 3, 4)
-                .reshape(
-                    2,
-                    self.num_heads,
-                    window_height * half,
-                    bias_rank,
-                )
-            )
-            return (
-                regions.unsqueeze(0)
-                .expand(count, -1, -1, -1, -1)
-                .reshape(
-                    count * 2,
-                    self.num_heads,
-                    window_height * half,
-                    bias_rank,
-                )
-            )
-
-        def horizontal_bias(tensor: torch.Tensor, count: int) -> torch.Tensor:
-            regions = (
-                tensor.reshape(
-                    self.num_heads,
-                    2,
-                    half,
-                    window_width,
-                    bias_rank,
-                )
-                .permute(1, 0, 2, 3, 4)
-                .reshape(
-                    2,
-                    self.num_heads,
-                    half * window_width,
-                    bias_rank,
-                )
-            )
-            return (
-                regions.unsqueeze(0)
-                .expand(count, -1, -1, -1, -1)
-                .reshape(
-                    count * 2,
-                    self.num_heads,
-                    half * window_width,
-                    bias_rank,
-                )
-            )
-
-        def quadrant_bias(tensor: torch.Tensor, count: int) -> torch.Tensor:
-            regions = (
-                tensor.reshape(
-                    self.num_heads,
-                    2,
-                    half,
-                    2,
-                    half,
-                    bias_rank,
-                )
-                .permute(1, 3, 0, 2, 4, 5)
-                .reshape(
-                    4,
-                    self.num_heads,
-                    half * half,
-                    bias_rank,
-                )
-            )
-            return (
-                regions.unsqueeze(0)
-                .expand(count, -1, -1, -1, -1)
-                .reshape(
-                    count * 4,
-                    self.num_heads,
-                    half * half,
-                    bias_rank,
-                )
-            )
-
-        query_bias_halves = torch.cat(
-            (
-                vertical_bias(bias_query, right_count),
-                horizontal_bias(bias_query, bottom_count),
-            ),
-            dim=0,
-        ).to(dtype=query.dtype)
-        key_bias_halves = torch.cat(
-            (
-                vertical_bias(bias_key, right_count),
-                horizontal_bias(bias_key, bottom_count),
-            ),
-            dim=0,
-        ).to(dtype=key.dtype)
-        query_bias_quadrants = quadrant_bias(
-            bias_query, corner_count,
-        ).to(dtype=query.dtype)
-        key_bias_quadrants = quadrant_bias(
-            bias_key, corner_count,
-        ).to(dtype=key.dtype)
-
-        def flash_with_rank_bias(
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            bq: torch.Tensor,
-            bk: torch.Tensor,
-        ) -> torch.Tensor:
-            q_augmented = torch.cat((q * self.content_scale, bq), dim=-1)
-            k_augmented = torch.cat((k, bk), dim=-1)
-            v_augmented = F.pad(v, (0, self.rank))
-            return _scaled_dot_product_attention_export_safe(
-                q_augmented,
-                k_augmented,
-                v_augmented,
-                attn_mask=None,
-                dropout_p=0.0,
-                scale=1.0,
-                training=self.training,
-                use_export_safe_math=False,
-            )[..., : self.head_dim]
-
-        output_halves = flash_with_rank_bias(
-            query_halves,
-            key_halves,
-            value_halves,
-            query_bias_halves,
-            key_bias_halves,
-        )
-        output_quadrants = flash_with_rank_bias(
-            query_quadrants,
-            key_quadrants,
-            value_quadrants,
-            query_bias_quadrants,
-            key_bias_quadrants,
-        )
-
-        right_output = (
-            output_halves[: right_count * 2]
-            .reshape(
-                right_count,
-                2,
-                self.num_heads,
-                window_height,
-                half,
-                self.head_dim,
-            )
-            .permute(0, 2, 3, 1, 4, 5)
-            .reshape(
-                right_count,
-                self.num_heads,
-                token_count,
-                self.head_dim,
-            )
-        )
-        bottom_output = (
-            output_halves[right_count * 2 :]
-            .reshape(
-                bottom_count,
-                2,
-                self.num_heads,
-                half,
-                window_width,
-                self.head_dim,
-            )
-            .permute(0, 2, 1, 3, 4, 5)
-            .reshape(
-                bottom_count,
-                self.num_heads,
-                token_count,
-                self.head_dim,
-            )
-        )
-        corner_output = (
-            output_quadrants.reshape(
-                corner_count,
-                2,
-                2,
-                self.num_heads,
-                half,
-                half,
-                self.head_dim,
-            )
-            .permute(0, 3, 1, 4, 2, 5, 6)
-            .reshape(
-                corner_count,
-                self.num_heads,
-                token_count,
-                self.head_dim,
-            )
-        )
-        output = torch.cat(
-            (right_output, bottom_output, corner_output), dim=0,
-        )
-        output = output.transpose(1, 2).reshape(
-            boundary_count, token_count, channels,
-        )
-        return self.proj_drop(self.proj(output))
-
     def forward(
         self,
         x: torch.Tensor,
@@ -1934,6 +1565,7 @@ class WindowAttentionRFB(nn.Module):
         qkv = self.qkv(x).reshape(b_windows, n_tokens, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
+        q, k = self._prepare_query_key(q, k)
 
         bq, bk = (
             self.neural_bias() if bias_factors is None else bias_factors
@@ -2443,74 +2075,6 @@ class ACTBlock(nn.Module):
             batch * n_h * n_w, token_count, channels,
         )
 
-    def _forward_shifted_windows_flash_rectangles(
-        self,
-        x_windows: torch.Tensor,
-        batch: int,
-        height: int,
-        width: int,
-    ) -> torch.Tensor:
-        """Use PyTorch Flash on the exact shifted-mask diagonal regions."""
-        if not isinstance(self.attn, WindowAttentionRFB):
-            raise RuntimeError(
-                "shifted rectangle Flash requires full-width window attention"
-            )
-        n_h = height // self.window_size
-        n_w = width // self.window_size
-        interior_h = n_h - 1
-        interior_w = n_w - 1
-        token_count = x_windows.shape[1]
-        channels = x_windows.shape[2]
-        grid = x_windows.reshape(
-            batch, n_h, n_w, token_count, channels,
-        )
-        interior_windows = grid[:, :interior_h, :interior_w].reshape(
-            batch * interior_h * interior_w, token_count, channels,
-        )
-        right_windows = grid[:, :interior_h, interior_w].reshape(
-            batch * interior_h, token_count, channels,
-        )
-        bottom_windows = grid[:, interior_h, :interior_w].reshape(
-            batch * interior_w, token_count, channels,
-        )
-        corner_windows = grid[:, interior_h, interior_w].reshape(
-            batch, token_count, channels,
-        )
-
-        interior_output = self.attn(interior_windows)
-        boundary_output = self.attn.forward_shifted_boundary_rectangles(
-            right_windows,
-            bottom_windows,
-            corner_windows,
-        )
-        if interior_output.dtype != x_windows.dtype:
-            interior_output = interior_output.to(dtype=x_windows.dtype)
-        if boundary_output.dtype != x_windows.dtype:
-            boundary_output = boundary_output.to(dtype=x_windows.dtype)
-
-        right_count = batch * interior_h
-        bottom_count = batch * interior_w
-        right_output = boundary_output[:right_count]
-        bottom_output = boundary_output[right_count : right_count + bottom_count]
-        corner_output = boundary_output[right_count + bottom_count :]
-        interior_grid = interior_output.reshape(
-            batch, interior_h, interior_w, token_count, channels,
-        )
-        right_grid = right_output.reshape(
-            batch, interior_h, 1, token_count, channels,
-        )
-        bottom_grid = bottom_output.reshape(
-            batch, 1, interior_w, token_count, channels,
-        )
-        corner_grid = corner_output.reshape(
-            batch, 1, 1, token_count, channels,
-        )
-        top = torch.cat((interior_grid, right_grid), dim=2)
-        final_row = torch.cat((bottom_grid, corner_grid), dim=2)
-        return torch.cat((top, final_row), dim=1).reshape(
-            batch * n_h * n_w, token_count, channels,
-        )
-
     def forward(
         self,
         x: torch.Tensor,
@@ -2820,7 +2384,16 @@ class OCAB(nn.Module):
                 padding,
             )
         return self.unfold(kv)
-    
+
+    def _prepare_query_key(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Hook for architecture variants that condition Q/K before SDPA."""
+
+        return query, key
+
     def forward(self, x: torch.Tensor, x_size: tuple[int, int]) -> torch.Tensor:
         H, W = x_size
         B, L, C = x.shape
@@ -2900,6 +2473,7 @@ class OCAB(nn.Module):
         q = q_windows.reshape(B_, Nq, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         k = k_windows.reshape(B_, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = v_windows.reshape(B_, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        q, k = self._prepare_query_key(q, k)
 
         use_export_safe_math = self.force_math_attention
         attn_bias = self._relative_position_bias(q.device, q.dtype)
@@ -2971,11 +2545,11 @@ class OCAB(nn.Module):
 
 class PixelAttention(nn.Module):
     """Pixel Attention for enhanced upsampling.
-    
+
     Generates per-pixel attention weights to refine features
     before PixelShuffle.
     """
-    
+
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.pa_conv = nn.Conv2d(dim, dim, 1, 1, 0, bias=True)
@@ -3042,6 +2616,9 @@ class AttentionBlocks(nn.Module):
         )
         self.dense_skip = dense_skip
         self.use_compiled_checkpoint_policy = False
+        self.compiled_checkpoint_context_fn = (
+            _FLASH_QKV_NORM_STATS_SELECTIVE_CHECKPOINT_CONTEXT
+        )
 
         # Build ACT blocks
         self.blocks = nn.ModuleList([
@@ -3100,9 +2677,7 @@ class AttentionBlocks(nn.Module):
     ) -> torch.Tensor:
         checkpoint_options: dict[str, Any] = {"use_reentrant": False}
         if self.use_compiled_checkpoint_policy:
-            checkpoint_options["context_fn"] = (
-                _FLASH_QKV_NORM_STATS_SELECTIVE_CHECKPOINT_CONTEXT
-            )
+            checkpoint_options["context_fn"] = self.compiled_checkpoint_context_fn
         if self.dense_skip:
             # Collect outputs from all blocks
             block_outputs = []
@@ -3245,7 +2820,7 @@ class RHAG(nn.Module):
             channel_squeeze_factor=channel_squeeze_factor,
             iln_eps=iln_eps,
         )
-        
+
         # Residual connection conv
         if resi_connection == '1conv':
             self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
@@ -3283,12 +2858,12 @@ class RHAG(nn.Module):
 
         # Attention blocks
         res = self.residual_group(x, x_size, hybrid_ctx)
-        
+
         # Conv on residual
         res = res.transpose(1, 2).view(-1, self.dim, H, W)
         res = self.conv(res)
         res = res.flatten(2).transpose(1, 2)
-        
+
         # Residual add. Deep variants gate the complete RHAG branch here;
         # shallower variants retain their exact historical x + res behavior.
         x = x + self.ls_rhag(res)
@@ -3301,7 +2876,7 @@ class RHAG(nn.Module):
 
 class PatchEmbed(nn.Module):
     """Image to Patch Embedding (flatten spatial to sequence)."""
-    
+
     def __init__(self, embed_dim: int, norm_layer: Optional[nn.Module] = None) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -3317,7 +2892,7 @@ class PatchEmbed(nn.Module):
 
 class PatchUnEmbed(nn.Module):
     """Patch Unembedding (sequence to spatial)."""
-    
+
     def __init__(self, embed_dim: int) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -3336,14 +2911,14 @@ class PatchUnEmbed(nn.Module):
 
 class Upsample(nn.Module):
     """Multi-scale upsampling with Pixel Attention.
-    
+
     Supports 1x, 2x, 3x, 4x scales.
     """
-    
+
     def __init__(self, scale: int, num_feat: int) -> None:
         super().__init__()
         self.scale = scale
-        
+
         if scale == 1:
             # No upsampling for restoration tasks
             self.up = nn.Identity()
@@ -3409,7 +2984,7 @@ class DRFT(nn.Module):
     # AOTAutograd never lifts those constants into CPU scalar graph inputs.
     compile_specialize_float = True
     compile_cache_key_tag = (
-        "drft-iln-family-v18-sdpa-ocab-layout-fusion-train-ema-cap"
+        "drft-iln-family-v20-sdpa-ocab-layout-fusion-raw-fp32-stats"
     )
 
     # Dynamic DRFT ONNX exports always trace this representative shape. The
@@ -3572,7 +3147,7 @@ class DRFT(nn.Module):
             repr(compile_contract).encode("utf-8")
         ).hexdigest()[:20]
         self.compile_cache_key_tag = (
-            "drft-iln-family-v18-sdpa-ocab-layout-fusion-train-ema-cap-"
+            "drft-iln-family-v20-sdpa-ocab-layout-fusion-raw-fp32-stats-"
             f"{compile_contract_sha}"
         )
 
@@ -3605,31 +3180,31 @@ class DRFT(nn.Module):
         self._onnx_deployment_feature_shape: tuple[int, int] | None = None
         self._onnx_deployment_dynamic_spatial = False
         self.onnx_deployment_inventory: dict[str, Any] = {}
-        
+
         # Image mean for normalization (RGB mean from ImageNet)
         if in_chans == 3:
             rgb_mean = (0.4488, 0.4371, 0.4040)
             self.register_buffer('mean', torch.tensor(rgb_mean).view(1, 3, 1, 1))
         else:
             self.register_buffer('mean', torch.zeros(1, in_chans, 1, 1))
-        
+
         num_in_ch = in_chans
         num_out_ch = in_chans
-        
+
         # Shallow feature extraction
         self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
-        
+
         # Patch embed/unembed without an additional normalization layer.
         self.patch_embed = PatchEmbed(embed_dim, norm_layer=None)
         self.patch_unembed = PatchUnEmbed(embed_dim)
-        
+
         # Input resolution for position encoding
         patches_resolution = (img_size, img_size)
-        
+
         # Build RHAGs
         self.num_layers = len(depths)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
-        
+
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             layer = RHAG(
@@ -3664,10 +3239,10 @@ class DRFT(nn.Module):
             self.layers.append(layer)
 
         self.norm = AffineTransform(embed_dim)
-        
+
         # Feature fusion before upsampling
         self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
-        
+
         # Reconstruction. The direct head keeps all convolution at LR and
         # performs a single terminal PixelShuffle, which is preferable for
         # latency-constrained variants.
@@ -3691,7 +3266,7 @@ class DRFT(nn.Module):
                 nn.PixelShuffle(upscale),
             )
             self.conv_last = nn.Identity()
-        
+
         # Initialize weights
         self.apply(self._init_weights)
 
@@ -3706,8 +3281,6 @@ class DRFT(nn.Module):
             self._dense_mask_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
         elif attn_type == 'hybrid':
             self._block_mask_cache: OrderedDict[tuple, object] = OrderedDict()
-
-        self.register_forward_pre_hook(_update_image_layer_norm_ema)
 
     def _compute_region_ids(self, H: int, W: int, device: torch.device) -> torch.Tensor:
         """Compute Swin-style region IDs for shifted window masking.
@@ -4825,15 +4398,18 @@ def drft_light(
     attn_type: ATTN_TYPE = 'masked',
     rank: int = 32,
     iln_eps: float = 1e-4,
+    embed_dim: int = 96,
+    groups: int = 2,
+    full_heads: int = 3,
     **kwargs
 ) -> DRFT:
-    """C96, two RHAGs, and three full-width heads in every local block."""
+    """DRFT-Light, canonically C96/G2 with three full-width heads."""
     return _build_drft(
         scale=scale,
-        embed_dim=96,
-        groups=2,
+        embed_dim=embed_dim,
+        groups=groups,
         depth=6,
-        full_heads=3,
+        full_heads=full_heads,
         use_checkpoint=use_checkpoint,
         window_size=window_size,
         overlap_window_size=overlap_window_size,

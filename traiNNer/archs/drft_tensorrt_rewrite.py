@@ -185,6 +185,16 @@ def _bf16_scalar(tensor: onnx.TensorProto) -> float:
     return struct.unpack("<f", bits.to_bytes(4, "little"))[0]
 
 
+def _float_scalar(tensor: onnx.TensorProto) -> float:
+    if tensor.data_type != TensorProto.FLOAT or list(tensor.dims) not in ([], [1]):
+        raise RuntimeError("Expected one FP32 scalar")
+    if len(tensor.raw_data) == 4:
+        return struct.unpack("<f", tensor.raw_data)[0]
+    if len(tensor.float_data) == 1:
+        return float(tensor.float_data[0])
+    raise RuntimeError("Expected one raw or float_data FP32 scalar")
+
+
 def fuse_image_layer_norm(
     model: onnx.ModelProto,
     *,
@@ -434,6 +444,270 @@ def fuse_image_layer_norm(
     return reports
 
 
+def fuse_next_image_layer_norm_plugin(
+    model: onnx.ModelProto,
+) -> list[dict[str, object]]:
+    """Fuse DRFT-Next's FP32-statistics NCHW ImageLayerNorm chain.
+
+    The legacy DRFT plugin consumes token-major BLC tensors and deliberately
+    reproduces BF16-rounded intermediate statistics. DRFT-Next instead casts
+    NCHW input to FP32, computes image-wide mean and centered variance in FP32,
+    then casts only the normalized tensor and standard deviation back to BF16.
+    A distinct operator name keeps those incompatible contracts ABI-safe.
+    """
+    plugin_op = "DrftImageLayerNormNCHW_TRT"
+    graph = model.graph
+    nodes = list(graph.node)
+    initializers = {tensor.name: tensor for tensor in graph.initializer}
+    producers = {output: node for node in nodes for output in node.output}
+    by_name = {node.name: (index, node) for index, node in enumerate(nodes)}
+    consumers: dict[str, list[onnx.NodeProto]] = {}
+    for node in nodes:
+        for name in node.input:
+            consumers.setdefault(name, []).append(node)
+
+    suffixes = (
+        "Cast",
+        "ReduceMean",
+        "Sub",
+        "Mul",
+        "ReduceMean_1",
+        "Constant",
+        "Add",
+        "Sqrt",
+        "Div",
+        "Cast_1",
+        "Mul_1",
+        "Add_1",
+        "Cast_2",
+    )
+    expected_types = {
+        "Cast": "Cast",
+        "ReduceMean": "ReduceMean",
+        "Sub": "Sub",
+        "Mul": "Mul",
+        "ReduceMean_1": "ReduceMean",
+        "Constant": "Constant",
+        "Add": "Add",
+        "Sqrt": "Sqrt",
+        "Div": "Div",
+        "Cast_1": "Cast",
+        "Mul_1": "Mul",
+        "Add_1": "Add",
+        "Cast_2": "Cast",
+    }
+    removed_nodes: set[int] = set()
+    replacements: dict[int, list[onnx.NodeProto]] = {}
+    reports: list[dict[str, object]] = []
+
+    def resolve_initializer(name: str) -> onnx.TensorProto | None:
+        seen: set[str] = set()
+        while name not in seen:
+            seen.add(name)
+            initializer = initializers.get(name)
+            if initializer is not None:
+                return initializer
+            producer = producers.get(name)
+            if (
+                producer is None
+                or producer.op_type != "Identity"
+                or len(producer.input) != 1
+            ):
+                return None
+            name = producer.input[0]
+        return None
+
+    def cast_target(node: onnx.NodeProto) -> int | None:
+        return next(
+            (attribute.i for attribute in node.attribute if attribute.name == "to"),
+            None,
+        )
+
+    for reduce_mean in nodes:
+        if reduce_mean.op_type != "ReduceMean" or not reduce_mean.name.endswith(
+            "/ReduceMean"
+        ):
+            continue
+        prefix = reduce_mean.name.removesuffix("/ReduceMean")
+        if "norm" not in prefix.rsplit("/", 1)[-1].lower():
+            continue
+        axes = next(
+            (
+                list(attribute.ints)
+                for attribute in reduce_mean.attribute
+                if attribute.name == "axes"
+            ),
+            None,
+        )
+        if axes != [1, 2, 3]:
+            continue
+
+        chain: dict[str, tuple[int, onnx.NodeProto]] = {}
+        for suffix in suffixes:
+            item = by_name.get(f"{prefix}/{suffix}")
+            if item is None:
+                raise RuntimeError(
+                    f"Incomplete DRFT-Next i-LN chain at {prefix}: missing {suffix}"
+                )
+            chain[suffix] = item
+        for suffix, expected_type in expected_types.items():
+            if chain[suffix][1].op_type != expected_type:
+                raise RuntimeError(
+                    f"Unexpected {prefix}/{suffix} type: "
+                    f"{chain[suffix][1].op_type}"
+                )
+
+        statistics_cast = chain["Cast"][1]
+        sub = chain["Sub"][1]
+        square = chain["Mul"][1]
+        variance = chain["ReduceMean_1"][1]
+        constant = chain["Constant"][1]
+        add_epsilon = chain["Add"][1]
+        sqrt = chain["Sqrt"][1]
+        divide = chain["Div"][1]
+        normalized_cast = chain["Cast_1"][1]
+        affine_mul = chain["Mul_1"][1]
+        affine_add = chain["Add_1"][1]
+        std_cast = chain["Cast_2"][1]
+        if (
+            cast_target(statistics_cast) != TensorProto.FLOAT
+            or cast_target(normalized_cast) != TensorProto.BFLOAT16
+            or cast_target(std_cast) != TensorProto.BFLOAT16
+        ):
+            raise RuntimeError(f"Unexpected DRFT-Next i-LN cast types at {prefix}")
+
+        tensor_attributes = [
+            attribute.t
+            for attribute in constant.attribute
+            if attribute.type == onnx.AttributeProto.TENSOR
+        ]
+        if len(tensor_attributes) != 1:
+            raise RuntimeError(f"i-LN epsilon must be one tensor constant: {prefix}")
+        epsilon = _float_scalar(tensor_attributes[0])
+        if abs(epsilon - 1.0e-4) > 1.0e-8:
+            raise RuntimeError(f"Unexpected i-LN epsilon {epsilon} at {prefix}")
+
+        input_name = statistics_cast.input[0]
+        if (
+            list(reduce_mean.input) != [statistics_cast.output[0]]
+            or list(sub.input)
+            != [statistics_cast.output[0], reduce_mean.output[0]]
+            or list(square.input) != [sub.output[0], sub.output[0]]
+            or list(variance.input) != [square.output[0]]
+            or variance.output[0] not in add_epsilon.input
+            or constant.output[0] not in add_epsilon.input
+            or list(sqrt.input) != [add_epsilon.output[0]]
+            or list(divide.input) != [sub.output[0], sqrt.output[0]]
+            or list(normalized_cast.input) != [divide.output[0]]
+            or normalized_cast.output[0] not in affine_mul.input
+            or affine_mul.output[0] not in affine_add.input
+            or list(std_cast.input) != [sqrt.output[0]]
+        ):
+            raise RuntimeError(f"Unexpected DRFT-Next i-LN data flow at {prefix}")
+
+        weight_name = next(
+            name for name in affine_mul.input if name != normalized_cast.output[0]
+        )
+        bias_name = next(
+            name for name in affine_add.input if name != affine_mul.output[0]
+        )
+        weight = resolve_initializer(weight_name)
+        bias = resolve_initializer(bias_name)
+        if (
+            weight is None
+            or bias is None
+            or list(weight.dims[:1]) != [1]
+            or len(weight.dims) != 4
+            or int(weight.dims[2]) != 1
+            or int(weight.dims[3]) != 1
+            or list(bias.dims) != list(weight.dims)
+            or weight.data_type != TensorProto.BFLOAT16
+            or bias.data_type != TensorProto.BFLOAT16
+        ):
+            raise RuntimeError(
+                f"i-LN affine parameters are not matching BF16 NCHW tensors at {prefix}"
+            )
+        channels = int(weight.dims[1])
+
+        internal_outputs = {
+            statistics_cast.output[0],
+            reduce_mean.output[0],
+            sub.output[0],
+            square.output[0],
+            variance.output[0],
+            constant.output[0],
+            add_epsilon.output[0],
+            sqrt.output[0],
+            divide.output[0],
+            normalized_cast.output[0],
+            affine_mul.output[0],
+        }
+        chain_names = {item[1].name for item in chain.values()}
+        for output_name in internal_outputs:
+            external_users = [
+                user.name
+                for user in consumers.get(output_name, [])
+                if user.name not in chain_names
+            ]
+            if external_users:
+                raise RuntimeError(
+                    f"Internal i-LN tensor {output_name} has external users "
+                    f"{external_users}"
+                )
+
+        plugin = helper.make_node(
+            plugin_op,
+            [input_name, weight_name, bias_name],
+            [affine_add.output[0], std_cast.output[0]],
+            name=f"{prefix}/DrftImageLayerNormNCHW",
+            plugin_version="1",
+            plugin_namespace="",
+            channels=channels,
+            epsilon=float(epsilon),
+        )
+        replacements[chain["Cast"][0]] = [plugin]
+        removed_nodes.update(item[0] for item in chain.values())
+        reports.append(
+            {
+                "prefix": prefix,
+                "input": input_name,
+                "output": affine_add.output[0],
+                "std_output": std_cast.output[0],
+                "weight": weight_name,
+                "bias": bias_name,
+                "channels": channels,
+                "epsilon": epsilon,
+                "statistics_dtype": "FP32",
+                "layout": "NCHW",
+                "implementation": plugin_op,
+            }
+        )
+
+    if not reports:
+        raise RuntimeError("No DRFT-Next NCHW ImageLayerNorm pattern was found")
+    del graph.node[:]
+    for node_index, node in enumerate(nodes):
+        graph.node.extend(replacements.get(node_index, []))
+        if node_index not in removed_nodes:
+            graph.node.append(node)
+    plugin_count = sum(node.op_type == plugin_op for node in graph.node)
+    if plugin_count != len(reports):
+        raise RuntimeError(
+            f"Expected {len(reports)} live NCHW i-LN plugins, found {plugin_count}"
+        )
+
+    metadata = {entry.key: entry.value for entry in model.metadata_props}
+    metadata["drft.tensorrt_lossless_image_layer_norm"] = (
+        "drft_next_fp32_statistics_nchw_plugin_v1"
+    )
+    del model.metadata_props[:]
+    for key, value in sorted(metadata.items()):
+        entry = model.metadata_props.add()
+        entry.key = key
+        entry.value = value
+    return reports
+
+
 def _eliminate_dead_nodes(model: onnx.ModelProto) -> dict[str, int]:
     """Keep only nodes reachable from graph outputs.
 
@@ -485,6 +759,356 @@ def _eliminate_dead_nodes(model: onnx.ModelProto) -> dict[str, int]:
         "nodes_removed": len(nodes) - len(live_nodes),
         "initializers_removed": len(initializers) - len(graph.initializer),
     }
+
+
+def fuse_next_ocab_qkv_reflect_pack(
+    model: onnx.ModelProto,
+    *,
+    channels: int,
+    heads: int,
+    query_window: int,
+    key_window: int,
+) -> list[dict[str, object]]:
+    """Fuse DRFT-Next's reflection pad, unfold, and Q/K/V window layouts.
+
+    The plugin is arithmetic-free: it reads the projected ``[B,H,W,3,C]``
+    tensor with reflection coordinates and writes token-major Q/K/V. Three
+    metadata-only transposes restore the layouts expected by QK-RoPE and MHA.
+    """
+
+    if (
+        channels <= 0
+        or heads <= 0
+        or channels % heads != 0
+        or channels // heads != 32
+        or channels % 8 != 0
+        or query_window <= 0
+        or key_window < query_window
+        or (key_window - query_window) % 2 != 0
+    ):
+        raise ValueError("Invalid DRFT-Next reflected OCAB packing dimensions")
+
+    graph = model.graph
+    nodes = list(graph.node)
+    by_name = {node.name: (index, node) for index, node in enumerate(nodes)}
+    produced = {output for node in nodes for output in node.output}
+    insertions: dict[int, list[onnx.NodeProto]] = {}
+    reports: list[dict[str, object]] = []
+
+    for group_index in range(64):
+        prefix = f"/layers.{group_index}/residual_group/ocab/"
+        boundary_item = by_name.get(f"{prefix}Reshape_1")
+        if boundary_item is None:
+            continue
+        boundary_index, boundary = boundary_item
+        if boundary.op_type != "Reshape" or len(boundary.output) != 1:
+            raise RuntimeError(f"Unexpected DRFT-Next OCAB boundary at {prefix}")
+
+        old_query = f"{prefix}Transpose_5_output_0"
+        old_key = f"{prefix}Transpose_6_output_0"
+        old_value = f"{prefix}Transpose_7_output_0"
+        if not all(name in produced for name in (old_query, old_key, old_value)):
+            raise RuntimeError(f"Incomplete DRFT-Next OCAB packing at {prefix}")
+
+        raw_query = f"{prefix}DrftNextOCABReflectPack_query_token_major"
+        raw_key = f"{prefix}DrftNextOCABReflectPack_key_token_major"
+        raw_value = f"{prefix}DrftNextOCABReflectPack_value_token_major"
+        query_output = f"{prefix}DrftNextOCABReflectPack_query"
+        key_output = f"{prefix}DrftNextOCABReflectPack_key"
+        value_output = f"{prefix}DrftNextOCABReflectPack_value"
+        plugin = helper.make_node(
+            "DrftNextOCABQKVPackReflectTokenMajor_TRT",
+            [boundary.output[0]],
+            [raw_query, raw_key, raw_value],
+            name=f"{prefix}DrftNextOCABQKVPackReflect",
+            plugin_version="1",
+            plugin_namespace="",
+            channels=channels,
+            heads=heads,
+            query_window_size=query_window,
+            key_window_size=key_window,
+        )
+        layouts = [
+            helper.make_node(
+                "Transpose",
+                [raw_query],
+                [query_output],
+                name=f"{prefix}DrftNextOCABReflectPack_query_layout",
+                perm=[1, 2, 0, 3],
+            ),
+            helper.make_node(
+                "Transpose",
+                [raw_key],
+                [key_output],
+                name=f"{prefix}DrftNextOCABReflectPack_key_layout",
+                perm=[1, 2, 0, 3],
+            ),
+            helper.make_node(
+                "Transpose",
+                [raw_value],
+                [value_output],
+                name=f"{prefix}DrftNextOCABReflectPack_value_layout",
+                perm=[1, 2, 0, 3],
+            ),
+        ]
+        insertions.setdefault(boundary_index + 1, []).extend([plugin, *layouts])
+
+        replacements = {
+            old_query: query_output,
+            old_key: key_output,
+            old_value: value_output,
+        }
+        for node in nodes:
+            for input_index, name in enumerate(node.input):
+                replacement = replacements.get(name)
+                if replacement is not None:
+                    node.input[input_index] = replacement
+        reports.append(
+            {
+                "group": group_index,
+                "boundary": boundary.output[0],
+                "channels": channels,
+                "heads": heads,
+                "head_dim": channels // heads,
+                "query_window": query_window,
+                "key_window": key_window,
+                "padding": "reflect",
+                "arithmetic": "none",
+                "token_major": True,
+            }
+        )
+
+    if not reports:
+        raise RuntimeError("No DRFT-Next reflected OCAB packing pattern was found")
+
+    del graph.node[:]
+    for node_index, node in enumerate(nodes):
+        graph.node.extend(insertions.get(node_index, []))
+        graph.node.append(node)
+    graph.node.extend(insertions.get(len(nodes), []))
+    dead_code = _eliminate_dead_nodes(model)
+    for report in reports:
+        report["dead_code_elimination"] = dead_code
+
+    plugin_count = sum(
+        node.op_type == "DrftNextOCABQKVPackReflectTokenMajor_TRT"
+        for node in graph.node
+    )
+    if plugin_count != len(reports):
+        raise RuntimeError(
+            f"Expected {len(reports)} reflected OCAB plugins, found {plugin_count}"
+        )
+
+    metadata = {entry.key: entry.value for entry in model.metadata_props}
+    metadata["drft.next.tensorrt_ocab_reflect_pack"] = (
+        "direct_bf16_reflect_window_pack_token_major_v1"
+    )
+    del model.metadata_props[:]
+    for key, value in sorted(metadata.items()):
+        entry = model.metadata_props.add()
+        entry.key = key
+        entry.value = value
+    return reports
+
+
+def fuse_next_qk_rmsnorm_rope(
+    model: onnx.ModelProto,
+    *,
+    epsilon: float = 1.0e-6,
+) -> list[dict[str, object]]:
+    """Fuse FP32 QK-RMSNorm, BF16 mixed RoPE, and query temperature.
+
+    TensorRT retains native QK/softmax/PV attention. The plugin consumes the
+    raw rank-4 Q/K tensors plus frozen BF16 cosines, sines, and head scales.
+    """
+
+    if epsilon <= 0.0:
+        raise ValueError(f"epsilon must be positive, got {epsilon}")
+
+    graph = model.graph
+    nodes = list(graph.node)
+    initializers = {tensor.name: tensor for tensor in graph.initializer}
+    producers = {
+        output: node
+        for node in nodes
+        for output in node.output
+    }
+    node_indices = {id(node): index for index, node in enumerate(nodes)}
+    by_name = {node.name: node for node in nodes}
+
+    def producer(tensor_name: str, expected: str | None = None) -> onnx.NodeProto:
+        node = producers.get(tensor_name)
+        if node is None or (expected is not None and node.op_type != expected):
+            actual = None if node is None else node.op_type
+            raise RuntimeError(
+                f"Expected {expected} producer for {tensor_name}, got {actual}"
+            )
+        return node
+
+    def is_constant(tensor_name: str) -> bool:
+        node = producers.get(tensor_name)
+        return tensor_name in initializers or (
+            node is not None and node.op_type == "Constant"
+        )
+
+    def constant_input(node: onnx.NodeProto) -> str:
+        constants = [name for name in node.input if is_constant(name)]
+        if len(constants) != 1:
+            raise RuntimeError(
+                f"Expected one constant input for {node.name}, got {constants}"
+            )
+        return constants[0]
+
+    def constant_fingerprint(tensor_name: str) -> bytes:
+        tensor = initializers.get(tensor_name)
+        if tensor is not None:
+            return tensor.SerializeToString()
+        node = producer(tensor_name, "Constant")
+        values = [attribute.t for attribute in node.attribute if attribute.name == "value"]
+        if len(values) != 1:
+            raise RuntimeError(f"Constant {node.name} has no tensor value")
+        return values[0].SerializeToString()
+
+    def raw_input_from_reduce(reduce_node: onnx.NodeProto) -> str:
+        square = producer(reduce_node.input[0], "Mul")
+        if len(square.input) != 2 or square.input[0] != square.input[1]:
+            raise RuntimeError(f"Unexpected QK square at {square.name}")
+        cast = producer(square.input[0], "Cast")
+        if len(cast.input) != 1:
+            raise RuntimeError(f"Unexpected QK FP32 cast at {cast.name}")
+        return cast.input[0]
+
+    def rotary_constants(rotated_tensor: str) -> tuple[str, str]:
+        reshape = producer(rotated_tensor, "Reshape")
+        concat = producer(reshape.input[0], "Concat")
+        if len(concat.input) != 2:
+            raise RuntimeError(f"Unexpected rotary concat at {concat.name}")
+        real_unsqueeze = producer(concat.input[0], "Unsqueeze")
+        imaginary_unsqueeze = producer(concat.input[1], "Unsqueeze")
+        real_rotation = producer(real_unsqueeze.input[0], "Sub")
+        imaginary_rotation = producer(imaginary_unsqueeze.input[0], "Add")
+        real_cos_mul = producer(real_rotation.input[0], "Mul")
+        real_sin_mul = producer(real_rotation.input[1], "Mul")
+        imaginary_sin_mul = producer(imaginary_rotation.input[0], "Mul")
+        imaginary_cos_mul = producer(imaginary_rotation.input[1], "Mul")
+        cosine = constant_input(real_cos_mul)
+        sine = constant_input(real_sin_mul)
+        if constant_fingerprint(cosine) != constant_fingerprint(
+            constant_input(imaginary_cos_mul)
+        ):
+            raise RuntimeError(f"Rotary cosine mismatch at {concat.name}")
+        if constant_fingerprint(sine) != constant_fingerprint(
+            constant_input(imaginary_sin_mul)
+        ):
+            raise RuntimeError(f"Rotary sine mismatch at {concat.name}")
+        return cosine, sine
+
+    q_reductions = [
+        node
+        for node in nodes
+        if node.op_type == "ReduceMean"
+        and node.name.endswith("/ReduceMean")
+        and (
+            "/attn/" in node.name
+            or "/attn_" in node.name
+            or "/ocab/" in node.name
+        )
+    ]
+    insertions: dict[int, list[onnx.NodeProto]] = {}
+    reports: list[dict[str, object]] = []
+    for q_reduce in q_reductions:
+        prefix = q_reduce.name[: -len("ReduceMean")]
+        k_reduce = by_name.get(f"{prefix}ReduceMean_1")
+        score = by_name.get(f"{prefix}MatMul")
+        if k_reduce is None or score is None or score.op_type != "MatMul":
+            raise RuntimeError(f"Incomplete QK attention pattern at {prefix}")
+        raw_query = raw_input_from_reduce(q_reduce)
+        raw_key = raw_input_from_reduce(k_reduce)
+
+        query_final = score.input[0]
+        query_scale_mul = producer(query_final, "Mul")
+        query_scale = constant_input(query_scale_mul)
+        query_rotated_inputs = [
+            name for name in query_scale_mul.input if name != query_scale
+        ]
+        if len(query_rotated_inputs) != 1:
+            raise RuntimeError(f"Unexpected query temperature at {prefix}")
+        query_rotated = query_rotated_inputs[0]
+
+        key_transpose = producer(score.input[1], "Transpose")
+        if len(key_transpose.input) != 1:
+            raise RuntimeError(f"Unexpected key transpose at {prefix}")
+        key_rotated = key_transpose.input[0]
+        query_cosine, query_sine = rotary_constants(query_rotated)
+        key_cosine, key_sine = rotary_constants(key_rotated)
+
+        query_output = f"{prefix}DrftNextQKRoPE_query"
+        key_output = f"{prefix}DrftNextQKRoPE_key"
+        plugin = helper.make_node(
+            "DrftNextQKRoPE_TRT",
+            [
+                raw_query,
+                raw_key,
+                query_cosine,
+                query_sine,
+                key_cosine,
+                key_sine,
+                query_scale,
+            ],
+            [query_output, key_output],
+            name=f"{prefix}DrftNextQKRoPE",
+            plugin_version="1",
+            plugin_namespace="",
+            epsilon=float(epsilon),
+        )
+        score.input[0] = query_output
+        key_transpose.input[0] = key_output
+        insertions.setdefault(node_indices[id(score)], []).append(plugin)
+        reports.append(
+            {
+                "scope": prefix.rstrip("/"),
+                "raw_query": raw_query,
+                "raw_key": raw_key,
+                "query_cosine": query_cosine,
+                "query_sine": query_sine,
+                "key_cosine": key_cosine,
+                "key_sine": key_sine,
+                "query_scale": query_scale,
+                "epsilon": epsilon,
+                "head_dim": 32,
+            }
+        )
+
+    if not reports:
+        raise RuntimeError("No DRFT-Next QK-RMSNorm/RoPE patterns were found")
+
+    del graph.node[:]
+    for node_index, node in enumerate(nodes):
+        graph.node.extend(insertions.get(node_index, []))
+        graph.node.append(node)
+    graph.node.extend(insertions.get(len(nodes), []))
+    dead_code = _eliminate_dead_nodes(model)
+    for report in reports:
+        report["dead_code_elimination"] = dead_code
+
+    plugin_count = sum(
+        node.op_type == "DrftNextQKRoPE_TRT" for node in graph.node
+    )
+    if plugin_count != len(reports):
+        raise RuntimeError(
+            f"Expected {len(reports)} QK-RoPE plugins, found {plugin_count}"
+        )
+
+    metadata = {entry.key: entry.value for entry in model.metadata_props}
+    metadata["drft.next.tensorrt_qk_rope"] = (
+        "fp32_rms_bf16_step_rounded_rope_warp32_v1"
+    )
+    del model.metadata_props[:]
+    for key, value in sorted(metadata.items()):
+        entry = model.metadata_props.add()
+        entry.key = key
+        entry.value = value
+    return reports
 
 
 def fuse_ocab_qkv_pack(
@@ -1007,6 +1631,9 @@ def main() -> None:
             "image_layer_norm_plugin",
             "image_layer_norm_fast_plugin",
             "image_layer_norm_cooperative_plugin",
+            "next_image_layer_norm_plugin",
+            "next_ocab_reflect_pack_plugin",
+            "next_qk_rope_plugin",
             "ocab_qkv_pack",
             "ocab_qkv_pack_token_major",
             "ffn_swiglu_depthwise_plugin",
@@ -1051,6 +1678,33 @@ def main() -> None:
         )
         mode = "drft_image_layer_norm_fast_plugin_v1"
         identity = "affine((x - mean(x)) / sqrt(mean((x - mean(x))^2) + eps))"
+    elif args.mode == "next_image_layer_norm_plugin":
+        reports = fuse_next_image_layer_norm_plugin(model)
+        mode = "drft_next_fp32_statistics_nchw_plugin_v1"
+        identity = (
+            "BF16 affine(FP32 (x - mean(x)) / "
+            "sqrt(mean((x - mean(x))^2) + eps)) over NCHW"
+        )
+    elif args.mode == "next_ocab_reflect_pack_plugin":
+        reports = fuse_next_ocab_qkv_reflect_pack(
+            model,
+            channels=args.channels,
+            heads=args.heads,
+            query_window=args.query_window,
+            key_window=args.key_window,
+        )
+        mode = "drft_next_ocab_reflect_pack_token_major_plugin_v1"
+        identity = (
+            "BF16 element-preserving Q/K/V window gather with exact reflect "
+            "coordinates and metadata-only attention layout transposes"
+        )
+    elif args.mode == "next_qk_rope_plugin":
+        reports = fuse_next_qk_rmsnorm_rope(model)
+        mode = "drft_next_qk_rmsnorm_rope_plugin_v1"
+        identity = (
+            "FP32 QK RMS statistics with BF16-rounded normalization, mixed "
+            "RoPE operations, and query temperature"
+        )
     elif args.mode == "ocab_qkv_pack":
         reports = fuse_ocab_qkv_pack(
             model,
