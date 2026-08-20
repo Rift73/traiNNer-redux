@@ -1010,6 +1010,33 @@ class RankFactoredNeuralBias(nn.Module):
     def clear_cache(self) -> None:
         self._cached_factors = None
 
+    def factors_for(
+        self,
+        reference: torch.Tensor,
+        factors: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return factors on the same device and in the same dtype as ``reference``.
+
+        Eval factors are cached outside the module's registered buffers. A later
+        ``model.half()``, ``model.float()``, or device move therefore does not
+        transform that cache. Refresh stale eval factors from the converted
+        parameters, then retain a final cast for autocast and caller-supplied
+        training factors.
+        """
+        resolved = self() if factors is None else factors
+        if not self.training and any(
+            factor.device != reference.device or factor.dtype != reference.dtype
+            for factor in resolved
+        ):
+            self.clear_cache()
+            resolved = self()
+        bq, bk = resolved
+        if bq.device != reference.device or bq.dtype != reference.dtype:
+            bq = bq.to(device=reference.device, dtype=reference.dtype)
+        if bk.device != reference.device or bk.dtype != reference.dtype:
+            bk = bk.to(device=reference.device, dtype=reference.dtype)
+        return bq, bk
+
     def train(self, mode: bool = True) -> "RankFactoredNeuralBias":
         self.clear_cache()
         return super().train(mode)
@@ -1035,6 +1062,17 @@ class _StaticRankFactoredBias(nn.Module):
     def forward(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.bq, self.bk
 
+    def factors_for(
+        self,
+        reference: torch.Tensor,
+        factors: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bq, bk = self() if factors is None else factors
+        return (
+            bq.to(device=reference.device, dtype=reference.dtype),
+            bk.to(device=reference.device, dtype=reference.dtype),
+        )
+
 
 # =============================================================================
 # Channel Attention Blocks
@@ -1053,6 +1091,26 @@ class ChannelAttention(nn.Module):
         self.force_tensorrt_export_mode = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype == torch.float16:
+            # Trained SwiGLU gate/value products can exceed FP16's finite range
+            # even though the final sigmoid gate is bounded. This branch only
+            # covers pooled 1x1 channel gating, so FP32 math is inexpensive and
+            # avoids poisoning the full feature map with NaNs.
+            y = x.float().mean(dim=(2, 3), keepdim=True)
+            y = F.conv2d(
+                y,
+                self.project.weight.float(),
+                None if self.project.bias is None else self.project.bias.float(),
+            )
+            gate, value = y.chunk(2, dim=1)
+            y = F.silu(gate) * value
+            y = F.conv2d(
+                y,
+                self.expand.weight.float(),
+                None if self.expand.bias is None else self.expand.bias.float(),
+            )
+            return x * self.sigmoid(y).to(dtype=x.dtype)
+
         if self.force_tensorrt_export_mode and not self.training:
             y = x.mean(dim=(2, 3), keepdim=True)
         else:
@@ -1567,9 +1625,7 @@ class WindowAttentionRFB(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self._prepare_query_key(q, k)
 
-        bq, bk = (
-            self.neural_bias() if bias_factors is None else bias_factors
-        )
+        bq, bk = self.neural_bias.factors_for(q, bias_factors)
         export_mode = torch.onnx.is_in_onnx_export()
         use_export_safe_math = self.force_math_attention or (export_mode and mask is not None)
         force_additive_attention = self.force_additive_attention or use_export_safe_math
@@ -1725,9 +1781,7 @@ class NarrowWindowAttention(nn.Module):
         )
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        bq, bk = (
-            self.neural_bias() if bias_factors is None else bias_factors
-        )
+        bq, bk = self.neural_bias.factors_for(q, bias_factors)
         use_export_safe_math = self.force_math_attention
         force_additive_attention = self.force_additive_attention or use_export_safe_math
 
@@ -2984,7 +3038,7 @@ class DRFT(nn.Module):
     # AOTAutograd never lifts those constants into CPU scalar graph inputs.
     compile_specialize_float = True
     compile_cache_key_tag = (
-        "drft-iln-family-v20-sdpa-ocab-layout-fusion-raw-fp32-stats"
+        "drft-iln-family-v21-sdpa-ocab-layout-fusion-raw-fp32-stats-fp16-safe"
     )
 
     # Dynamic DRFT ONNX exports always trace this representative shape. The
@@ -3147,7 +3201,7 @@ class DRFT(nn.Module):
             repr(compile_contract).encode("utf-8")
         ).hexdigest()[:20]
         self.compile_cache_key_tag = (
-            "drft-iln-family-v20-sdpa-ocab-layout-fusion-raw-fp32-stats-"
+            "drft-iln-family-v21-sdpa-ocab-layout-fusion-raw-fp32-stats-fp16-safe-"
             f"{compile_contract_sha}"
         )
 

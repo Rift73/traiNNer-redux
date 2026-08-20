@@ -1,3 +1,5 @@
+# ruff: noqa: SLF001
+
 from unittest.mock import patch
 
 import torch
@@ -64,6 +66,41 @@ def test_iln_uses_fp32_statistics_and_returns_the_activation_dtype() -> None:
     assert torch.equal(scale, expected_std.to(dtype=x.dtype))
     assert output.dtype == x.dtype
     assert scale.dtype == x.dtype
+
+
+def test_rank_factored_bias_refreshes_a_stale_precision_cache() -> None:
+    bias = drft_arch.RankFactoredNeuralBias(
+        num_heads=1,
+        q_window_size=(4, 4),
+        rank=8,
+    ).eval()
+    cached = bias()
+    bias._cached_factors = tuple(factor.half() for factor in cached)
+
+    reference = torch.empty((), dtype=torch.float32)
+    refreshed = bias.factors_for(reference)
+
+    assert all(factor.dtype == reference.dtype for factor in refreshed)
+    assert all(factor.dtype == reference.dtype for factor in bias._cached_factors)
+
+    static_bias = drft_arch._StaticRankFactoredBias(*refreshed)
+    half_factors = static_bias.factors_for(torch.empty((), dtype=torch.float16))
+    assert all(factor.dtype == torch.float16 for factor in half_factors)
+
+
+def test_channel_attention_keeps_fp16_swiglu_overflow_out_of_the_gate() -> None:
+    attention = drft_arch.ChannelAttention(dim=16, squeeze_factor=16).eval().half()
+    with torch.no_grad():
+        attention.project.weight.zero_()
+        attention.project.bias.fill_(1000.0)
+        attention.expand.weight.zero_()
+        attention.expand.bias.zero_()
+
+    x = torch.ones(1, 16, 2, 2, dtype=torch.float16)
+    output = attention(x)
+
+    assert torch.isfinite(output).all()
+    assert torch.equal(output, torch.full_like(output, 0.5))
 
 
 def test_drft_family_has_balanced_factory_contract() -> None:
@@ -182,7 +219,7 @@ def test_rhag_outer_layerscale_is_opt_in() -> None:
     assert isinstance(unchanged.layers[0].ls_rhag, nn.Identity)
     assert not any("ls_rhag" in key for key in unchanged.state_dict())
     assert unchanged.compile_cache_key_tag.startswith(
-        "drft-iln-family-v20-sdpa-ocab-layout-fusion-raw-fp32-stats-"
+        "drft-iln-family-v21-sdpa-ocab-layout-fusion-raw-fp32-stats-fp16-safe-"
     )
     assert unchanged.compile_cache_key_tag == drft_arch.DRFT(
         **common
@@ -191,7 +228,7 @@ def test_rhag_outer_layerscale_is_opt_in() -> None:
     stabilized = drft_arch.DRFT(**common, rhag_layer_scale_init=1e-4)
     assert isinstance(stabilized.layers[0].ls_rhag, drft_arch.LayerScale)
     assert stabilized.compile_cache_key_tag.startswith(
-        "drft-iln-family-v20-sdpa-ocab-layout-fusion-raw-fp32-stats-"
+        "drft-iln-family-v21-sdpa-ocab-layout-fusion-raw-fp32-stats-fp16-safe-"
     )
     assert stabilized.compile_cache_key_tag != unchanged.compile_cache_key_tag
     assert torch.equal(
