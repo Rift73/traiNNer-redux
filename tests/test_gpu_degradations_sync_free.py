@@ -13,6 +13,7 @@ cache disabled, i.e. with the filters the reference meant to apply.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import math
 import subprocess
@@ -25,6 +26,7 @@ import numpy as np
 import pytest
 import torch
 from traiNNer.data import gpu_degradations
+from traiNNer.utils.rng import RNG
 
 REFERENCE_COMMIT = "0ed482ff"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -35,11 +37,19 @@ Params = tuple[tuple[Any, ...], dict[str, Any]]
 Sampler = Callable[[np.random.Generator], Params]
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _project_rng() -> None:
+    # channel_shift_pt draws its shifts from the project RNG.
+    with contextlib.suppress(RuntimeError):  # already initialised
+        RNG.init_rng(0)
+
+
 def _channel_shift_params(r: np.random.Generator) -> Params:
     """Shifts drawn here and passed as [v, v] ranges.
 
-    channel_shift_pt resolves a [v, v] range to v whatever the state of numpy's
-    global RNG, so both modules apply the same shifts without seeding it.
+    channel_shift_pt resolves a [v, v] range to v whatever the RNG state (the
+    reference draws from numpy's global RNG, the current code from the project
+    RNG), so both modules apply the same shifts.
     """
     shift_type = str(r.choice(["rgb", "yuv", "cmyk"]))
     percent = bool(r.integers(0, 2))

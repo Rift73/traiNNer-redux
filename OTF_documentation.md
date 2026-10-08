@@ -24,6 +24,7 @@
 15. [Degradation Combo System](#15-degradation-combo-system)
 16. [Pipeline Order](#16-pipeline-order)
 17. [YML Quick Reference](#17-yml-quick-reference)
+18. [Performance and Native Kernels](#18-performance-and-native-kernels)
 
 ---
 
@@ -1107,6 +1108,47 @@ datasets:
 
 ---
 
+## 18. Performance and Native Kernels
+
+The OTF pipeline runs on the GPU wherever it can. Three steps use hand-written CUDA kernels, and the other GPU steps no longer make the CPU wait for the GPU. No config changes are needed. Measurements, per-change tables and re-run commands are in [`docs/OTF_performance.md`](docs/OTF_performance.md).
+
+### CUDA Extensions
+
+| Extension | Accelerates | Without the extension |
+|---|---|---|
+| NLMeans (`nlmeans_cuda_ext`) | LQ denoising (`otf_hf_noise_denoise_lq`) | No CPU path: the denoise step stops training with the build error. |
+| IIR trailing (`iir_trailing_cuda_ext`) | NTSC tape trailing (`ntsc_tape_trailing` > 0) | A PyTorch loop over the columns: same filter, much slower. |
+| Dithering (`dither_cuda_ext`) | Uniform-mode error diffusion (all eight algorithms) and `riemersma` from batch 2 up | The per-image `chainner_ext` CPU path, with identical output. |
+
+- **Built on first use.** `torch.utils.cpp_extension.load` compiles each extension with `nvcc` from the CUDA toolkit (found through `CUDA_HOME` or `PATH`), the host C++ compiler and `ninja`. IIR trailing is built when the GPU degradations are imported (at startup), NLMeans and dithering on their first call. A cold build takes tens of seconds per extension (dithering: about 40 s); later runs load the cached build in about half a second.
+- **Build cache.** `$TORCH_EXTENSIONS_DIR` if set, otherwise torch's per-user cache: `~/.cache/torch_extensions/py<python>_cu<cuda>/<extension>/` on Linux (for example `py312_cu132/dither_cuda_ext`). torch rebuilds an extension when its sources or flags change; delete its folder to force a rebuild.
+- **No toolkit or no GPU.** Dithering logs one line and runs the CPU path unchanged; IIR trailing falls back to the loop. Only NLMeans requires the toolkit.
+- **Exactness.** The dithering kernels are bit-identical to `chainner_ext` (sign of zero and odd sizes included). Palette-mode dithering stays on the CPU, and `riemersma` at batch 1 is routed to the CPU because a single serial walk is faster there.
+
+### Sync-Free GPU Steps
+
+Per-image loops, `.item()` calls and per-call constant uploads made the CPU wait for the GPU about 55 times per batch. They are gone; outputs are bit-identical to the previous code except for the behaviour changes below.
+
+- **Poisson and Gaussian noise** decide gray noise once per batch, and Poisson counts the levels of the whole batch on the GPU (it used a per-image `torch.unique` loop). With `poisson_scale_range: [0, 0]` and `gray_noise_prob: 0` (or their stage-2 fields) the Poisson step is skipped.
+- **DiffJPEG** compresses the whole batch in one pass with a quality per image.
+- **NTSC, rainbow, channel shift, chroma subsampling, ordered dither, lowpass, overshoot** cache their constants, colour matrices, Bayer maps, frequency grids and NTSC carriers per device and size; the first batch of each size still waits once. Rainbow's filter is zero-padded to a fixed radius, so cuDNN no longer re-tunes on every random length.
+- **Video codecs** (not a sync change) derive encoder threads from the core count and batch size, and decode with one colour converter per batch.
+
+### Behaviour Changes
+
+1. **MPEG-4 quality is applied.** `compress_mpeg4_range` used to be ignored (the encoder was given `crf`, which MPEG-4 does not have), so every MPEG-4 batch came out at about q=2. It now sets the quantizer like MPEG-2 (`qmin = qmax = quality`): expect stronger MPEG-4 artifacts across the configured range, and re-check ranges tuned against the old behaviour.
+2. **NTSC VHS and large-input filters corrected.** The NTSC filter cache confused filters with the same number of taps. With VHS on (`ntsc_enable_vhs` or a `vhs_*` preset) the luma path could run the much narrower colour-under filter and random `ntsc_vhs_luma_bw`/`ntsc_color_under_bw` draws were ignored; inputs larger than 754×480 used one filter for Y, I and Q. Each path now gets its own filter, so VHS luma is sharper and follows the configured bandwidths. The default `broadcast` preset at up to 754×480 is unchanged.
+3. **DiffJPEG quality 100 is finite.** A `jpeg_range` or `jpeg_range2` reaching 100 divided by zero (NaN output, later a CUDA assert). Quality 100 is now near-lossless; only DiffJPEG's fixed 4:2:0 chroma subsampling remains.
+
+Also fixed: grayscale (1-channel) and RGBA batches pass through CPU dithering, palette dithering and WebP with their channel count intact (they crashed, or lost an opaque alpha channel).
+
+### Reproducibility
+
+- Channel shift now draws from the run seed (`manual_seed`) like the other degradations; its shifts used to come from numpy's unseeded global generator. A seeded run therefore draws differently from the first channel shift on.
+- A skipped Poisson step (scale range [0, 0]) makes no random draws, so later seeded torch draws differ from before.
+
+---
+
 ## Source Files
 
 | File | What was modified |
@@ -1115,12 +1157,19 @@ datasets:
 | `traiNNer/models/realesrgan_model.py` | Added `_apply_*` methods for all degradations; modified `feed_data()` pipeline |
 | `traiNNer/models/realesrgan_paired_model.py` | Added validation data pass-through (prefix detection) |
 | `traiNNer/data/otf_degradations.py` | CPU-based degradation functions: WebP, video codecs, dithering, shift, subsampling, NLMeans |
-| `traiNNer/data/gpu_degradations.py` | **NEW** — Pure PyTorch GPU degradation functions: shift, subsampling, dithering, rainbow, lowpass, interlace, overshoot, ghosting, scanline, NTSC, detail mask, bicubic descale |
-| `traiNNer/data/compress_video_batch.py` | **NEW** — TorchCodec/PyAV batch video compression |
+| `traiNNer/data/gpu_degradations.py` | **NEW** — Pure PyTorch GPU degradation functions: shift, subsampling, dithering, rainbow, lowpass, interlace, overshoot, ghosting, scanline, NTSC, detail mask, bicubic descale. Sync-free (constants cached per device and size); channel shift drawn from the run seed |
+| `traiNNer/data/compress_video_batch.py` | **NEW** — TorchCodec/PyAV batch video compression; encoder threads from the core count and batch size |
 | `traiNNer/data/nlmeans_cuda.py` | **NEW** — JIT-compiled CUDA NLMeans kernel loader |
 | `traiNNer/data/iir_trailing_cuda.py` | **NEW** — JIT-compiled CUDA IIR trailing kernel loader |
 | `traiNNer/csrc/nlmeans_kernel.cu` | **NEW** — NLMeans v3 D-tile CUDA kernel |
 | `traiNNer/csrc/iir_trailing_kernel.cu` | **NEW** — IIR trailing CUDA kernel |
+| `traiNNer/data/dither_cuda.py` | **NEW** — JIT-compiled CUDA dithering loader (error diffusion, riemersma) with the CPU path as fallback |
+| `traiNNer/csrc/dither.cpp`, `traiNNer/csrc/dither_kernel.cu` | **NEW** — Exact error-diffusion and riemersma CUDA kernels |
+| `traiNNer/data/degradations.py` | Sync-free Poisson/Gaussian noise (batched level count, gray decision once, [0, 0] skip) |
+| `traiNNer/utils/diffjpeg.py` | Whole batch in one pass with a quality per image; quality 100 finite |
 | `traiNNer/data/realesrgan_dataset.py` | Added target GT loading, paired augmentation, aligned cropping |
 | `traiNNer/data/realesrgan_paired_dataset.py` | Added `paired_dataroot_gt` override, index wrapping |
 | `traiNNer/data/transforms.py` | Added `single_crop_vips()`, `augment_vips_pair()`, `paired_random_crop_multi_gt()` |
+| `benchmarks/otf_profile.py` | **NEW** — Real-loader OTF profiler: per-step times and hidden host syncs |
+| `docs/OTF_performance.md` | **NEW** — Performance pass: measurements, deviations kept on purpose, re-run commands |
+| `tests/test_dither_cuda.py`, `tests/test_otf_sync_free.py`, `tests/test_gpu_degradations_sync_free.py`, `tests/test_compress_batch.py`, `tests/test_channel_shift_rng.py`, `tests/test_otf_per_image_channels.py` | **NEW** — Tests for the dithering kernels, sync-free steps, batch codecs, seeded channel shift and 1/3/4-channel round trips |

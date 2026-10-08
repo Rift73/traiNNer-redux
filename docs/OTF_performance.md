@@ -29,6 +29,22 @@ Mixed codecs: HEVC 60 ms per call, WebP 9.6 ms per call (CPU stages = 40 % of th
 
 Found on the way: `jpeg_range` reaching 100 makes DiffJPEG divide by zero (NaN, later a CUDA assert).
 
+### Training pressure (owner's DUAL degradation-test config: batch 16, LR 128, bf16, channels-last, compile)
+
+| compile mode | degradations | feed_data isolated / in loop | train step | ratio |
+|---|---|---|---|---|
+| max-autotune | all | 199.8 / 203.2 ms | 90.3 ms | 2.2 |
+| max-autotune | none | 12.4 / 10.7 ms | 89.9 ms | 0.12 |
+| default | all | 198.9 / 238.8 ms | 104.6 ms | 1.9–2.3 |
+
+With everything on, degradation is two-thirds of an iteration. Dithering alone is 158.6 ms (68 % of feed_data):
+the owner's `dithering_palette_mode: 0.7` sends 70 % of batches through the CPU palette path (median cut of
+128–256 colours, serial over 16 images). `resize_pt` has a 0.26 ms median but an 18 ms mean (p90 74 ms) even with
+degradations off: the lanczos kernel shape follows the random scale and cuDNN re-autotunes. Poisson noise 10 ms
+(computed then multiplied by 0), DiffJPEG 6.7 ms, NLMeans 5.0 ms, NTSC 4.5 ms. A busy GPU does not slow the
+degradation itself (in-loop feed_data equals the isolated number); the cost is simply additive. Cold max-autotune
+compile of the DUAL model is about 15 min; warm cache 35 s. Peak training allocation 9.4 GiB.
+
 ## Changes
 
 ### CUDA dithering kernel (`traiNNer/csrc/dither_kernel.cu`, `dither.cpp`, `traiNNer/data/dither_cuda.py`)
@@ -81,8 +97,11 @@ sums to 1, so filters with the same tap count collided: `vhs_sp` ran the 500 kHz
 the 3 MHz luma filter (max diff 0.45 at 8×256²), inputs above 754×480 shared one filter for Y, I and Q (max diff
 0.72 at 512²), and random VHS bandwidths were ignored. The cache is now keyed on the filter's design parameters;
 those paths now give what HEAD's code intended (HEAD with its cache disabled). The default broadcast preset at
-256² is bit-identical. Also noted, unchanged: `channel_shift_pt` draws from numpy's global RNG, which the run seed
-never seeds, so channel shifts are not reproducible from the seed.
+256² is bit-identical. `channel_shift_pt` used numpy's unseeded global RNG, so channel shifts were not reproducible
+from the run seed; it now draws from the project RNG (same distribution). Because that RNG is shared, a seeded run's
+random stream differs from before from the first channel shift onward. Also fixed on the per-image CPU paths
+(`otf_degradations.py`): 1-channel images crashed uniform and palette dithering and WebP, and 4-channel palette
+dithering misaligned the palette; both now round-trip (alpha passes through palette dithering unchanged).
 
 ### Codec path settings (`traiNNer/data/compress_video_batch.py`)
 Backends unchanged (owner's benchmarks). What actually reached the encoders was checked by effect on the output:
@@ -108,8 +127,16 @@ x264/x265 set each frame's QP from the running average of earlier frames in the 
 intra-only but not identical to per-image encoding. WebP: `method=0` and the 8-worker pool are correct; Pillow's
 WebP decode only partly releases the GIL (1.8x on 8 threads), a backend change was not made.
 
-## After (same script, same arguments)
-_To be filled._
+## After (same script, same arguments; commit b6812173 = kernel + S1 + S2 + S3)
+
+| run (batch 8, GT 256) | feed_data median / p90 before | after | mean before → after |
+|---|---|---|---|
+| Floyd-Steinberg, JPEG | 21.2 / 24.5 ms | 9.3 / 13.0 ms | 22.5 → 10.0 |
+| Riemersma, JPEG | 21.5 / 25.4 ms | 8.6 / 13.4 ms | 23.0 → 9.6 |
+| Floyd-Steinberg, mixed codecs | 31.1 / 68.7 ms | 21.5 / 38.3 ms | 42.9 → 25.0 |
+
+The owner's DUAL training-pressure after-run (palette dithering, resize autotune) is recorded below once those
+lanes land.
 
 ## Decisions
 - GPU stays the home of the degradations: their cost is additive per step either way, and hiding them on the CPU

@@ -141,19 +141,22 @@ def compress_webp(img: np.ndarray, quality: int) -> np.ndarray:
     method=0 is the fastest encoding setting (1.8x faster than cv2 default).
 
     Args:
-        img: HWC float32 [0,1] RGB image.
+        img: HWC float32 [0,1] image with 1, 3 or 4 channels.
         quality: WebP quality (1-100).
 
     Returns:
-        HWC float32 [0,1] RGB image after WebP round-trip.
+        HWC float32 [0,1] image after WebP round-trip, same shape as img.
     """
     img_u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
-    pil_img = Image.fromarray(img_u8)
+    # Pillow takes gray as a 2-D "L" image.
+    pil_img = Image.fromarray(img_u8[:, :, 0] if img_u8.shape[2] == 1 else img_u8)
     buf = io.BytesIO()
     pil_img.save(buf, format="WebP", quality=quality, method=0)
     buf.seek(0)
-    decoded = np.array(Image.open(buf))
-    return decoded.astype(np.float32) / 255.0
+    # WebP stores gray as RGB and drops a fully opaque alpha, so decode back to
+    # the mode that was encoded.
+    decoded = np.array(Image.open(buf).convert(pil_img.mode))
+    return (decoded.astype(np.float32) / 255.0).reshape(img.shape)
 
 
 def _video_core(
@@ -298,21 +301,21 @@ def compress_video(
 # ── Dithering ──────────────────────────────────────────────────────────────────
 
 
-def _extract_palette(img: np.ndarray, num_colors: int) -> np.ndarray:
+def _extract_palette(img: np.ndarray, num_colors: int) -> np.ndarray | None:
     """Extract a content-adaptive color palette using PIL median cut.
 
     Args:
-        img: HWC float32 [0,1] RGB image.
+        img: HWC float32 [0,1] image with 1 or 3 channels, or HW gray.
         num_colors: Number of palette colors (2-256).
 
     Returns:
-        Palette as (1, num_colors, C) float32 array for PaletteQuantization.
+        Palette as (1, num_colors, C) float32 array for PaletteQuantization,
+        with C = 1 for gray and 3 for RGB; None if no usable palette is found.
     """
     img_u8 = (img * 255).clip(0, 255).astype(np.uint8)
-    if img.ndim == 2:
-        pil_img = Image.fromarray(img_u8, mode="L")
-    else:
-        pil_img = Image.fromarray(img_u8, mode="RGB")
+    gray = img.ndim == 2 or img.shape[2] == 1
+    # Pillow takes gray as a 2-D "L" image.
+    pil_img = Image.fromarray(img_u8.reshape(img_u8.shape[:2]) if gray else img_u8)
 
     quantized = pil_img.quantize(
         colors=num_colors,
@@ -323,7 +326,10 @@ def _extract_palette(img: np.ndarray, num_colors: int) -> np.ndarray:
     palette_raw = quantized.getpalette()
     if palette_raw is None:
         raise ValueError(f"Failed to extract palette with {num_colors} colors")
-    channels = 1 if img.ndim == 2 else 3
+    channels = 1 if gray else 3
+    if gray:
+        # getpalette() returns RGB triplets for an "L" source too (R = G = B).
+        palette_raw = palette_raw[::3]
     # getpalette() always returns 768 values (256×3) but only the first N
     # entries are meaningful. Count actual unique indices used.
     actual_colors = len(set(quantized.getdata()))
@@ -355,7 +361,7 @@ def apply_dithering_palette(
     Like GIF/PNG8 quantization but with proper error diffusion.
 
     Args:
-        img: HWC float32 [0,1] image.
+        img: HWC float32 [0,1] image with 1, 3 or 4 channels, or HW gray.
         dithering_type: Algorithm name.
         num_colors: Number of palette colors (2-256).
         map_size: Map size for ordered dithering.
@@ -363,8 +369,16 @@ def apply_dithering_palette(
         decay_ratio: Decay ratio for Riemersma dithering.
 
     Returns:
-        HWC float32 [0,1] dithered image.
+        Float32 [0,1] dithered image, same shape as img. With 4 channels the
+        palette covers the color channels and alpha is returned unchanged.
     """
+    if img.ndim == 3 and img.shape[2] == 4:
+        # Pillow's median cut does not take RGBA (only octree does).
+        color = apply_dithering_palette(
+            img[:, :, :3], dithering_type, num_colors, map_size, history, decay_ratio
+        )
+        return np.concatenate((color, img[:, :, 3:]), axis=2)
+
     from chainner_ext import (
         DiffusionAlgorithm,
         PaletteQuantization,
@@ -400,7 +414,8 @@ def apply_dithering_palette(
         logger.warning("Unknown dithering type: %s, skipping", dithering_type)
         return img
 
-    return np.squeeze(result)
+    # chainner_ext returns HWC, also for HW input.
+    return result.reshape(img.shape)
 
 
 def apply_dithering(
@@ -414,7 +429,7 @@ def apply_dithering(
     """Apply dithering/quantization to an image.
 
     Args:
-        img: HWC float32 [0,1] image.
+        img: HWC float32 [0,1] image with 1, 3 or 4 channels, or HW gray.
         dithering_type: Algorithm name (e.g. "quantize", "floydsteinberg", "order", "riemersma").
         quantize_ch: Number of quantization levels per channel.
         map_size: Map size for ordered dithering.
@@ -422,7 +437,7 @@ def apply_dithering(
         decay_ratio: Decay ratio for Riemersma dithering.
 
     Returns:
-        HWC float32 [0,1] dithered image.
+        Float32 [0,1] dithered image, same shape as img.
     """
     from chainner_ext import (
         DiffusionAlgorithm,
@@ -458,7 +473,8 @@ def apply_dithering(
         logger.warning("Unknown dithering type: %s, skipping", dithering_type)
         return img
 
-    return np.squeeze(result)
+    # chainner_ext returns HWC, also for HW input.
+    return result.reshape(img.shape)
 
 
 # ── Channel Shift ──────────────────────────────────────────────────────────────
@@ -533,7 +549,7 @@ def apply_shift(
     Returns:
         HWC float32 [0,1] shifted image.
     """
-    if img.ndim == 2:
+    if img.ndim == 2 or img.shape[2] == 1:
         return img
 
     shift_fn = _shift_channel_percent if percent else _shift_channel_int

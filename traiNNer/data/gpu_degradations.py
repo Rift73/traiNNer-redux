@@ -30,6 +30,8 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from traiNNer.utils.rng import RNG
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -183,6 +185,9 @@ def channel_shift_pt(
 ) -> Tensor:
     """Apply per-channel spatial shift on GPU.
 
+    The shifts are drawn from the project RNG (RNG.get_rng()), so they follow
+    the run seed like the other degradation parameters.
+
     Args:
         tensor: BCHW float32 [0,1] RGB tensor on GPU.
         shift_type: "rgb", "yuv", or "cmyk".
@@ -192,23 +197,22 @@ def channel_shift_pt(
     Returns:
         BCHW float32 shifted tensor.
     """
-    import numpy as np
-
     _, _, h, w = tensor.shape
+    rng = RNG.get_rng()
 
-    def _sample_int(lo, hi):
+    def _sample_int(lo: int, hi: int) -> int:
         """Sample integer from [lo, hi] inclusive. Handles lo==hi."""
         if lo == hi:
             return lo
         if lo > hi:
             lo, hi = hi, lo
-        return np.random.randint(lo, hi + 1)
+        return int(rng.integers(lo, hi + 1))
 
-    def sample_shift(amount_range):
+    def sample_shift(amount_range: list[list[int]]) -> tuple[int, int]:
         ax_range, ay_range = amount_range
         if percent:
-            ax = 0 if ax_range == [0, 0] else int(h * np.random.uniform(*ax_range) / 100)
-            ay = 0 if ay_range == [0, 0] else int(w * np.random.uniform(*ay_range) / 100)
+            ax = 0 if ax_range == [0, 0] else int(h * rng.uniform(*ax_range) / 100)
+            ay = 0 if ay_range == [0, 0] else int(w * rng.uniform(*ay_range) / 100)
         else:
             ax = 0 if ax_range == [0, 0] else _sample_int(ax_range[0], ax_range[1])
             ay = 0 if ay_range == [0, 0] else _sample_int(ay_range[0], ay_range[1])
@@ -1397,9 +1401,7 @@ def ntsc_composite_pt(
 
         vhs_chroma = i_bb * cos_carrier + q_bb * nsin_carrier
 
-        vhs_luma = _ntsc_fir_filter_rows(
-            vhs_luma, vhs_luma_bw * 1e6, vhs_taps, nyquist
-        )
+        vhs_luma = _ntsc_fir_filter_rows(vhs_luma, vhs_luma_bw * 1e6, vhs_taps, nyquist)
 
         composite = vhs_luma + vhs_chroma
 
