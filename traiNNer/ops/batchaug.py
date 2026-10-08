@@ -1,7 +1,6 @@
 # Modified from: https://github.com/victorca25/traiNNer/blob/master/codes/dataops/batchaug.py
 
 import os
-import random
 import sys
 from os import path as osp
 
@@ -88,8 +87,11 @@ def batch_aug(
         msg = "Augmentations need batch >1 to work."
         raise ValueError(msg)
 
-    idx = random.choices(range(len(augs)), weights=probs)[0]
-    aug = augs[idx]
+    # Weighted pick from the project RNG (same distribution as
+    # random.choices(augs, probs)); Python's random is also advanced by
+    # rich's log handler, so it made the pick depend on logging.
+    weights = np.asarray(probs, dtype=np.float64)
+    aug = augs[int(RNG.get_rng().choice(len(augs), p=weights / weights.sum()))]
 
     if aug == "none":
         return img_gt, img_lq
@@ -407,19 +409,20 @@ def downup(
 ) -> tuple[Tensor, Tensor]:
     sampling_opts = [("bicubic", True), ("bilinear", True), ("nearest-exact", False)]
 
-    down_sample = random.choice(sampling_opts)
-    up_sample = random.choice(sampling_opts)
+    # Uniform picks from the project RNG, as random.choice made them.
+    down_sample = sampling_opts[RNG.get_rng().integers(len(sampling_opts))]
+    up_sample = sampling_opts[RNG.get_rng().integers(len(sampling_opts))]
 
     # don't allow nearest for both
     if down_sample[0] == sampling_opts[2][0] and up_sample[0] == sampling_opts[2][0]:
         if RNG.get_rng().random() > 0.5:
             # change up sample
             while up_sample[0] == sampling_opts[2][0]:
-                up_sample = random.choice(sampling_opts)
+                up_sample = sampling_opts[RNG.get_rng().integers(len(sampling_opts))]
         else:
             # change down sample
             while down_sample[0] == sampling_opts[2][0]:
-                down_sample = random.choice(sampling_opts)
+                down_sample = sampling_opts[RNG.get_rng().integers(len(sampling_opts))]
 
     scale_factor = RNG.get_rng().uniform(scope[0], scope[1])
     img_lq_base_size = img_lq.shape
@@ -488,7 +491,7 @@ def up(
     )
 
     gt_up_sample = sampling_opts[0]  # bicubic
-    lq_up_sample = random.choice(sampling_opts)
+    lq_up_sample = sampling_opts[RNG.get_rng().integers(len(sampling_opts))]
 
     # upscale cropped HQ to original size
     img_gt = F.interpolate(

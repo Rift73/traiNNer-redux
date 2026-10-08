@@ -183,7 +183,17 @@ left queued when the next degradation is launched, and the chain is launch-bound
 host launch time). What would create a window: removing those three host syncs from the step, a launcher thread
 (RNG reproducibility would need a separate generator), or CUDA graphs for the GPU-only part of the chain. Found on
 the way and fixed on the main branch: the NLMeans and IIR kernels launched on the legacy default stream
-(`fbbaec71`); every log line advances Python's `random`, which the chain draws from (fix in progress, lane C2).
+(`fbbaec71`); every log line advances Python's `random`, which the chain drew from (fixed, next section).
+
+### Seed-reproducible degradation stream (`realesrgan_model.py`, `transforms.py`, `ops/batchaug.py`)
+rich's `RichHandler` draws a random link id per log record, so every log line advanced Python's `random`, and the
+chain drew from it (combo, codec and chroma picks, resize up/down/keep and modes, the paired crop offsets, MoA's
+augmentation and sampling picks: 16 draws). All of them now use the project RNG with the same distributions
+(`_weighted_choice` helper for weighted picks). Seeded runs differ from before this change (and SRModel /
+RealESRGANPairedModel streams change too via MoA), but two runs with the same seed now give identical batches no
+matter what is logged; `tests/test_otf_rng_stream.py` proves it on the real dataset and shows HEAD failing it.
+Left alone: dataset-worker draws (seeded per worker by `worker_init_fn`; with `num_worker_per_gpu: 0` they still
+run in the main process and depend on logging).
 
 ## Decisions
 - GPU stays the home of the degradations: their cost is additive per step either way, and hiding them on the CPU
