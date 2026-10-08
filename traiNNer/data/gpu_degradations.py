@@ -24,6 +24,7 @@ Functions:
 from __future__ import annotations
 
 import logging
+from functools import cache, lru_cache
 
 import torch
 from torch import Tensor
@@ -53,8 +54,15 @@ _YCBCR_WEIGHTS = {
 }
 
 
-def _ycbcr_matrix(kr: float, kb: float, device: torch.device) -> Tensor:
-    """Build the 3×3 RGB→YCbCr conversion matrix."""
+@cache
+def _ycbcr_matrices(standard: str, device: torch.device) -> tuple[Tensor, Tensor]:
+    """Build the 3x3 RGB→YCbCr conversion matrix and its inverse.
+
+    Built once per (standard, device): creating the matrix on the device is a
+    pageable host-to-device copy and torch.linalg.inv checks its result on the
+    host, so building them per call would block the host twice per call.
+    """
+    kr, kb = _YCBCR_WEIGHTS[standard]
     kg = 1.0 - kr - kb
     # Y  =  Kr*R      + Kg*G      + Kb*B
     # Cb = -Kr/(2*(1-Kb))*R - Kg/(2*(1-Kb))*G + 0.5*B
@@ -68,7 +76,7 @@ def _ycbcr_matrix(kr: float, kb: float, device: torch.device) -> Tensor:
         dtype=torch.float32,
         device=device,
     )
-    return m
+    return m, torch.linalg.inv(m)
 
 
 def rgb_to_ycbcr_pt(tensor: Tensor, standard: str = "709") -> Tensor:
@@ -81,8 +89,7 @@ def rgb_to_ycbcr_pt(tensor: Tensor, standard: str = "709") -> Tensor:
     Returns:
         BCHW float32 tensor, C=3 (Y, Cb, Cr).
     """
-    kr, kb = _YCBCR_WEIGHTS[standard]
-    m = _ycbcr_matrix(kr, kb, tensor.device)  # (3, 3)
+    m, _m_inv = _ycbcr_matrices(standard, tensor.device)  # (3, 3)
     # BCHW → B,3,H*W → matmul → B,3,H*W → BCHW
     b, _c, h, w = tensor.shape
     flat = tensor.reshape(b, 3, h * w)  # (B, 3, N)
@@ -100,9 +107,7 @@ def ycbcr_to_rgb_pt(tensor: Tensor, standard: str = "709") -> Tensor:
     Returns:
         BCHW float32 tensor, C=3 (RGB), clamped to [0, 1].
     """
-    kr, kb = _YCBCR_WEIGHTS[standard]
-    m = _ycbcr_matrix(kr, kb, tensor.device)
-    m_inv = torch.linalg.inv(m)  # (3, 3)
+    _m, m_inv = _ycbcr_matrices(standard, tensor.device)  # (3, 3)
     b, _c, h, w = tensor.shape
     flat = tensor.reshape(b, 3, h * w)
     rgb = torch.matmul(m_inv, flat)
@@ -392,6 +397,23 @@ def _bayer_matrix(n: int, device: torch.device) -> Tensor:
     return m / (n * n)
 
 
+@lru_cache(maxsize=16)
+def _bayer_threshold(ms: int, h: int, w: int, device: torch.device) -> Tensor:
+    """Bayer threshold map tiled to (1, 1, H, W), built once per size and device.
+
+    _bayer_matrix creates its 2x2 seed on the device, a pageable host-to-device
+    copy that blocks the host, so the tiled map is cached rather than rebuilt.
+    """
+    bayer = _bayer_matrix(ms, device)  # (ms, ms) in [0, 1)
+
+    # Tile Bayer matrix across image
+    # Use modular indexing to tile without allocating full-size tensor
+    y_idx = torch.arange(h, device=device) % ms
+    x_idx = torch.arange(w, device=device) % ms
+    threshold = bayer[y_idx[:, None], x_idx[None, :]]  # (H, W)
+    return threshold.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W) — broadcasts over B, C
+
+
 def ordered_dither_pt(tensor: Tensor, levels: int, map_size: int = 4) -> Tensor:
     """Ordered (Bayer) dithering on GPU.
 
@@ -406,15 +428,8 @@ def ordered_dither_pt(tensor: Tensor, levels: int, map_size: int = 4) -> Tensor:
     # Round map_size to nearest power of 2
     ms = max(2, 1 << (map_size - 1).bit_length())
 
-    bayer = _bayer_matrix(ms, tensor.device)  # (ms, ms) in [0, 1)
     _, _, h, w = tensor.shape
-
-    # Tile Bayer matrix across image
-    # Use modular indexing to tile without allocating full-size tensor
-    y_idx = torch.arange(h, device=tensor.device) % ms
-    x_idx = torch.arange(w, device=tensor.device) % ms
-    threshold = bayer[y_idx[:, None], x_idx[None, :]]  # (H, W)
-    threshold = threshold.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W) — broadcasts over B, C
+    threshold = _bayer_threshold(ms, h, w, tensor.device)
 
     # Dither: add threshold offset before quantization
     n = levels - 1
@@ -451,6 +466,10 @@ def _get_yiq_matrices(device: torch.device) -> tuple[Tensor, Tensor]:
     if device not in _yiq_cache:
         _yiq_cache[device] = (_YIQ_FWD.to(device), _YIQ_INV.to(device))
     return _yiq_cache[device]
+
+
+# Smallest conv radius for the rainbow chroma filter (see composite_rainbow_pt).
+_RAINBOW_CONV_RADIUS = 12
 
 
 def composite_rainbow_pt(
@@ -511,14 +530,25 @@ def composite_rainbow_pt(
     kx = torch.arange(ksize, device=device, dtype=torch.float32) - radius
     kernel = torch.exp(-0.5 * (kx / sigma) ** 2)
     kernel = kernel / kernel.sum()
-    kernel = kernel.reshape(1, 1, 1, ksize)
+
+    # The radius follows the bandwidth drawn per call, and cudnn.benchmark
+    # autotunes every new conv shape (30-80 ms each). Zero-padding the kernel
+    # to radius 12, 24 or 48 leaves at most three shapes; the default bandwidth
+    # range needs only the first, which costs the same as the shorter kernels.
+    # The zero taps add exact zeros, so the output is bit-identical.
+    conv_radius = _RAINBOW_CONV_RADIUS
+    while conv_radius < radius:
+        conv_radius *= 2
+    conv_radius = max(min(conv_radius, w // 2), radius)
+    extra = conv_radius - radius
+    kernel = F.pad(kernel, [extra, extra]).reshape(1, 1, 1, 2 * conv_radius + 1)
 
     i_demod = composite * (2.0 * carrier_cos)
     q_demod = composite * (2.0 * carrier_sin)
 
     iq_demod = torch.cat([i_demod, q_demod], dim=0)
     iq_filtered = F.conv2d(
-        F.pad(iq_demod, [radius, radius, 0, 0], mode="reflect"),
+        F.pad(iq_demod, [conv_radius, conv_radius, 0, 0], mode="reflect"),
         kernel,
     )
     i_decoded = iq_filtered[:b]
@@ -537,6 +567,19 @@ def composite_rainbow_pt(
 # ═══════════════════════════════════════════════════════════════
 # Lowpass Filter (frequency domain — anime mastering artifact)
 # ═══════════════════════════════════════════════════════════════
+
+
+@lru_cache(maxsize=8)
+def _rfft2_radius(h: int, w: int, device: torch.device) -> Tensor:
+    """Radial frequency sqrt(fy² + fx²) on the rfft2 grid of an (h, w) image.
+
+    Depends only on the image size, so it is built once per size and device
+    (lowpass_filter_pt and overshoot_pt draw their cutoff and order per call).
+    """
+    freq_y = torch.fft.fftfreq(h, device=device, dtype=torch.float32)
+    freq_x = torch.fft.rfftfreq(w, device=device, dtype=torch.float32)
+    fy, fx = torch.meshgrid(freq_y, freq_x, indexing="ij")
+    return torch.sqrt(fy * fy + fx * fx)
 
 
 def lowpass_filter_pt(
@@ -559,14 +602,10 @@ def lowpass_filter_pt(
         BCHW float32 [0,1] filtered tensor.
     """
     _b, _c, h, w = tensor.shape
-    device = tensor.device
 
     cutoff_freq = max(cutoff * 0.5, 1e-6)
 
-    freq_y = torch.fft.fftfreq(h, device=device, dtype=torch.float32)
-    freq_x = torch.fft.rfftfreq(w, device=device, dtype=torch.float32)
-    fy, fx = torch.meshgrid(freq_y, freq_x, indexing="ij")
-    dist = torch.sqrt(fy * fy + fx * fx)
+    dist = _rfft2_radius(h, w, tensor.device)
 
     butterworth = 1.0 / (1.0 + (dist / cutoff_freq) ** (2 * order))
     butterworth = butterworth.unsqueeze(0).unsqueeze(0)
@@ -642,13 +681,9 @@ def overshoot_pt(
         BCHW float32 [0,1] tensor with overshoot/undershoot artifacts.
     """
     _b, _c, h, w = tensor.shape
-    device = tensor.device
 
     cutoff_freq = max(cutoff * 0.5, 1e-6)
-    freq_y = torch.fft.fftfreq(h, device=device, dtype=torch.float32)
-    freq_x = torch.fft.rfftfreq(w, device=device, dtype=torch.float32)
-    fy, fx = torch.meshgrid(freq_y, freq_x, indexing="ij")
-    dist = torch.sqrt(fy * fy + fx * fx)
+    dist = _rfft2_radius(h, w, tensor.device)
     butterworth = 1.0 / (1.0 + (dist / cutoff_freq) ** (2 * order))
     butterworth = butterworth.unsqueeze(0).unsqueeze(0)
 
@@ -753,6 +788,12 @@ _PREWITT_GY = torch.tensor(
     ],
     dtype=torch.float32,
 ).reshape(1, 1, 3, 3)
+
+
+@cache
+def _prewitt_kernels(device: torch.device) -> tuple[Tensor, Tensor]:
+    """Prewitt x/y kernels on ``device``, copied once (each copy blocks the host)."""
+    return _PREWITT_GX.to(device), _PREWITT_GY.to(device)
 
 
 def _vs_deflate(x: Tensor) -> Tensor:
@@ -896,8 +937,7 @@ def detail_mask_neo_pt(
     for _ in range(4):
         blur_pref_diff = _vs_inflate(blur_pref_diff)
 
-    gx_kernel = _PREWITT_GX.to(device)
-    gy_kernel = _PREWITT_GY.to(device)
+    gx_kernel, gy_kernel = _prewitt_kernels(device)
     luma_pad = F.pad(luma, [1, 1, 1, 1], mode="reflect")
     edge_x = F.conv2d(luma_pad, gx_kernel)
     edge_y = F.conv2d(luma_pad, gy_kernel)
@@ -1107,7 +1147,11 @@ _NTSC_YIQ_TO_RGB = torch.tensor(
     dtype=torch.float32,
 )
 
-_ntsc_filter_cache: dict[tuple, Tensor] = {}
+
+@cache
+def _ntsc_matrices(device: torch.device) -> tuple[Tensor, Tensor]:
+    """NTSC RGB→YIQ and YIQ→RGB on ``device``, copied once (each copy blocks the host)."""
+    return _NTSC_RGB_TO_YIQ.to(device), _NTSC_YIQ_TO_RGB.to(device)
 
 
 def _ntsc_design_fir(
@@ -1132,10 +1176,32 @@ def _ntsc_design_fir(
     return kernel
 
 
-def _ntsc_fir_filter_rows(signal: Tensor, kernel: Tensor) -> Tensor:
-    """Zero-phase FIR filtering along the last (width) dimension via FFT."""
+@lru_cache(maxsize=64)
+def _ntsc_fir_power_response(
+    cutoff_hz: float,
+    num_taps: int,
+    nyquist: float,
+    fft_n: int,
+    device: torch.device,
+) -> Tensor:
+    """|H|² of the _ntsc_design_fir filter on an fft_n-point rfft grid.
+
+    Keyed on the host-side design parameters, so a lookup never reads the GPU.
+    Bounded because the VHS bandwidths may be drawn at random per call.
+    """
+    kernel = _ntsc_design_fir(cutoff_hz, num_taps, device, nyquist)
+    response = torch.fft.rfft(kernel, n=fft_n)
+    return response.real * response.real + response.imag * response.imag
+
+
+def _ntsc_fir_filter_rows(
+    signal: Tensor, cutoff_hz: float, num_taps: int, nyquist: float
+) -> Tensor:
+    """Zero-phase FIR filtering along the last (width) dimension via FFT.
+
+    The filter is _ntsc_design_fir(cutoff_hz, num_taps, nyquist=nyquist).
+    """
     b, c, h, w = signal.shape
-    num_taps = kernel.shape[0]
     pad_size = num_taps
 
     padded = F.pad(signal, [pad_size, pad_size, 0, 0], mode="reflect")
@@ -1145,22 +1211,14 @@ def _ntsc_fir_filter_rows(signal: Tensor, kernel: Tensor) -> Tensor:
     while fft_n < pw:
         fft_n *= 2
     sig_flat = padded.reshape(b * c * h, pw)
-    S = torch.fft.rfft(sig_flat, n=fft_n)
+    spectrum = torch.fft.rfft(sig_flat, n=fft_n)
+    h_sq = _ntsc_fir_power_response(cutoff_hz, num_taps, nyquist, fft_n, signal.device)
 
-    cache_key = (round(kernel.sum().item() * 1e8), num_taps, fft_n)
-    if (
-        cache_key not in _ntsc_filter_cache
-        or _ntsc_filter_cache[cache_key].device != signal.device
-    ):
-        H = torch.fft.rfft(kernel, n=fft_n)
-        H_sq = H.real * H.real + H.imag * H.imag
-        _ntsc_filter_cache[cache_key] = H_sq
-    H_sq = _ntsc_filter_cache[cache_key]
-
-    filtered = torch.fft.irfft(S * H_sq, n=fft_n)
+    filtered = torch.fft.irfft(spectrum * h_sq, n=fft_n)
     return filtered[:, pad_size : pad_size + w].reshape(b, c, h, w)
 
 
+@lru_cache(maxsize=8)
 def _ntsc_build_carrier(
     h: int,
     w: int,
@@ -1168,7 +1226,7 @@ def _ntsc_build_carrier(
     device: torch.device,
     scale: int = 1,
 ) -> Tensor:
-    """Build NTSC carrier signal (1, 1, H, W)."""
+    """Build NTSC carrier signal (1, 1, H, W), cached per argument set."""
     phase_per_sample = 3.141592653589793 / (2.0 * scale)
     sample_phase = phase_per_sample * torch.arange(
         w, device=device, dtype=torch.float32
@@ -1200,6 +1258,28 @@ def _ntsc_comb_1h(
     luma = (composite + ref) * 0.5
     chroma = (composite - ref) * 0.5
     return luma, chroma
+
+
+@lru_cache(maxsize=4)
+def _ntsc_vhs_carriers(
+    scale: int, ntsc_w: int, device: torch.device
+) -> tuple[Tensor, Tensor]:
+    """VHS color-under cos and -sin carriers (1, 1, 1, W), cached per argument set."""
+    lut_period = 4 * scale
+    cos_lut = torch.cos(
+        (3.141592653589793 / 2.0)
+        * torch.arange(lut_period, device=device, dtype=torch.float32)
+        / scale
+    )
+    nsin_lut = -torch.sin(
+        (3.141592653589793 / 2.0)
+        * torch.arange(lut_period, device=device, dtype=torch.float32)
+        / scale
+    )
+    col_idx = torch.arange(ntsc_w, device=device) % lut_period
+    cos_carrier = cos_lut[col_idx].reshape(1, 1, 1, ntsc_w)
+    nsin_carrier = nsin_lut[col_idx].reshape(1, 1, 1, ntsc_w)
+    return cos_carrier, nsin_carrier
 
 
 def _ntsc_iir_trailing(signal: Tensor, strength: float) -> Tensor:
@@ -1283,77 +1363,56 @@ def ntsc_composite_pt(
         tensor, size=(ntsc_h, ntsc_w), mode="bicubic", align_corners=False
     )
 
-    m_fwd = _NTSC_RGB_TO_YIQ.to(device)
-    m_inv = _NTSC_YIQ_TO_RGB.to(device)
+    m_fwd, m_inv = _ntsc_matrices(device)
     flat = x.reshape(b, 3, ntsc_h * ntsc_w)
     yiq = torch.matmul(m_fwd, flat).reshape(b, 3, ntsc_h, ntsc_w)
     y_ch = yiq[:, 0:1]
     i_ch = yiq[:, 1:2]
     q_ch = yiq[:, 2:3]
 
-    fir_y = _ntsc_design_fir(_NTSC_LUMA_BW, num_taps, device, nyquist)
-    fir_i = _ntsc_design_fir(_NTSC_I_BW, num_taps, device, nyquist)
-    fir_q = _ntsc_design_fir(_NTSC_Q_BW, num_taps, device, nyquist)
-
-    y_ch = _ntsc_fir_filter_rows(y_ch, fir_y)
-    i_ch = _ntsc_fir_filter_rows(i_ch, fir_i)
-    q_ch = _ntsc_fir_filter_rows(q_ch, fir_q)
+    y_ch = _ntsc_fir_filter_rows(y_ch, _NTSC_LUMA_BW, num_taps, nyquist)
+    i_ch = _ntsc_fir_filter_rows(i_ch, _NTSC_I_BW, num_taps, nyquist)
+    q_ch = _ntsc_fir_filter_rows(q_ch, _NTSC_Q_BW, num_taps, nyquist)
 
     carrier_i = _ntsc_build_carrier(ntsc_h, ntsc_w, _NTSC_I_PHASE, device, scale)
     carrier_q = _ntsc_build_carrier(ntsc_h, ntsc_w, _NTSC_Q_PHASE, device, scale)
 
     composite = y_ch + i_ch * carrier_i + q_ch * carrier_q
     composite = composite * _NTSC_COMPOSITE_SCALE + _NTSC_COMPOSITE_OFFSET
-    composite = _ntsc_fir_filter_rows(composite, fir_y)
+    composite = _ntsc_fir_filter_rows(composite, _NTSC_LUMA_BW, num_taps, nyquist)
 
     # === Effects ===
 
     if enable_vhs:
         vhs_luma, vhs_chroma = _ntsc_comb_2sample(composite, scale)
-        lut_period = 4 * scale
-        cos_lut = torch.cos(
-            (3.141592653589793 / 2.0)
-            * torch.arange(lut_period, device=device, dtype=torch.float32)
-            / scale
-        )
-        nsin_lut = -torch.sin(
-            (3.141592653589793 / 2.0)
-            * torch.arange(lut_period, device=device, dtype=torch.float32)
-            / scale
-        )
-        col_idx = torch.arange(ntsc_w, device=device) % lut_period
-        cos_carrier = cos_lut[col_idx].reshape(1, 1, 1, ntsc_w)
-        nsin_carrier = nsin_lut[col_idx].reshape(1, 1, 1, ntsc_w)
+        cos_carrier, nsin_carrier = _ntsc_vhs_carriers(scale, ntsc_w, device)
 
         i_bb = 2.0 * vhs_chroma * cos_carrier
         q_bb = 2.0 * vhs_chroma * nsin_carrier
 
         vhs_taps = 61 * scale
-        fir_cu = _ntsc_design_fir(color_under_bw * 1000.0, vhs_taps, device, nyquist)
-        i_bb = _ntsc_fir_filter_rows(i_bb, fir_cu)
-        q_bb = _ntsc_fir_filter_rows(q_bb, fir_cu)
+        color_under_hz = color_under_bw * 1000.0
+        i_bb = _ntsc_fir_filter_rows(i_bb, color_under_hz, vhs_taps, nyquist)
+        q_bb = _ntsc_fir_filter_rows(q_bb, color_under_hz, vhs_taps, nyquist)
 
         vhs_chroma = i_bb * cos_carrier + q_bb * nsin_carrier
 
-        fir_vhs_y = _ntsc_design_fir(
-            vhs_luma_bw * 1e6, vhs_taps, device, nyquist
+        vhs_luma = _ntsc_fir_filter_rows(
+            vhs_luma, vhs_luma_bw * 1e6, vhs_taps, nyquist
         )
-        vhs_luma = _ntsc_fir_filter_rows(vhs_luma, fir_vhs_y)
 
         composite = vhs_luma + vhs_chroma
 
     if edge_ringing > 0:
         luma_tmp, _ = _ntsc_comb_2sample(composite, scale)
-        fir_detail = _ntsc_design_fir(1.5e6, 91 * scale, device, nyquist)
-        blurred = _ntsc_fir_filter_rows(luma_tmp, fir_detail)
+        blurred = _ntsc_fir_filter_rows(luma_tmp, 1.5e6, 91 * scale, nyquist)
         composite = composite + edge_ringing * (luma_tmp - blurred)
 
     if luma_noise > 0:
         luma_level = ((composite - _NTSC_BLANKING_V) / 0.66).clamp(0, 1)
         noise_scale = 1.0 - 0.7 * luma_level
         raw_noise = torch.randn_like(composite)
-        fir_noise = _ntsc_design_fir(3.0e6, 31 * scale, device, nyquist)
-        filtered_noise = _ntsc_fir_filter_rows(raw_noise, fir_noise)
+        filtered_noise = _ntsc_fir_filter_rows(raw_noise, 3.0e6, 31 * scale, nyquist)
         composite = composite + luma_noise * noise_scale * filtered_noise
 
     if noise > 0:
@@ -1397,14 +1456,14 @@ def ntsc_composite_pt(
     else:
         dec_luma, dec_chroma = _ntsc_comb_2sample(composite, scale)
 
-    dec_luma = _ntsc_fir_filter_rows(dec_luma, fir_y)
+    dec_luma = _ntsc_fir_filter_rows(dec_luma, _NTSC_LUMA_BW, num_taps, nyquist)
     dec_luma = (dec_luma - _NTSC_COMPOSITE_OFFSET) / _NTSC_COMPOSITE_SCALE
 
     i_demod = 2.0 * dec_chroma * carrier_i
     q_demod = 2.0 * dec_chroma * carrier_q
 
-    i_decoded = _ntsc_fir_filter_rows(i_demod, fir_i)
-    q_decoded = _ntsc_fir_filter_rows(q_demod, fir_q)
+    i_decoded = _ntsc_fir_filter_rows(i_demod, _NTSC_I_BW, num_taps, nyquist)
+    q_decoded = _ntsc_fir_filter_rows(q_demod, _NTSC_Q_BW, num_taps, nyquist)
 
     i_decoded = i_decoded / _NTSC_COMPOSITE_SCALE
     q_decoded = q_decoded / _NTSC_COMPOSITE_SCALE
