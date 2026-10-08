@@ -63,6 +63,22 @@ cached load 0.5 s.
 | floydsteinberg b1 2048² | 8.3 ms | 114 ms | 13.8x |
 | riemersma b1 2048² | 241 ms | 142 ms | 0.6x (routed to CPU) |
 
+### Palette-mode dithering on the GPU (same kernel files, `palette_*` entry points)
+70 % of the owner's dithering events take the palette path (Pillow median cut, then chainner_ext's palette
+diffusion), which ran per image on the CPU. The median cut stays on the CPU (byte-identical palettes, 16-thread
+pool over the downloaded uint8 batch, ~1.3 ms per 128² image); the dithering runs as a batched kernel with the
+reference's exact semantics (unique colours sorted by the luma-weighted key in total order, squared Euclidean
+distance summed in channel order, first-minimum tie rule, clip-then-lookup, NaN rules). Bit-identical to the CPU
+path in 86 cases. `cut` = the median-cut floor inside the GPU path.
+
+| batch × size, 256 colours | CPU path | GPU path | cut | speedup |
+|---|---|---|---|---|
+| 8 × 128² floydsteinberg / riemersma / quantize | 89 / 91 / 89 ms | 19 / 34 / 18 ms | 17 ms | 4.7× / 2.7× / 4.9× |
+| 16 × 128² (owner's config) floydsteinberg / riemersma / quantize | 173 / 178 / 178 ms | 24 / 36 / 23 ms | 21 ms | 7.2× / 5.0× / 7.8× |
+| 8 × 256² floydsteinberg / riemersma | 363 / 376 ms | 78 / 146 ms | 76 ms | 4.7× / 2.6× |
+
+Further gains need a different median cut; Pillow's is the floor.
+
 ### Sync-free noise and DiffJPEG (`traiNNer/data/degradations.py`, `traiNNer/utils/diffjpeg.py`)
 Poisson: the per-image `torch.unique` loop became a batched device-side level count (sort, count changes, log2/ceil
 in float64); the gray decision is evaluated once; with scale range [0, 0] and `gray_prob` ≤ 0 the noise is skipped
@@ -145,8 +161,29 @@ WebP decode only partly releases the GIL (1.8x on 8 threads), a backend change w
 | Riemersma, JPEG | 21.5 / 25.4 ms | 8.6 / 13.4 ms | 23.0 → 9.6 |
 | Floyd-Steinberg, mixed codecs | 31.1 / 68.7 ms | 21.5 / 38.3 ms | 42.9 → 25.0 |
 
-The owner's DUAL training-pressure after-run (palette dithering, resize autotune) is recorded below once those
-lanes land.
+### Training pressure after (owner's DUAL config, commit fbbaec71, same script and arguments)
+
+| degradations | feed_data in loop before → after | train step | ratio before → after | iteration (feed_data + step) |
+|---|---|---|---|---|
+| all (JPEG, palette 0.7) | 203.2 → 32.3 ms (isolated 199.8 → 34.4) | 89.0 ms | 2.25 → 0.36 | ~292 → ~121 ms (2.4×) |
+| none | 10.7 → 0.9 ms | 89.4 ms | 0.12 → 0.01 | |
+
+What remains in the 34 ms: dithering 21.2 ms (45 %, the Pillow median cut in palette mode is the floor; the
+GPU kernels are ~3 ms of it), DiffJPEG 2.35 ms per call (two calls), NLMeans, NTSC; `resize_pt` median 0.24 ms
+with a 2.0 ms mean from the first-time tuning of its 24 shapes inside a 50-batch window (paid once per process).
+Peak training allocation unchanged (9.4 GiB).
+
+### Side-stream pipelining (prototype on branch `otf-pipeline`, not shipped)
+A prototype (`otf_pipeline: false` by default) runs batch i+1's degradation on a side CUDA stream after batch i's
+`optimize_parameters` is launched. Output-identical (10/10 iterations `torch.equal` with the real optimizer step,
+two configurations), but the paired gain on the owner's config is +1.1 / +0.9 / 0.0 / +0.1 % (none / JPEG uniform /
+JPEG palette / mixed codecs), inside the A–A' noise. Cause, measured: the training step ends host-synchronous (loss
+and grad-norm `.item()` checks, then `ema_pytorch`'s `.item()` calls after the optimizer step), so no GPU work is
+left queued when the next degradation is launched, and the chain is launch-bound (its side-stream span equals its
+host launch time). What would create a window: removing those three host syncs from the step, a launcher thread
+(RNG reproducibility would need a separate generator), or CUDA graphs for the GPU-only part of the chain. Found on
+the way and fixed on the main branch: the NLMeans and IIR kernels launched on the legacy default stream
+(`fbbaec71`); every log line advances Python's `random`, which the chain draws from (fix in progress, lane C2).
 
 ## Decisions
 - GPU stays the home of the degradations: their cost is additive per step either way, and hiding them on the CPU
