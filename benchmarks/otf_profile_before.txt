@@ -1,0 +1,1420 @@
+========================================================================================================================
+OTF profile  dither=floydsteinberg  codecs=jpeg  2026-10-09T03:57:34
+========================================================================================================================
+Command: /home/rift/workspace/traiNNer-redux/venv/bin/python benchmarks/otf_profile.py --dither floydsteinberg --codecs jpeg --out /home/rift/workspace/scratch/trainner-cuda-dither/benchmarks/otf_profile_before.txt
+Work tree: /home/rift/workspace/scratch/otf-profile-base @ 0ed482f; modified tracked files: none
+torch 2.14.0.dev20260802+cu132, NVIDIA GeForce RTX 5090, 32 CPUs, process affinity 0-31 (32 CPUs)
+Before CUDA init: load average (0.47, 0.92, 0.72); GPU 2409 MiB, 1 %
+Option file: /home/rift/workspace/scratch/otf-profile-base/options/train/DRFT/4x_DRFT_S.yml
+Batch: 8 x GT crop 256 (dataset crop 288), workers 8, warm-up 5, 50 timed batches per pass, passes A and B interleaved
+Final tensors: lq (8, 3, 64, 64), gt (8, 3, 256, 256)
+
+  dataloader fetch (prefetcher.next + sync)    median     0.63  p90     0.82  mean     0.69  min     0.46  ms
+Pass A - feed_data, synchronize only before/after the call (unsynced total):
+  feed_data                                    median    21.18  p90    24.49  mean    22.52  min    17.43  ms
+Pass B - feed_data with a CUDA sync before/after every stage (adds sync overhead):
+  feed_data (instrumented)                     median    22.39  p90    25.89  mean    23.86  min    18.36  ms
+  sum of stage self times, mean per batch: 23.37 ms
+  gap pass B - pass A (mean): 1.35 ms = sync overhead + lost CPU/GPU overlap
+
+GPU memory (torch allocator, cuda:0):
+  allocated before timed passes (model, EMA, OTF queue, warm-up state): 0.923 GiB
+  peak allocated during passes A+B: 1.271 GiB (+0.347 GiB over the baseline)
+  peak reserved during passes A+B: 1.414 GiB
+
+Per-stage breakdown, pass B (ms per batch; self = exclusive of nested stages;
+share% = stage self time / pass-B feed_data time over all timed batches):
+stage                           self med  self p90 self mean  share%  incl med calls/b incl/call  parent / where
+------------------------------------------------------------------------------------------------------------------------
+random_add_poisson_noise_pt        5.446     6.425     5.547    23.2     5.446    2.00     2.773  GPU
+jpeger (DiffJPEG)                  4.156     6.411     4.784    20.0     4.156    2.00     2.392  in _apply_compression; GPU
+_apply_ntsc                        3.393     5.257     3.872    16.2     3.393    1.00     3.872  GPU + .item() sync (FIR cache key)
+nlmeans_denoise_pt                 2.603     2.845     2.697    11.3     2.603    1.00     2.697  GPU
+_apply_rainbow                     0.612     1.380     2.021     8.5     0.612    1.00     2.021  GPU
+_apply_hf_noise                    1.131     1.869     1.283     5.4     1.131    1.00     1.283  GPU + .item() sync (gray mask)
+apply_per_image                    0.973     1.405     0.989     4.1     0.973    1.00     0.989  in _apply_dithering; CPU: D2H, serial numpy per image, H2D
+_apply_lowpass                     0.317     0.564     0.384     1.6     0.317    1.00     0.384  GPU
+_apply_overshoot                   0.269     0.482     0.332     1.4     0.269    1.00     0.332  GPU
+_dequeue_and_enqueue               0.325     0.465     0.324     1.4     0.325    1.00     0.324  GPU (CPU randperm index)
+_apply_compression                 0.155     0.266     0.181     0.8     4.305    2.00     2.482  dispatch (children below)
+filter2d                           0.156     0.203     0.169     0.7     0.156    1.00     0.169  GPU
+_apply_interlace                   0.125     0.201     0.155     0.6     0.125    1.00     0.155  GPU
+_apply_ghosting                    0.130     0.201     0.149     0.6     0.130    1.00     0.149  GPU
+_apply_shift                       0.091     0.144     0.125     0.5     0.091    1.00     0.125  GPU
+resize_pt                          0.094     0.156     0.122     0.5     0.094    1.00     0.122  GPU
+_apply_dithering                   0.073     0.155     0.091     0.4     1.065    1.00     1.080  dispatch (children below)
+_apply_scanline                    0.050     0.133     0.072     0.3     0.050    1.00     0.072  GPU
+_apply_subsampling                 0.024     0.058     0.041     0.2     0.024    1.00     0.041  GPU
+paired_random_crop                 0.021     0.049     0.025     0.1     0.021    1.00     0.025  GPU
+_select_active_degradations        0.006     0.008     0.007     0.0     0.006    1.00     0.007  CPU (Python only)
+------------------------------------------------------------------------------------------------------------------------
+sum of stage self times                               23.370    97.9
+unattributed (glue, clamp/round)                         0.494     2.1
+off-GPU stages (CPU round trip)                         0.989     4.1  apply_per_image, apply_per_image_parallel, compress_video_batch
+
+Implicit host syncs inside feed_data (torch sync debug mode, 10 batches):
+syncs/batch  location  |  source line
+------------------------------------------------------------------------------------------------------------------------
+      16.00  /home/rift/workspace/traiNNer-redux/venv/lib/python3.12/site-packages/torch/functional.py:973  |  output, inverse_indices, counts = torch._unique2(
+      16.00  traiNNer/utils/diffjpeg.py:57  |  if quality < 50:
+       7.00  traiNNer/data/gpu_degradations.py:1150  |  cache_key = (round(kernel.sum().item() * 1e8), num_taps, fft_n)
+       2.00  traiNNer/data/degradations.py:786  |  if cal_gray_noise:
+       2.00  traiNNer/data/degradations.py:804  |  vals = img.new_tensor(vals_list).view(b, 1, 1, 1)
+       2.00  traiNNer/data/degradations.py:807  |  if cal_gray_noise and noise_gray is not None:
+       1.00  traiNNer/data/gpu_degradations.py:1286  |  m_fwd = _NTSC_RGB_TO_YIQ.to(device)
+       1.00  traiNNer/data/gpu_degradations.py:1287  |  m_inv = _NTSC_YIQ_TO_RGB.to(device)
+       1.00  traiNNer/models/realesrgan_model.py:169  |  shape_a = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:183  |  shape_b = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:190  |  alpha = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:207  |  gray_mask = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:212  |  gray_count = int(gray_mask.sum().item())
+       1.00  traiNNer/models/realesrgan_model.py:218  |  shape_a[gray_mask],
+       1.00  traiNNer/models/realesrgan_model.py:219  |  shape_b[gray_mask],
+       1.00  traiNNer/models/realesrgan_model.py:223  |  noise[gray_mask] = gray_noise
+       1.00  traiNNer/data/otf_degradations.py:93  |  batch_np = tensor.detach().cpu().float().numpy()  # BCHW float32
+       1.00  traiNNer/data/otf_degradations.py:100  |  return torch.from_numpy(stacked).to(device=device, dtype=dtype)
+       1.00  traiNNer/models/realesrgan_model.py:123  |  self.queue_lr = self.queue_lr[idx]
+       1.00  traiNNer/models/realesrgan_model.py:124  |  self.queue_gt = self.queue_gt[idx]
+       0.10  <unattributed: reported on set_sync_debug_mode>:0  |  
+
+Overrides applied in memory to the option file:
+  ntsc_prob: 1.0
+  rainbow_prob: 1.0
+  ghosting_prob: 1.0
+  interlace_prob: 1.0
+  scanline_prob: 1.0
+  lowpass_prob: 1.0
+  overshoot_prob: 1.0
+  shift_prob: 1.0
+  subsampling_prob: 1.0
+  dithering_prob: 1.0
+  otf_hf_noise_prob: 1.0
+  dithering_types: ['floydsteinberg']
+  otf_degradation_combos: None
+  compress_prob: 1.0
+  compress_prob2: 1.0
+  compress_jpeg_range: (75, 95)
+  compress_jpeg_range2: (75, 95)
+  otf_hf_noise_denoise_lq: True
+  compress_algorithms: ['jpeg']
+  compress_algorithm_probs: [1.0]
+  compress_algorithms2: ['jpeg']
+  compress_algorithm_probs2: [1.0]
+  datasets.train.dataroot_gt: ['/home/rift/workspace/traiNNer-redux/datasets/val/MANGA109/HR']
+  datasets.train.batch_size_per_gpu: 8
+  datasets.train.num_worker_per_gpu: 8
+  datasets.train.gt_size: 256
+  datasets.train.lq_size: None
+Effective OTF options (model.opt):
+  scale: 4
+  use_amp: True
+  use_channels_last: True
+  high_order_degradation: True
+  high_order_degradations_debug: False
+  high_order_degradations_debug_limit: 100
+  otf_degradation_combos: None
+  otf_degradation_combo_weights: None
+  otf_no_combo_weight: 0.5
+  otf_global_degradations: None
+  otf_hf_noise_normalize: True
+  otf_hf_noise_prob: 1.0
+  otf_hf_noise_alpha_range: (0.01, 0.05)
+  otf_hf_noise_beta_shape_range: (2, 5)
+  otf_hf_noise_beta_offset_range: None
+  otf_hf_noise_gray_prob: 1
+  otf_hf_noise_denoise_lq: True
+  otf_hf_noise_denoise_strength: 30.0
+  dithering_prob: 1.0
+  dithering_types: ['floydsteinberg']
+  dithering_quantize_range: (2, 10)
+  dithering_map_size: [4, 8]
+  dithering_history_range: (10, 15)
+  dithering_ratio_range: (0.1, 0.9)
+  dithering_palette_mode: 0.0
+  dithering_palette_size: (8, 64)
+  shift_prob: 1.0
+  shift_types: ['rgb']
+  shift_percent: False
+  shift_rgb_r: [[0, 0], [0, 0]]
+  shift_rgb_g: [[0, 0], [0, 0]]
+  shift_rgb_b: [[0, 0], [0, 0]]
+  shift_yuv_y: [[0, 0], [0, 0]]
+  shift_yuv_u: [[0, 0], [0, 0]]
+  shift_yuv_v: [[0, 0], [0, 0]]
+  shift_cmyk_c: [[0, 0], [0, 0]]
+  shift_cmyk_m: [[0, 0], [0, 0]]
+  shift_cmyk_y: [[0, 0], [0, 0]]
+  shift_cmyk_k: [[0, 0], [0, 0]]
+  subsampling_prob: 1.0
+  subsampling_down_algorithms: ['nearest']
+  subsampling_up_algorithms: ['nearest']
+  subsampling_formats: ['4:4:4']
+  subsampling_blur_range: None
+  subsampling_ycbcr_type: ['601']
+  ghosting_prob: 1.0
+  ghosting_shift_x: [1, 8]
+  ghosting_shift_y: [0, 2]
+  ghosting_opacity: [0.05, 0.25]
+  interlace_prob: 1.0
+  interlace_field_shift: [1, 5]
+  interlace_dominant_field: ['top', 'bottom']
+  lowpass_prob: 1.0
+  lowpass_cutoff: [0.3, 0.8]
+  lowpass_order: [1, 5]
+  lowpass_detail_mask: False
+  lowpass_mask_lines_brz: 0.08
+  ntsc_prob: 1.0
+  ntsc_preset: ['broadcast']
+  ntsc_comb_mode: 2sample
+  ntsc_enable_vhs: False
+  ntsc_noise: [0.03, 0.03]
+  ntsc_luma_noise: [0.0, 0.0]
+  ntsc_ghost_amplitude: [0.0, 0.0]
+  ntsc_ghost_delay_us: [1.5, 1.5]
+  ntsc_ghost_phase: [180.0, 180.0]
+  ntsc_jitter: [0.0, 0.0]
+  ntsc_edge_ringing: [0.0, 0.0]
+  ntsc_vhs_luma_bw: [4.2, 4.2]
+  ntsc_color_under_bw: [500.0, 500.0]
+  ntsc_tape_trailing: [0.0, 0.0]
+  ntsc_intensity: [1.0, 1.0]
+  overshoot_prob: 1.0
+  overshoot_amount: [0.5, 2.0]
+  overshoot_cutoff: [0.2, 0.5]
+  overshoot_order: [1, 3]
+  rainbow_prob: 1.0
+  rainbow_subcarrier_freq: [0.2, 0.3]
+  rainbow_chroma_bandwidth: [0.04, 0.12]
+  rainbow_intensity: [0.3, 1.0]
+  rainbow_phase_alternation: True
+  scanline_prob: 1.0
+  scanline_strength: [0.1, 0.5]
+  scanline_even_lines: True
+  lq_usm: False
+  lq_usm_radius_range: (1, 25)
+  blur_prob: 0.0
+  thicklines_prob: 0.0
+  resize_prob: [0.0, 0.0, 1.0]
+  resize_mode_list: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob: [0.0, 1.0, 0.0, 0.0]
+  resize_range: (1.0, 1.0)
+  gaussian_noise_prob: 0.0
+  noise_range: (0.0, 0.0)
+  poisson_scale_range: (0.0, 0.0)
+  gray_noise_prob: 0.0
+  compress_prob: 1.0
+  compress_algorithms: ['jpeg']
+  compress_algorithm_probs: [1.0]
+  compress_jpeg_range: (75, 95)
+  compress_webp_range: (50, 95)
+  compress_h264_range: (20, 40)
+  compress_hevc_range: (20, 40)
+  compress_mpeg2_range: (2, 20)
+  compress_mpeg4_range: (2, 20)
+  compress_vp9_range: (20, 50)
+  compress_video_sampling: ['444', '422', '420']
+  compress_video_sampling_weights: None
+  blur_prob2: 0.0
+  resize_prob2: [0.0, 0.0, 1.0]
+  resize_mode_list2: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob2: [0.0, 1.0, 0.0, 0.0]
+  resize_range2: (1.0, 1.0)
+  gaussian_noise_prob2: 0.0
+  noise_range2: (0.0, 0.0)
+  poisson_scale_range2: (0.0, 0.0)
+  gray_noise_prob2: 0.0
+  compress_prob2: 1.0
+  compress_algorithms2: ['jpeg']
+  compress_algorithm_probs2: [1.0]
+  compress_jpeg_range2: (75, 95)
+  compress_webp_range2: (50, 95)
+  compress_h264_range2: (20, 40)
+  compress_hevc_range2: (20, 40)
+  compress_mpeg2_range2: (2, 20)
+  compress_mpeg4_range2: (2, 20)
+  compress_vp9_range2: (20, 50)
+  compress_video_sampling2: ['444', '422', '420']
+  compress_video_sampling_weights2: None
+  resize_mode_list3: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob3: [0.0, 1.0, 0.0, 0.0]
+  queue_size: 64
+Effective train dataset options:
+  name: Train Dataset
+  type: realesrgandataset
+  io_backend: {'type': 'disk'}
+  num_worker_per_gpu: 8
+  batch_size_per_gpu: 8
+  accum_iter: 2
+  use_hflip: True
+  use_rot: True
+  gt_size: 256
+  lq_size: 64
+  phase: train
+  scale: 4
+  dataset_enlarge_ratio: auto
+  prefetch_mode: cuda
+  pin_memory: True
+  persistent_workers: True
+  num_prefetch_queue: 1
+  prefetch_factor: 2
+  dataroot_gt: ['/home/rift/workspace/traiNNer-redux/datasets/val/MANGA109/HR']
+  filename_tmpl: {}
+  blur_kernel_size: 12
+  kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+  kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+  kernel_range: (5, 17)
+  sinc_prob: 0
+  blur_sigma: (0.2, 2)
+  betag_range: (0.5, 4)
+  betap_range: (1, 2)
+  blur_kernel_size2: 12
+  kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+  kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+  kernel_range2: (5, 17)
+  sinc_prob2: 0
+  blur_sigma2: (0.2, 1)
+  betag_range2: (0.5, 4)
+  betap_range2: (1, 2)
+  final_sinc_prob: 0
+  final_kernel_range: (5, 17)
+
+========================================================================================================================
+OTF profile  dither=riemersma  codecs=jpeg  2026-10-09T03:57:47
+========================================================================================================================
+Command: /home/rift/workspace/traiNNer-redux/venv/bin/python benchmarks/otf_profile.py --dither riemersma --codecs jpeg --out /home/rift/workspace/scratch/trainner-cuda-dither/benchmarks/otf_profile_before.txt --append
+Work tree: /home/rift/workspace/scratch/otf-profile-base @ 0ed482f; modified tracked files: none
+torch 2.14.0.dev20260802+cu132, NVIDIA GeForce RTX 5090, 32 CPUs, process affinity 0-31 (32 CPUs)
+Before CUDA init: load average (0.73, 0.96, 0.74); GPU 2417 MiB, 0 %
+Option file: /home/rift/workspace/scratch/otf-profile-base/options/train/DRFT/4x_DRFT_S.yml
+Batch: 8 x GT crop 256 (dataset crop 288), workers 8, warm-up 5, 50 timed batches per pass, passes A and B interleaved
+Final tensors: lq (8, 3, 64, 64), gt (8, 3, 256, 256)
+
+  dataloader fetch (prefetcher.next + sync)    median     0.65  p90     0.90  mean     0.70  min     0.51  ms
+Pass A - feed_data, synchronize only before/after the call (unsynced total):
+  feed_data                                    median    21.46  p90    25.35  mean    23.01  min    18.55  ms
+Pass B - feed_data with a CUDA sync before/after every stage (adds sync overhead):
+  feed_data (instrumented)                     median    23.28  p90    26.84  mean    24.85  min    19.53  ms
+  sum of stage self times, mean per batch: 24.35 ms
+  gap pass B - pass A (mean): 1.84 ms = sync overhead + lost CPU/GPU overlap
+
+GPU memory (torch allocator, cuda:0):
+  allocated before timed passes (model, EMA, OTF queue, warm-up state): 0.923 GiB
+  peak allocated during passes A+B: 1.271 GiB (+0.347 GiB over the baseline)
+  peak reserved during passes A+B: 1.414 GiB
+
+Per-stage breakdown, pass B (ms per batch; self = exclusive of nested stages;
+share% = stage self time / pass-B feed_data time over all timed batches):
+stage                           self med  self p90 self mean  share%  incl med calls/b incl/call  parent / where
+------------------------------------------------------------------------------------------------------------------------
+random_add_poisson_noise_pt        5.792     6.563     5.830    23.5     5.792    2.00     2.915  GPU
+jpeger (DiffJPEG)                  4.493     6.783     5.112    20.6     4.493    2.00     2.556  in _apply_compression; GPU
+_apply_ntsc                        3.491     5.343     3.875    15.6     3.491    1.00     3.875  GPU + .item() sync (FIR cache key)
+nlmeans_denoise_pt                 2.654     3.052     2.760    11.1     2.654    1.00     2.760  GPU
+_apply_rainbow                     0.594     0.905     1.997     8.0     0.594    1.00     1.997  GPU
+apply_per_image                    1.322     1.750     1.276     5.1     1.322    1.00     1.276  in _apply_dithering; CPU: D2H, serial numpy per image, H2D
+_apply_hf_noise                    1.169     1.629     1.259     5.1     1.169    1.00     1.259  GPU + .item() sync (gray mask)
+_dequeue_and_enqueue               0.332     0.616     0.376     1.5     0.332    1.00     0.376  GPU (CPU randperm index)
+_apply_lowpass                     0.334     0.516     0.360     1.4     0.334    1.00     0.360  GPU
+_apply_overshoot                   0.281     0.439     0.335     1.3     0.281    1.00     0.335  GPU
+filter2d                           0.161     0.353     0.203     0.8     0.161    1.00     0.203  GPU
+_apply_compression                 0.166     0.325     0.186     0.7     4.669    2.00     2.649  dispatch (children below)
+_apply_ghosting                    0.131     0.162     0.154     0.6     0.131    1.00     0.154  GPU
+_apply_interlace                   0.127     0.189     0.140     0.6     0.127    1.00     0.140  GPU
+_apply_shift                       0.095     0.191     0.124     0.5     0.095    1.00     0.124  GPU
+resize_pt                          0.096     0.179     0.117     0.5     0.096    1.00     0.117  GPU
+_apply_dithering                   0.073     0.154     0.087     0.4     1.400    1.00     1.363  dispatch (children below)
+_apply_scanline                    0.050     0.161     0.082     0.3     0.050    1.00     0.082  GPU
+_apply_subsampling                 0.025     0.082     0.044     0.2     0.025    1.00     0.044  GPU
+paired_random_crop                 0.021     0.029     0.023     0.1     0.021    1.00     0.023  GPU
+_select_active_degradations        0.006     0.016     0.009     0.0     0.006    1.00     0.009  CPU (Python only)
+------------------------------------------------------------------------------------------------------------------------
+sum of stage self times                               24.350    98.0
+unattributed (glue, clamp/round)                         0.503     2.0
+off-GPU stages (CPU round trip)                         1.276     5.1  apply_per_image, apply_per_image_parallel, compress_video_batch
+
+Implicit host syncs inside feed_data (torch sync debug mode, 10 batches):
+syncs/batch  location  |  source line
+------------------------------------------------------------------------------------------------------------------------
+      16.00  /home/rift/workspace/traiNNer-redux/venv/lib/python3.12/site-packages/torch/functional.py:973  |  output, inverse_indices, counts = torch._unique2(
+      16.00  traiNNer/utils/diffjpeg.py:57  |  if quality < 50:
+       7.00  traiNNer/data/gpu_degradations.py:1150  |  cache_key = (round(kernel.sum().item() * 1e8), num_taps, fft_n)
+       2.00  traiNNer/data/degradations.py:786  |  if cal_gray_noise:
+       2.00  traiNNer/data/degradations.py:804  |  vals = img.new_tensor(vals_list).view(b, 1, 1, 1)
+       2.00  traiNNer/data/degradations.py:807  |  if cal_gray_noise and noise_gray is not None:
+       1.00  traiNNer/data/gpu_degradations.py:1286  |  m_fwd = _NTSC_RGB_TO_YIQ.to(device)
+       1.00  traiNNer/data/gpu_degradations.py:1287  |  m_inv = _NTSC_YIQ_TO_RGB.to(device)
+       1.00  traiNNer/models/realesrgan_model.py:169  |  shape_a = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:183  |  shape_b = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:190  |  alpha = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:207  |  gray_mask = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:212  |  gray_count = int(gray_mask.sum().item())
+       1.00  traiNNer/models/realesrgan_model.py:218  |  shape_a[gray_mask],
+       1.00  traiNNer/models/realesrgan_model.py:219  |  shape_b[gray_mask],
+       1.00  traiNNer/models/realesrgan_model.py:223  |  noise[gray_mask] = gray_noise
+       1.00  traiNNer/data/otf_degradations.py:93  |  batch_np = tensor.detach().cpu().float().numpy()  # BCHW float32
+       1.00  traiNNer/data/otf_degradations.py:100  |  return torch.from_numpy(stacked).to(device=device, dtype=dtype)
+       1.00  traiNNer/models/realesrgan_model.py:123  |  self.queue_lr = self.queue_lr[idx]
+       1.00  traiNNer/models/realesrgan_model.py:124  |  self.queue_gt = self.queue_gt[idx]
+       0.10  <unattributed: reported on set_sync_debug_mode>:0  |  
+
+Overrides applied in memory to the option file:
+  ntsc_prob: 1.0
+  rainbow_prob: 1.0
+  ghosting_prob: 1.0
+  interlace_prob: 1.0
+  scanline_prob: 1.0
+  lowpass_prob: 1.0
+  overshoot_prob: 1.0
+  shift_prob: 1.0
+  subsampling_prob: 1.0
+  dithering_prob: 1.0
+  otf_hf_noise_prob: 1.0
+  dithering_types: ['riemersma']
+  otf_degradation_combos: None
+  compress_prob: 1.0
+  compress_prob2: 1.0
+  compress_jpeg_range: (75, 95)
+  compress_jpeg_range2: (75, 95)
+  otf_hf_noise_denoise_lq: True
+  compress_algorithms: ['jpeg']
+  compress_algorithm_probs: [1.0]
+  compress_algorithms2: ['jpeg']
+  compress_algorithm_probs2: [1.0]
+  datasets.train.dataroot_gt: ['/home/rift/workspace/traiNNer-redux/datasets/val/MANGA109/HR']
+  datasets.train.batch_size_per_gpu: 8
+  datasets.train.num_worker_per_gpu: 8
+  datasets.train.gt_size: 256
+  datasets.train.lq_size: None
+Effective OTF options (model.opt):
+  scale: 4
+  use_amp: True
+  use_channels_last: True
+  high_order_degradation: True
+  high_order_degradations_debug: False
+  high_order_degradations_debug_limit: 100
+  otf_degradation_combos: None
+  otf_degradation_combo_weights: None
+  otf_no_combo_weight: 0.5
+  otf_global_degradations: None
+  otf_hf_noise_normalize: True
+  otf_hf_noise_prob: 1.0
+  otf_hf_noise_alpha_range: (0.01, 0.05)
+  otf_hf_noise_beta_shape_range: (2, 5)
+  otf_hf_noise_beta_offset_range: None
+  otf_hf_noise_gray_prob: 1
+  otf_hf_noise_denoise_lq: True
+  otf_hf_noise_denoise_strength: 30.0
+  dithering_prob: 1.0
+  dithering_types: ['riemersma']
+  dithering_quantize_range: (2, 10)
+  dithering_map_size: [4, 8]
+  dithering_history_range: (10, 15)
+  dithering_ratio_range: (0.1, 0.9)
+  dithering_palette_mode: 0.0
+  dithering_palette_size: (8, 64)
+  shift_prob: 1.0
+  shift_types: ['rgb']
+  shift_percent: False
+  shift_rgb_r: [[0, 0], [0, 0]]
+  shift_rgb_g: [[0, 0], [0, 0]]
+  shift_rgb_b: [[0, 0], [0, 0]]
+  shift_yuv_y: [[0, 0], [0, 0]]
+  shift_yuv_u: [[0, 0], [0, 0]]
+  shift_yuv_v: [[0, 0], [0, 0]]
+  shift_cmyk_c: [[0, 0], [0, 0]]
+  shift_cmyk_m: [[0, 0], [0, 0]]
+  shift_cmyk_y: [[0, 0], [0, 0]]
+  shift_cmyk_k: [[0, 0], [0, 0]]
+  subsampling_prob: 1.0
+  subsampling_down_algorithms: ['nearest']
+  subsampling_up_algorithms: ['nearest']
+  subsampling_formats: ['4:4:4']
+  subsampling_blur_range: None
+  subsampling_ycbcr_type: ['601']
+  ghosting_prob: 1.0
+  ghosting_shift_x: [1, 8]
+  ghosting_shift_y: [0, 2]
+  ghosting_opacity: [0.05, 0.25]
+  interlace_prob: 1.0
+  interlace_field_shift: [1, 5]
+  interlace_dominant_field: ['top', 'bottom']
+  lowpass_prob: 1.0
+  lowpass_cutoff: [0.3, 0.8]
+  lowpass_order: [1, 5]
+  lowpass_detail_mask: False
+  lowpass_mask_lines_brz: 0.08
+  ntsc_prob: 1.0
+  ntsc_preset: ['broadcast']
+  ntsc_comb_mode: 2sample
+  ntsc_enable_vhs: False
+  ntsc_noise: [0.03, 0.03]
+  ntsc_luma_noise: [0.0, 0.0]
+  ntsc_ghost_amplitude: [0.0, 0.0]
+  ntsc_ghost_delay_us: [1.5, 1.5]
+  ntsc_ghost_phase: [180.0, 180.0]
+  ntsc_jitter: [0.0, 0.0]
+  ntsc_edge_ringing: [0.0, 0.0]
+  ntsc_vhs_luma_bw: [4.2, 4.2]
+  ntsc_color_under_bw: [500.0, 500.0]
+  ntsc_tape_trailing: [0.0, 0.0]
+  ntsc_intensity: [1.0, 1.0]
+  overshoot_prob: 1.0
+  overshoot_amount: [0.5, 2.0]
+  overshoot_cutoff: [0.2, 0.5]
+  overshoot_order: [1, 3]
+  rainbow_prob: 1.0
+  rainbow_subcarrier_freq: [0.2, 0.3]
+  rainbow_chroma_bandwidth: [0.04, 0.12]
+  rainbow_intensity: [0.3, 1.0]
+  rainbow_phase_alternation: True
+  scanline_prob: 1.0
+  scanline_strength: [0.1, 0.5]
+  scanline_even_lines: True
+  lq_usm: False
+  lq_usm_radius_range: (1, 25)
+  blur_prob: 0.0
+  thicklines_prob: 0.0
+  resize_prob: [0.0, 0.0, 1.0]
+  resize_mode_list: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob: [0.0, 1.0, 0.0, 0.0]
+  resize_range: (1.0, 1.0)
+  gaussian_noise_prob: 0.0
+  noise_range: (0.0, 0.0)
+  poisson_scale_range: (0.0, 0.0)
+  gray_noise_prob: 0.0
+  compress_prob: 1.0
+  compress_algorithms: ['jpeg']
+  compress_algorithm_probs: [1.0]
+  compress_jpeg_range: (75, 95)
+  compress_webp_range: (50, 95)
+  compress_h264_range: (20, 40)
+  compress_hevc_range: (20, 40)
+  compress_mpeg2_range: (2, 20)
+  compress_mpeg4_range: (2, 20)
+  compress_vp9_range: (20, 50)
+  compress_video_sampling: ['444', '422', '420']
+  compress_video_sampling_weights: None
+  blur_prob2: 0.0
+  resize_prob2: [0.0, 0.0, 1.0]
+  resize_mode_list2: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob2: [0.0, 1.0, 0.0, 0.0]
+  resize_range2: (1.0, 1.0)
+  gaussian_noise_prob2: 0.0
+  noise_range2: (0.0, 0.0)
+  poisson_scale_range2: (0.0, 0.0)
+  gray_noise_prob2: 0.0
+  compress_prob2: 1.0
+  compress_algorithms2: ['jpeg']
+  compress_algorithm_probs2: [1.0]
+  compress_jpeg_range2: (75, 95)
+  compress_webp_range2: (50, 95)
+  compress_h264_range2: (20, 40)
+  compress_hevc_range2: (20, 40)
+  compress_mpeg2_range2: (2, 20)
+  compress_mpeg4_range2: (2, 20)
+  compress_vp9_range2: (20, 50)
+  compress_video_sampling2: ['444', '422', '420']
+  compress_video_sampling_weights2: None
+  resize_mode_list3: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob3: [0.0, 1.0, 0.0, 0.0]
+  queue_size: 64
+Effective train dataset options:
+  name: Train Dataset
+  type: realesrgandataset
+  io_backend: {'type': 'disk'}
+  num_worker_per_gpu: 8
+  batch_size_per_gpu: 8
+  accum_iter: 2
+  use_hflip: True
+  use_rot: True
+  gt_size: 256
+  lq_size: 64
+  phase: train
+  scale: 4
+  dataset_enlarge_ratio: auto
+  prefetch_mode: cuda
+  pin_memory: True
+  persistent_workers: True
+  num_prefetch_queue: 1
+  prefetch_factor: 2
+  dataroot_gt: ['/home/rift/workspace/traiNNer-redux/datasets/val/MANGA109/HR']
+  filename_tmpl: {}
+  blur_kernel_size: 12
+  kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+  kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+  kernel_range: (5, 17)
+  sinc_prob: 0
+  blur_sigma: (0.2, 2)
+  betag_range: (0.5, 4)
+  betap_range: (1, 2)
+  blur_kernel_size2: 12
+  kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+  kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+  kernel_range2: (5, 17)
+  sinc_prob2: 0
+  blur_sigma2: (0.2, 1)
+  betag_range2: (0.5, 4)
+  betap_range2: (1, 2)
+  final_sinc_prob: 0
+  final_kernel_range: (5, 17)
+
+========================================================================================================================
+OTF profile  dither=floydsteinberg  codecs=mixed  2026-10-09T03:58:01
+========================================================================================================================
+Command: /home/rift/workspace/traiNNer-redux/venv/bin/python benchmarks/otf_profile.py --dither floydsteinberg --codecs mixed --out /home/rift/workspace/scratch/trainner-cuda-dither/benchmarks/otf_profile_before.txt --append
+Work tree: /home/rift/workspace/scratch/otf-profile-base @ 0ed482f; modified tracked files: none
+torch 2.14.0.dev20260802+cu132, NVIDIA GeForce RTX 5090, 32 CPUs, process affinity 0-31 (32 CPUs)
+Before CUDA init: load average (1.08, 1.02, 0.76); GPU 2472 MiB, 0 %
+Option file: /home/rift/workspace/scratch/otf-profile-base/options/train/DRFT/4x_DRFT_S.yml
+Batch: 8 x GT crop 256 (dataset crop 288), workers 8, warm-up 5, 50 timed batches per pass, passes A and B interleaved
+Final tensors: lq (8, 3, 64, 64), gt (8, 3, 256, 256)
+
+  dataloader fetch (prefetcher.next + sync)    median     0.63  p90     0.83  mean     0.67  min     0.48  ms
+Pass A - feed_data, synchronize only before/after the call (unsynced total):
+  feed_data                                    median    31.09  p90    68.74  mean    42.90  min    17.77  ms
+Pass B - feed_data with a CUDA sync before/after every stage (adds sync overhead):
+  feed_data (instrumented)                     median    27.51  p90    77.08  mean    36.93  min    18.75  ms
+  sum of stage self times, mean per batch: 36.41 ms
+  gap pass B - pass A (mean): -5.97 ms = sync overhead + lost CPU/GPU overlap
+
+GPU memory (torch allocator, cuda:0):
+  allocated before timed passes (model, EMA, OTF queue, warm-up state): 0.923 GiB
+  peak allocated during passes A+B: 1.271 GiB (+0.347 GiB over the baseline)
+  peak reserved during passes A+B: 1.414 GiB
+
+Per-stage breakdown, pass B (ms per batch; self = exclusive of nested stages;
+share% = stage self time / pass-B feed_data time over all timed batches):
+stage                           self med  self p90 self mean  share%  incl med calls/b incl/call  parent / where
+------------------------------------------------------------------------------------------------------------------------
+compress_video_batch               0.000    49.512     9.603    26.0     0.000    0.16    60.017  in _apply_compression; CPU: D2H, TorchCodec/PyAV encode+decode, H2D
+random_add_poisson_noise_pt        5.770     6.712     5.922    16.0     5.770    2.00     2.961  GPU
+apply_per_image_parallel           0.000    11.470     4.234    11.5     0.000    0.44     9.623  in _apply_compression; CPU: D2H, 8-thread pool, H2D
+_apply_ntsc                        3.479     5.567     4.081    11.1     3.479    1.00     4.081  GPU + .item() sync (FIR cache key)
+jpeger (DiffJPEG)                  3.678     4.540     3.277     8.9     3.678    1.40     2.341  in _apply_compression; GPU
+nlmeans_denoise_pt                 2.807     3.069     2.766     7.5     2.807    1.00     2.766  GPU
+_apply_rainbow                     0.600     1.499     2.131     5.8     0.600    1.00     2.131  GPU
+_apply_hf_noise                    1.152     1.568     1.280     3.5     1.152    1.00     1.280  GPU + .item() sync (gray mask)
+apply_per_image                    0.989     1.169     0.982     2.7     0.989    1.00     0.982  in _apply_dithering; CPU: D2H, serial numpy per image, H2D
+_apply_lowpass                     0.308     0.405     0.342     0.9     0.308    1.00     0.342  GPU
+_dequeue_and_enqueue               0.332     0.461     0.339     0.9     0.332    1.00     0.339  GPU (CPU randperm index)
+_apply_overshoot                   0.259     0.394     0.297     0.8     0.259    1.00     0.297  GPU
+filter2d                           0.202     0.314     0.211     0.6     0.202    1.00     0.211  GPU
+_apply_compression                 0.166     0.261     0.187     0.5     8.358    2.00     8.651  dispatch (children below)
+_apply_ghosting                    0.126     0.170     0.155     0.4     0.126    1.00     0.155  GPU
+_apply_interlace                   0.125     0.165     0.139     0.4     0.125    1.00     0.139  GPU
+resize_pt                          0.097     0.251     0.130     0.4     0.097    1.00     0.130  GPU
+_apply_shift                       0.091     0.126     0.116     0.3     0.091    1.00     0.116  GPU
+_apply_dithering                   0.081     0.115     0.088     0.2     1.071    1.00     1.070  dispatch (children below)
+_apply_scanline                    0.049     0.114     0.064     0.2     0.049    1.00     0.064  GPU
+_apply_subsampling                 0.023     0.032     0.029     0.1     0.023    1.00     0.029  GPU
+paired_random_crop                 0.023     0.044     0.028     0.1     0.023    1.00     0.028  GPU
+_select_active_degradations        0.006     0.012     0.009     0.0     0.006    1.00     0.009  CPU (Python only)
+------------------------------------------------------------------------------------------------------------------------
+sum of stage self times                               36.411    98.6
+unattributed (glue, clamp/round)                         0.519     1.4
+off-GPU stages (CPU round trip)                        14.819    40.1  apply_per_image, apply_per_image_parallel, compress_video_batch
+
+Implicit host syncs inside feed_data (torch sync debug mode, 10 batches):
+syncs/batch  location  |  source line
+------------------------------------------------------------------------------------------------------------------------
+      16.00  /home/rift/workspace/traiNNer-redux/venv/lib/python3.12/site-packages/torch/functional.py:973  |  output, inverse_indices, counts = torch._unique2(
+       8.80  traiNNer/utils/diffjpeg.py:57  |  if quality < 50:
+       7.00  traiNNer/data/gpu_degradations.py:1150  |  cache_key = (round(kernel.sum().item() * 1e8), num_taps, fft_n)
+       2.00  traiNNer/data/degradations.py:786  |  if cal_gray_noise:
+       2.00  traiNNer/data/degradations.py:804  |  vals = img.new_tensor(vals_list).view(b, 1, 1, 1)
+       2.00  traiNNer/data/degradations.py:807  |  if cal_gray_noise and noise_gray is not None:
+       1.00  traiNNer/data/gpu_degradations.py:1286  |  m_fwd = _NTSC_RGB_TO_YIQ.to(device)
+       1.00  traiNNer/data/gpu_degradations.py:1287  |  m_inv = _NTSC_YIQ_TO_RGB.to(device)
+       1.00  traiNNer/models/realesrgan_model.py:169  |  shape_a = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:183  |  shape_b = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:190  |  alpha = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:207  |  gray_mask = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:212  |  gray_count = int(gray_mask.sum().item())
+       1.00  traiNNer/models/realesrgan_model.py:218  |  shape_a[gray_mask],
+       1.00  traiNNer/models/realesrgan_model.py:219  |  shape_b[gray_mask],
+       1.00  traiNNer/models/realesrgan_model.py:223  |  noise[gray_mask] = gray_noise
+       1.00  traiNNer/data/otf_degradations.py:93  |  batch_np = tensor.detach().cpu().float().numpy()  # BCHW float32
+       1.00  traiNNer/data/otf_degradations.py:100  |  return torch.from_numpy(stacked).to(device=device, dtype=dtype)
+       1.00  traiNNer/models/realesrgan_model.py:123  |  self.queue_lr = self.queue_lr[idx]
+       1.00  traiNNer/models/realesrgan_model.py:124  |  self.queue_gt = self.queue_gt[idx]
+       0.80  traiNNer/data/otf_degradations.py:121  |  batch_np = tensor.detach().cpu().float().numpy()
+       0.80  traiNNer/data/otf_degradations.py:131  |  return torch.from_numpy(stacked).to(device=device, dtype=dtype)
+       0.10  <unattributed: reported on set_sync_debug_mode>:0  |  
+       0.10  traiNNer/data/compress_video_batch.py:124  |  inp = (tensor.clamp(0, 1) * 255).byte().cpu()
+       0.10  traiNNer/data/compress_video_batch.py:154  |  result = torch.stack(frames).float().div_(255.0).to(device)
+
+Overrides applied in memory to the option file:
+  ntsc_prob: 1.0
+  rainbow_prob: 1.0
+  ghosting_prob: 1.0
+  interlace_prob: 1.0
+  scanline_prob: 1.0
+  lowpass_prob: 1.0
+  overshoot_prob: 1.0
+  shift_prob: 1.0
+  subsampling_prob: 1.0
+  dithering_prob: 1.0
+  otf_hf_noise_prob: 1.0
+  dithering_types: ['floydsteinberg']
+  otf_degradation_combos: None
+  compress_prob: 1.0
+  compress_prob2: 1.0
+  compress_jpeg_range: (75, 95)
+  compress_jpeg_range2: (75, 95)
+  otf_hf_noise_denoise_lq: True
+  compress_algorithms: ['jpeg', 'hevc', 'webp']
+  compress_algorithm_probs: [0.5, 0.3, 0.2]
+  compress_hevc_range: (20, 40)
+  compress_webp_range: (50, 95)
+  compress_video_sampling: ['444', '422', '420']
+  compress_algorithms2: ['jpeg', 'webp']
+  compress_algorithm_probs2: [0.7, 0.3]
+  compress_webp_range2: (60, 95)
+  datasets.train.dataroot_gt: ['/home/rift/workspace/traiNNer-redux/datasets/val/MANGA109/HR']
+  datasets.train.batch_size_per_gpu: 8
+  datasets.train.num_worker_per_gpu: 8
+  datasets.train.gt_size: 256
+  datasets.train.lq_size: None
+Effective OTF options (model.opt):
+  scale: 4
+  use_amp: True
+  use_channels_last: True
+  high_order_degradation: True
+  high_order_degradations_debug: False
+  high_order_degradations_debug_limit: 100
+  otf_degradation_combos: None
+  otf_degradation_combo_weights: None
+  otf_no_combo_weight: 0.5
+  otf_global_degradations: None
+  otf_hf_noise_normalize: True
+  otf_hf_noise_prob: 1.0
+  otf_hf_noise_alpha_range: (0.01, 0.05)
+  otf_hf_noise_beta_shape_range: (2, 5)
+  otf_hf_noise_beta_offset_range: None
+  otf_hf_noise_gray_prob: 1
+  otf_hf_noise_denoise_lq: True
+  otf_hf_noise_denoise_strength: 30.0
+  dithering_prob: 1.0
+  dithering_types: ['floydsteinberg']
+  dithering_quantize_range: (2, 10)
+  dithering_map_size: [4, 8]
+  dithering_history_range: (10, 15)
+  dithering_ratio_range: (0.1, 0.9)
+  dithering_palette_mode: 0.0
+  dithering_palette_size: (8, 64)
+  shift_prob: 1.0
+  shift_types: ['rgb']
+  shift_percent: False
+  shift_rgb_r: [[0, 0], [0, 0]]
+  shift_rgb_g: [[0, 0], [0, 0]]
+  shift_rgb_b: [[0, 0], [0, 0]]
+  shift_yuv_y: [[0, 0], [0, 0]]
+  shift_yuv_u: [[0, 0], [0, 0]]
+  shift_yuv_v: [[0, 0], [0, 0]]
+  shift_cmyk_c: [[0, 0], [0, 0]]
+  shift_cmyk_m: [[0, 0], [0, 0]]
+  shift_cmyk_y: [[0, 0], [0, 0]]
+  shift_cmyk_k: [[0, 0], [0, 0]]
+  subsampling_prob: 1.0
+  subsampling_down_algorithms: ['nearest']
+  subsampling_up_algorithms: ['nearest']
+  subsampling_formats: ['4:4:4']
+  subsampling_blur_range: None
+  subsampling_ycbcr_type: ['601']
+  ghosting_prob: 1.0
+  ghosting_shift_x: [1, 8]
+  ghosting_shift_y: [0, 2]
+  ghosting_opacity: [0.05, 0.25]
+  interlace_prob: 1.0
+  interlace_field_shift: [1, 5]
+  interlace_dominant_field: ['top', 'bottom']
+  lowpass_prob: 1.0
+  lowpass_cutoff: [0.3, 0.8]
+  lowpass_order: [1, 5]
+  lowpass_detail_mask: False
+  lowpass_mask_lines_brz: 0.08
+  ntsc_prob: 1.0
+  ntsc_preset: ['broadcast']
+  ntsc_comb_mode: 2sample
+  ntsc_enable_vhs: False
+  ntsc_noise: [0.03, 0.03]
+  ntsc_luma_noise: [0.0, 0.0]
+  ntsc_ghost_amplitude: [0.0, 0.0]
+  ntsc_ghost_delay_us: [1.5, 1.5]
+  ntsc_ghost_phase: [180.0, 180.0]
+  ntsc_jitter: [0.0, 0.0]
+  ntsc_edge_ringing: [0.0, 0.0]
+  ntsc_vhs_luma_bw: [4.2, 4.2]
+  ntsc_color_under_bw: [500.0, 500.0]
+  ntsc_tape_trailing: [0.0, 0.0]
+  ntsc_intensity: [1.0, 1.0]
+  overshoot_prob: 1.0
+  overshoot_amount: [0.5, 2.0]
+  overshoot_cutoff: [0.2, 0.5]
+  overshoot_order: [1, 3]
+  rainbow_prob: 1.0
+  rainbow_subcarrier_freq: [0.2, 0.3]
+  rainbow_chroma_bandwidth: [0.04, 0.12]
+  rainbow_intensity: [0.3, 1.0]
+  rainbow_phase_alternation: True
+  scanline_prob: 1.0
+  scanline_strength: [0.1, 0.5]
+  scanline_even_lines: True
+  lq_usm: False
+  lq_usm_radius_range: (1, 25)
+  blur_prob: 0.0
+  thicklines_prob: 0.0
+  resize_prob: [0.0, 0.0, 1.0]
+  resize_mode_list: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob: [0.0, 1.0, 0.0, 0.0]
+  resize_range: (1.0, 1.0)
+  gaussian_noise_prob: 0.0
+  noise_range: (0.0, 0.0)
+  poisson_scale_range: (0.0, 0.0)
+  gray_noise_prob: 0.0
+  compress_prob: 1.0
+  compress_algorithms: ['jpeg', 'hevc', 'webp']
+  compress_algorithm_probs: [0.5, 0.3, 0.2]
+  compress_jpeg_range: (75, 95)
+  compress_webp_range: (50, 95)
+  compress_h264_range: (20, 40)
+  compress_hevc_range: (20, 40)
+  compress_mpeg2_range: (2, 20)
+  compress_mpeg4_range: (2, 20)
+  compress_vp9_range: (20, 50)
+  compress_video_sampling: ['444', '422', '420']
+  compress_video_sampling_weights: None
+  blur_prob2: 0.0
+  resize_prob2: [0.0, 0.0, 1.0]
+  resize_mode_list2: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob2: [0.0, 1.0, 0.0, 0.0]
+  resize_range2: (1.0, 1.0)
+  gaussian_noise_prob2: 0.0
+  noise_range2: (0.0, 0.0)
+  poisson_scale_range2: (0.0, 0.0)
+  gray_noise_prob2: 0.0
+  compress_prob2: 1.0
+  compress_algorithms2: ['jpeg', 'webp']
+  compress_algorithm_probs2: [0.7, 0.3]
+  compress_jpeg_range2: (75, 95)
+  compress_webp_range2: (60, 95)
+  compress_h264_range2: (20, 40)
+  compress_hevc_range2: (20, 40)
+  compress_mpeg2_range2: (2, 20)
+  compress_mpeg4_range2: (2, 20)
+  compress_vp9_range2: (20, 50)
+  compress_video_sampling2: ['444', '422', '420']
+  compress_video_sampling_weights2: None
+  resize_mode_list3: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob3: [0.0, 1.0, 0.0, 0.0]
+  queue_size: 64
+Effective train dataset options:
+  name: Train Dataset
+  type: realesrgandataset
+  io_backend: {'type': 'disk'}
+  num_worker_per_gpu: 8
+  batch_size_per_gpu: 8
+  accum_iter: 2
+  use_hflip: True
+  use_rot: True
+  gt_size: 256
+  lq_size: 64
+  phase: train
+  scale: 4
+  dataset_enlarge_ratio: auto
+  prefetch_mode: cuda
+  pin_memory: True
+  persistent_workers: True
+  num_prefetch_queue: 1
+  prefetch_factor: 2
+  dataroot_gt: ['/home/rift/workspace/traiNNer-redux/datasets/val/MANGA109/HR']
+  filename_tmpl: {}
+  blur_kernel_size: 12
+  kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+  kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+  kernel_range: (5, 17)
+  sinc_prob: 0
+  blur_sigma: (0.2, 2)
+  betag_range: (0.5, 4)
+  betap_range: (1, 2)
+  blur_kernel_size2: 12
+  kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+  kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+  kernel_range2: (5, 17)
+  sinc_prob2: 0
+  blur_sigma2: (0.2, 1)
+  betag_range2: (0.5, 4)
+  betap_range2: (1, 2)
+  final_sinc_prob: 0
+  final_kernel_range: (5, 17)
+
+########################################################################################################################
+training pressure (owner's DUAL degradation-test config)
+########################################################################################################################
+Option file: owner's /home/rift/workspace/traiNNer-redux/options/train/DUAL/2x_DUAL_LIGHT_C128G4D16_PU2_pretrain64_degradation_test.yml (sha256 a8782de415f4847e...), copied read-only to
+  /home/rift/workspace/scratch/otf-profile-base/options/train/DUAL/2x_DUAL_LIGHT_C128G4D16_PU2_pretrain64_degradation_test.yml; the copy drops val.save_img_freq and logger.save_checkpoint_keep, which the 0ed482f option parser rejects
+  (validation-image and checkpoint-retention settings only; no effect on degradation or the training step).
+Code: OTF degradation, model and train-loop code at 0ed482f; network dual_light from the owner's untracked
+  traiNNer/archs/dual_arch.py (sha256 a7c579c5cc7179f8..., absent at 0ed482f), copied unchanged.
+Dataset: the option file's own dataroot_gt (exists); batch, crop and workers as in the option file (16, lq 128 = gt 256, 8).
+degradations=all: every custom degradation prob and compress_prob/compress_prob2 = 1.0, JPEG-only, dithering_types
+  [floydsteinberg] (dithering_palette_mode 0.7 kept from the option file), JPEG ranges capped at 99 because quality
+  100 makes DiffJPEG return NaN (stage 1 [40, 100] -> [40, 99], stage 2 [75, 100] -> [75, 99]); resize/sinc as configured.
+degradations=none: every custom degradation prob and both compress probs = 0.0 (the Poisson-noise branch has no
+  probability and still runs with poisson_scale_range [0, 0]).
+========================================================================================================================
+OTF profile  degradations=all  dither=floydsteinberg  codecs=jpeg  train_steps=30  2026-10-09T04:34:27
+========================================================================================================================
+Command: /home/rift/workspace/traiNNer-redux/venv/bin/python benchmarks/otf_profile.py --opt options/train/DUAL/2x_DUAL_LIGHT_C128G4D16_PU2_pretrain64_degradation_test.yml --dataroot /home/rift/workspace/traiNNer-redux/datasets/train/DiverSeg-IP/HR --batch 16 --workers 8 --gt-size 256 --train-steps 30 --out /home/rift/workspace/scratch/trainner-cuda-dither/benchmarks/otf_profile_before.txt --append --degradations all --jpeg-quality-cap 99 --compile-mode default
+Work tree: /home/rift/workspace/scratch/otf-profile-base @ 0ed482f; modified tracked files: none
+torch 2.14.0.dev20260802+cu132, NVIDIA GeForce RTX 5090, 32 CPUs, process affinity 0-31 (32 CPUs)
+Before CUDA init: load average (2.12, 2.83, 2.67); GPU 2137 MiB, 0 %
+Option file: options/train/DUAL/2x_DUAL_LIGHT_C128G4D16_PU2_pretrain64_degradation_test.yml
+Batch: 16 x GT crop 256 (dataset crop 288), workers 8, warm-up 5, 50 timed batches per pass, passes A and B interleaved
+Final tensors: lq (16, 3, 128, 128), gt (16, 3, 256, 256)
+
+  dataloader fetch (prefetcher.next + sync)    median     0.84  p90     1.67  mean     1.01  min     0.68  ms
+Pass A - feed_data, synchronize only before/after the call (unsynced total):
+  feed_data                                    median   198.87  p90   295.00  mean   169.76  min    30.90  ms
+Pass B - feed_data with a CUDA sync before/after every stage (adds sync overhead):
+  feed_data (instrumented)                     median   198.85  p90   250.99  mean   166.31  min    31.44  ms
+  sum of stage self times, mean per batch: 165.75 ms
+  gap pass B - pass A (mean): -3.45 ms = sync overhead + lost CPU/GPU overlap
+
+GPU memory (torch allocator, cuda:0):
+  allocated before timed passes (model, EMA, OTF queue, warm-up state): 0.264 GiB
+  peak allocated during passes A+B: 0.948 GiB (+0.683 GiB over the baseline)
+  peak reserved during passes A+B: 1.451 GiB
+
+Per-stage breakdown, pass B (ms per batch; self = exclusive of nested stages;
+share% = stage self time / pass-B feed_data time over all timed batches):
+stage                           self med  self p90 self mean  share%  incl med calls/b incl/call  parent / where
+------------------------------------------------------------------------------------------------------------------------
+apply_per_image                  160.929   194.046   113.281    68.1   160.929    1.00   113.281  in _apply_dithering; CPU: D2H, serial numpy per image, H2D
+resize_pt                          0.273    76.360    18.275    11.0     0.273    1.60    11.422  GPU
+random_add_poisson_noise_pt        9.588    11.269     9.750     5.9     9.588    2.00     4.875  GPU
+jpeger (DiffJPEG)                  6.661     8.440     7.059     4.2     6.661    2.00     3.529  in _apply_compression; GPU
+_apply_ntsc                        4.370    15.827     6.997     4.2     4.370    1.00     6.997  GPU + .item() sync (FIR cache key)
+nlmeans_denoise_pt                 5.025     5.429     5.076     3.1     5.025    1.00     5.076  GPU
+_apply_hf_noise                    1.237     2.022     1.415     0.9     1.237    1.00     1.415  GPU + .item() sync (gray mask)
+_apply_shift                       0.751     0.930     0.779     0.5     0.751    1.00     0.779  GPU
+_apply_rainbow                     0.711     0.827     0.736     0.4     0.711    1.00     0.736  GPU
+_dequeue_and_enqueue               0.465     0.626     0.529     0.3     0.465    1.00     0.529  GPU (CPU randperm index)
+_apply_lowpass                     0.350     0.385     0.354     0.2     0.350    1.00     0.354  GPU
+filter2d                           0.293     0.427     0.350     0.2     0.293    1.00     0.350  GPU
+_apply_overshoot                   0.281     0.390     0.306     0.2     0.281    1.00     0.306  GPU
+_apply_compression                 0.193     0.292     0.241     0.1     6.841    2.00     3.650  dispatch (children below)
+_apply_ghosting                    0.189     0.224     0.203     0.1     0.189    1.00     0.203  GPU
+_apply_interlace                   0.167     0.192     0.172     0.1     0.167    1.00     0.172  GPU
+_apply_dithering                   0.081     0.106     0.087     0.1   161.009    1.00   113.367  dispatch (children below)
+_apply_scanline                    0.059     0.088     0.066     0.0     0.059    1.00     0.066  GPU
+_apply_subsampling                 0.040     0.047     0.041     0.0     0.040    1.00     0.041  GPU
+paired_random_crop                 0.026     0.044     0.030     0.0     0.026    1.00     0.030  GPU
+_select_active_degradations        0.006     0.008     0.007     0.0     0.006    1.00     0.007  CPU (Python only)
+------------------------------------------------------------------------------------------------------------------------
+sum of stage self times                              165.754    99.7
+unattributed (glue, clamp/round)                         0.555     0.3
+off-GPU stages (CPU round trip)                       113.281    68.1  apply_per_image, apply_per_image_parallel, compress_video_batch
+
+Implicit host syncs inside feed_data (torch sync debug mode, 10 batches):
+syncs/batch  location  |  source line
+------------------------------------------------------------------------------------------------------------------------
+      32.00  /home/rift/workspace/traiNNer-redux/venv/lib/python3.12/site-packages/torch/functional.py:973  |  output, inverse_indices, counts = torch._unique2(
+      32.00  traiNNer/utils/diffjpeg.py:57  |  if quality < 50:
+       7.00  traiNNer/data/gpu_degradations.py:1150  |  cache_key = (round(kernel.sum().item() * 1e8), num_taps, fft_n)
+       2.00  traiNNer/data/gpu_degradations.py:62  |  m = torch.tensor(
+       2.00  traiNNer/data/degradations.py:786  |  if cal_gray_noise:
+       2.00  traiNNer/data/degradations.py:804  |  vals = img.new_tensor(vals_list).view(b, 1, 1, 1)
+       2.00  traiNNer/data/degradations.py:807  |  if cal_gray_noise and noise_gray is not None:
+       1.00  traiNNer/data/gpu_degradations.py:1286  |  m_fwd = _NTSC_RGB_TO_YIQ.to(device)
+       1.00  traiNNer/data/gpu_degradations.py:1287  |  m_inv = _NTSC_YIQ_TO_RGB.to(device)
+       1.00  traiNNer/data/gpu_degradations.py:105  |  m_inv = torch.linalg.inv(m)  # (3, 3)
+       1.00  traiNNer/models/realesrgan_model.py:169  |  shape_a = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:183  |  shape_b = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:190  |  alpha = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:207  |  gray_mask = torch.as_tensor(
+       1.00  traiNNer/models/realesrgan_model.py:212  |  gray_count = int(gray_mask.sum().item())
+       1.00  traiNNer/models/realesrgan_model.py:218  |  shape_a[gray_mask],
+       1.00  traiNNer/models/realesrgan_model.py:219  |  shape_b[gray_mask],
+       1.00  traiNNer/models/realesrgan_model.py:223  |  noise[gray_mask] = gray_noise
+       1.00  traiNNer/data/otf_degradations.py:93  |  batch_np = tensor.detach().cpu().float().numpy()  # BCHW float32
+       1.00  traiNNer/data/otf_degradations.py:100  |  return torch.from_numpy(stacked).to(device=device, dtype=dtype)
+       1.00  traiNNer/models/realesrgan_model.py:123  |  self.queue_lr = self.queue_lr[idx]
+       1.00  traiNNer/models/realesrgan_model.py:124  |  self.queue_gt = self.queue_gt[idx]
+       0.50  traiNNer/data/degradations.py:989  |  kernel_h = _lanczos(_ramp(dh / h, a), a).to(input.device, input.dtype)
+       0.50  traiNNer/data/degradations.py:995  |  kernel_w = _lanczos(_ramp(dw / w, a), a).to(input.device, input.dtype)
+       0.10  <unattributed: reported on set_sync_debug_mode>:0  |  
+
+Training step - model.optimize_parameters per batch, run as train.py runs one
+iteration (then finalize_compile_cache, update_learning_rate); sync before/after:
+  network dual_light, torch.compile mode default, AMP torch.bfloat16, memory format torch.channels_last, accum_iter 1, batch 16, losses ['l_g_charbonnier'], optimizer AdamW, EMA on
+  warm-up steps, excluded (compile, autotune, CUDA graph capture): 118.8, 0.2, 0.1, 0.1, 0.2 s; total 119.4 s
+  train step, all 30 timed batches             median   104.56  p90   106.66  mean   112.38  min   102.51  ms
+    optimizer-step batches (+EMA, LR)          median   104.56  p90   106.66  mean   112.38  min   102.51  ms
+  feed_data inside the training loop           median   238.81  p90   281.44  mean   192.79  min    31.00  ms
+  rejected (non-finite) steps: 0
+  peak allocated during training: 9.442 GiB
+  ratio degradation / train step (feed_data in training loop): 238.81 / 104.56 ms = 2.284
+  ratio degradation / train step (isolated pass-A feed_data): 198.87 / 104.56 ms = 1.902
+
+Overrides applied in memory to the option file:
+  ntsc_prob: 1.0 (option file: 0.0)
+  rainbow_prob: 1.0 (option file: 0.0)
+  ghosting_prob: 1.0 (option file: 0.0)
+  interlace_prob: 1.0 (option file: 0.0)
+  scanline_prob: 1.0 (option file: 0.0)
+  lowpass_prob: 1.0 (option file: 0.0)
+  overshoot_prob: 1.0 (option file: 0.0)
+  shift_prob: 1.0 (option file: 0.0)
+  subsampling_prob: 1.0 (option file: 0.0)
+  dithering_prob: 1.0 (option file: 0.0)
+  otf_hf_noise_prob: 1.0 (option file: 0.0)
+  dithering_types: ['floydsteinberg'] (option file: ['quantize', 'order', 'floydsteinberg', 'jarvisjudiceninke', 'stucki', 'atkinson', 'burkes', 'sierra', 'tworowsierra', 'sierraLite', 'riemersma'])
+  compress_prob: 1.0 (option file: 0.0)
+  compress_prob2: 1.0 (option file: 0.0)
+  compress_jpeg_range: (40.0, 99) (option file: (40.0, 100.0))
+  compress_jpeg_range2: (75.0, 99) (option file: (75.0, 100.0))
+  otf_hf_noise_denoise_lq: True (option file: False)
+  compress_algorithms: ['jpeg'] (option file: ['jpeg', 'webp', 'h264', 'hevc', 'mpeg2', 'mpeg4', 'vp9'])
+  compress_algorithm_probs: [1.0] (option file: [2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+  compress_algorithms2: ['jpeg'] (option file: ['jpeg', 'webp', 'h264', 'hevc', 'mpeg2', 'mpeg4', 'vp9'])
+  compress_algorithm_probs2: [1.0] (option file: [2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+  otf_degradation_combos: None (option file: None)
+  compile_mode: default (option file: max-autotune)
+  datasets.train.dataroot_gt: ['/home/rift/workspace/traiNNer-redux/datasets/train/DiverSeg-IP/HR'] (option file: ['/home/rift/workspace/traiNNer-redux/datasets/train/DiverSeg-IP/HR'])
+  datasets.train.batch_size_per_gpu: 16 (option file: 16)
+  datasets.train.num_worker_per_gpu: 8 (option file: 8)
+  datasets.train.gt_size: 256 (option file: None)
+  datasets.train.lq_size: None (option file: 128)
+Effective OTF options (model.opt):
+  scale: 2
+  use_amp: True
+  use_channels_last: True
+  high_order_degradation: True
+  high_order_degradations_debug: False
+  high_order_degradations_debug_limit: 100
+  otf_degradation_combos: None
+  otf_degradation_combo_weights: None
+  otf_no_combo_weight: 1.0
+  otf_global_degradations: None
+  otf_hf_noise_normalize: True
+  otf_hf_noise_prob: 1.0
+  otf_hf_noise_alpha_range: (0.0, 0.035)
+  otf_hf_noise_beta_shape_range: (2.0, 2.0)
+  otf_hf_noise_beta_offset_range: None
+  otf_hf_noise_gray_prob: 1.0
+  otf_hf_noise_denoise_lq: True
+  otf_hf_noise_denoise_strength: 30.0
+  dithering_prob: 1.0
+  dithering_types: ['floydsteinberg']
+  dithering_quantize_range: (4, 7)
+  dithering_map_size: [4, 8]
+  dithering_history_range: (2, 5)
+  dithering_ratio_range: (0.1, 0.5)
+  dithering_palette_mode: 0.7
+  dithering_palette_size: (128, 256)
+  shift_prob: 1.0
+  shift_types: ['yuv']
+  shift_percent: False
+  shift_rgb_r: [[0, 0], [0, 0]]
+  shift_rgb_g: [[0, 0], [0, 0]]
+  shift_rgb_b: [[0, 0], [0, 0]]
+  shift_yuv_y: [[-2, 2], [-2, 2]]
+  shift_yuv_u: [[-2, 2], [-2, 2]]
+  shift_yuv_v: [[-2, 2], [-2, 2]]
+  shift_cmyk_c: [[0, 0], [0, 0]]
+  shift_cmyk_m: [[0, 0], [0, 0]]
+  shift_cmyk_y: [[0, 0], [0, 0]]
+  shift_cmyk_k: [[0, 0], [0, 0]]
+  subsampling_prob: 1.0
+  subsampling_down_algorithms: ['nearest']
+  subsampling_up_algorithms: ['nearest']
+  subsampling_formats: ['4:4:4']
+  subsampling_blur_range: None
+  subsampling_ycbcr_type: ['601']
+  ghosting_prob: 1.0
+  ghosting_shift_x: [1, 8]
+  ghosting_shift_y: [0, 2]
+  ghosting_opacity: [0.05, 0.25]
+  interlace_prob: 1.0
+  interlace_field_shift: [1, 5]
+  interlace_dominant_field: ['top', 'bottom']
+  lowpass_prob: 1.0
+  lowpass_cutoff: [0.35, 0.7]
+  lowpass_order: [1, 10]
+  lowpass_detail_mask: False
+  lowpass_mask_lines_brz: 0.08
+  ntsc_prob: 1.0
+  ntsc_preset: ['broadcast']
+  ntsc_comb_mode: 2sample
+  ntsc_enable_vhs: False
+  ntsc_noise: [0.03, 0.03]
+  ntsc_luma_noise: [0.0, 0.0]
+  ntsc_ghost_amplitude: [0.0, 0.0]
+  ntsc_ghost_delay_us: [1.5, 1.5]
+  ntsc_ghost_phase: [180.0, 180.0]
+  ntsc_jitter: [0.0, 0.0]
+  ntsc_edge_ringing: [0.0, 0.0]
+  ntsc_vhs_luma_bw: [4.2, 4.2]
+  ntsc_color_under_bw: [500.0, 500.0]
+  ntsc_tape_trailing: [0.0, 0.0]
+  ntsc_intensity: [1.0, 1.0]
+  overshoot_prob: 1.0
+  overshoot_amount: [0.5, 2.0]
+  overshoot_cutoff: [0.2, 0.5]
+  overshoot_order: [1, 3]
+  rainbow_prob: 1.0
+  rainbow_subcarrier_freq: [0.25, 0.3]
+  rainbow_chroma_bandwidth: [0.06, 0.1]
+  rainbow_intensity: [0.3, 1.0]
+  rainbow_phase_alternation: True
+  scanline_prob: 1.0
+  scanline_strength: [0.1, 0.5]
+  scanline_even_lines: True
+  lq_usm: False
+  lq_usm_radius_range: (1, 25)
+  blur_prob: 0.0
+  thicklines_prob: 0.0
+  resize_prob: [0.15, 0.15, 0.7]
+  resize_mode_list: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob: [0.3, 0.3, 0.1, 0.3]
+  resize_range: (0.4, 1.5)
+  gaussian_noise_prob: 0.0
+  noise_range: (0.0, 0.0)
+  poisson_scale_range: (0.0, 0.0)
+  gray_noise_prob: 0.0
+  compress_prob: 1.0
+  compress_algorithms: ['jpeg']
+  compress_algorithm_probs: [1.0]
+  compress_jpeg_range: (40.0, 99)
+  compress_webp_range: (40, 100)
+  compress_h264_range: (13, 26)
+  compress_hevc_range: (13, 29)
+  compress_mpeg2_range: (2, 9)
+  compress_mpeg4_range: (2, 9)
+  compress_vp9_range: (20, 45)
+  compress_video_sampling: ['444', '422', '420']
+  compress_video_sampling_weights: [6.0, 2.0, 2.0]
+  blur_prob2: 0.0
+  resize_prob2: [0.15, 0.15, 0.7]
+  resize_mode_list2: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob2: [0.3, 0.3, 0.1, 0.3]
+  resize_range2: (0.6, 1.2)
+  gaussian_noise_prob2: 0.0
+  noise_range2: (0.0, 0.0)
+  poisson_scale_range2: (0.0, 0.0)
+  gray_noise_prob2: 0.0
+  compress_prob2: 1.0
+  compress_algorithms2: ['jpeg']
+  compress_algorithm_probs2: [1.0]
+  compress_jpeg_range2: (75.0, 99)
+  compress_webp_range2: (75, 100)
+  compress_h264_range2: (13, 20)
+  compress_hevc_range2: (13, 23)
+  compress_mpeg2_range2: (2, 6)
+  compress_mpeg4_range2: (2, 6)
+  compress_vp9_range2: (20, 35)
+  compress_video_sampling2: ['444', '422', '420']
+  compress_video_sampling_weights2: [6.0, 2.0, 2.0]
+  resize_mode_list3: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob3: [0.3, 0.3, 0.1, 0.3]
+  queue_size: 64
+Effective train dataset options:
+  name: Train Dataset
+  type: realesrgandataset
+  io_backend: {'type': 'disk'}
+  num_worker_per_gpu: 8
+  batch_size_per_gpu: 16
+  accum_iter: 1
+  use_hflip: True
+  use_rot: True
+  gt_size: 256
+  lq_size: 128
+  phase: train
+  scale: 2
+  dataset_enlarge_ratio: auto
+  prefetch_mode: cuda
+  pin_memory: True
+  persistent_workers: True
+  num_prefetch_queue: 1
+  prefetch_factor: 2
+  dataroot_gt: ['/home/rift/workspace/traiNNer-redux/datasets/train/DiverSeg-IP/HR']
+  filename_tmpl: {}
+  blur_kernel_size: 12
+  kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+  kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+  kernel_range: (5, 17)
+  sinc_prob: 0
+  blur_sigma: (0.2, 2)
+  betag_range: (0.5, 4)
+  betap_range: (1, 2)
+  blur_kernel_size2: 12
+  kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+  kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+  kernel_range2: (5, 17)
+  sinc_prob2: 0
+  blur_sigma2: (0.2, 1)
+  betag_range2: (0.5, 4)
+  betap_range2: (1, 2)
+  final_sinc_prob: 0
+  final_kernel_range: (5, 17)
+
+========================================================================================================================
+OTF profile  degradations=none  dither=floydsteinberg  codecs=jpeg  train_steps=30  2026-10-09T04:35:26
+========================================================================================================================
+Command: /home/rift/workspace/traiNNer-redux/venv/bin/python benchmarks/otf_profile.py --opt options/train/DUAL/2x_DUAL_LIGHT_C128G4D16_PU2_pretrain64_degradation_test.yml --dataroot /home/rift/workspace/traiNNer-redux/datasets/train/DiverSeg-IP/HR --batch 16 --workers 8 --gt-size 256 --train-steps 30 --out /home/rift/workspace/scratch/trainner-cuda-dither/benchmarks/otf_profile_before.txt --append --degradations none --compile-mode default
+Work tree: /home/rift/workspace/scratch/otf-profile-base @ 0ed482f; modified tracked files: none
+torch 2.14.0.dev20260802+cu132, NVIDIA GeForce RTX 5090, 32 CPUs, process affinity 0-31 (32 CPUs)
+Before CUDA init: load average (1.42, 2.33, 2.51); GPU 2160 MiB, 1 %
+Option file: options/train/DUAL/2x_DUAL_LIGHT_C128G4D16_PU2_pretrain64_degradation_test.yml
+Batch: 16 x GT crop 256 (dataset crop 288), workers 8, warm-up 5, 50 timed batches per pass, passes A and B interleaved
+Final tensors: lq (16, 3, 128, 128), gt (16, 3, 256, 256)
+
+  dataloader fetch (prefetcher.next + sync)    median     0.84  p90     1.72  mean     1.04  min     0.65  ms
+Pass A - feed_data, synchronize only before/after the call (unsynced total):
+  feed_data                                    median    12.13  p90    68.65  mean    28.14  min     8.93  ms
+Pass B - feed_data with a CUDA sync before/after every stage (adds sync overhead):
+  feed_data (instrumented)                     median    13.03  p90    70.38  mean    26.52  min     9.56  ms
+  sum of stage self times, mean per batch: 26.15 ms
+  gap pass B - pass A (mean): -1.62 ms = sync overhead + lost CPU/GPU overlap
+
+GPU memory (torch allocator, cuda:0):
+  allocated before timed passes (model, EMA, OTF queue, warm-up state): 0.230 GiB
+  peak allocated during passes A+B: 0.597 GiB (+0.367 GiB over the baseline)
+  peak reserved during passes A+B: 0.805 GiB
+
+Per-stage breakdown, pass B (ms per batch; self = exclusive of nested stages;
+share% = stage self time / pass-B feed_data time over all timed batches):
+stage                           self med  self p90 self mean  share%  incl med calls/b incl/call  parent / where
+------------------------------------------------------------------------------------------------------------------------
+resize_pt                          0.247    57.839    14.298    53.9     0.247    1.44     9.929  GPU
+random_add_poisson_noise_pt       10.573    12.947    11.022    41.6    10.573    2.00     5.511  GPU
+_dequeue_and_enqueue               0.267     1.098     0.418     1.6     0.267    1.00     0.418  GPU (CPU randperm index)
+filter2d                           0.339     0.452     0.358     1.4     0.339    1.00     0.358  GPU
+paired_random_crop                 0.033     0.052     0.038     0.1     0.033    1.00     0.038  GPU
+_select_active_degradations        0.006     0.031     0.011     0.0     0.006    1.00     0.011  CPU (Python only)
+_apply_hf_noise                    0.004     0.005     0.005     0.0     0.004    1.00     0.005  GPU + .item() sync (gray mask)
+------------------------------------------------------------------------------------------------------------------------
+sum of stage self times                               26.152    98.6
+unattributed (glue, clamp/round)                         0.367     1.4
+off-GPU stages (CPU round trip)                         0.000     0.0  apply_per_image, apply_per_image_parallel, compress_video_batch
+
+Implicit host syncs inside feed_data (torch sync debug mode, 10 batches):
+syncs/batch  location  |  source line
+------------------------------------------------------------------------------------------------------------------------
+      32.00  /home/rift/workspace/traiNNer-redux/venv/lib/python3.12/site-packages/torch/functional.py:973  |  output, inverse_indices, counts = torch._unique2(
+       2.00  traiNNer/data/degradations.py:786  |  if cal_gray_noise:
+       2.00  traiNNer/data/degradations.py:804  |  vals = img.new_tensor(vals_list).view(b, 1, 1, 1)
+       2.00  traiNNer/data/degradations.py:807  |  if cal_gray_noise and noise_gray is not None:
+       1.00  traiNNer/models/realesrgan_model.py:123  |  self.queue_lr = self.queue_lr[idx]
+       1.00  traiNNer/models/realesrgan_model.py:124  |  self.queue_gt = self.queue_gt[idx]
+       0.60  traiNNer/data/degradations.py:989  |  kernel_h = _lanczos(_ramp(dh / h, a), a).to(input.device, input.dtype)
+       0.60  traiNNer/data/degradations.py:995  |  kernel_w = _lanczos(_ramp(dw / w, a), a).to(input.device, input.dtype)
+       0.10  <unattributed: reported on set_sync_debug_mode>:0  |  
+
+Training step - model.optimize_parameters per batch, run as train.py runs one
+iteration (then finalize_compile_cache, update_learning_rate); sync before/after:
+  network dual_light, torch.compile mode default, AMP torch.bfloat16, memory format torch.channels_last, accum_iter 1, batch 16, losses ['l_g_charbonnier'], optimizer AdamW, EMA on
+  warm-up steps, excluded (compile, autotune, CUDA graph capture): 34.9, 0.2, 0.1, 0.1, 0.2 s; total 35.6 s
+  train step, all 30 timed batches             median   103.95  p90   120.61  mean   116.18  min   102.34  ms
+    optimizer-step batches (+EMA, LR)          median   103.95  p90   120.61  mean   116.18  min   102.34  ms
+  feed_data inside the training loop           median    10.83  p90    27.73  mean    30.19  min     9.18  ms
+  rejected (non-finite) steps: 0
+  peak allocated during training: 9.446 GiB
+  ratio degradation / train step (feed_data in training loop): 10.83 / 103.95 ms = 0.104
+  ratio degradation / train step (isolated pass-A feed_data): 12.13 / 103.95 ms = 0.117
+
+Overrides applied in memory to the option file:
+  ntsc_prob: 0.0 (option file: 0.0)
+  rainbow_prob: 0.0 (option file: 0.0)
+  ghosting_prob: 0.0 (option file: 0.0)
+  interlace_prob: 0.0 (option file: 0.0)
+  scanline_prob: 0.0 (option file: 0.0)
+  lowpass_prob: 0.0 (option file: 0.0)
+  overshoot_prob: 0.0 (option file: 0.0)
+  shift_prob: 0.0 (option file: 0.0)
+  subsampling_prob: 0.0 (option file: 0.0)
+  dithering_prob: 0.0 (option file: 0.0)
+  otf_hf_noise_prob: 0.0 (option file: 0.0)
+  compress_prob: 0.0 (option file: 0.0)
+  compress_prob2: 0.0 (option file: 0.0)
+  otf_degradation_combos: None (option file: None)
+  compile_mode: default (option file: max-autotune)
+  datasets.train.dataroot_gt: ['/home/rift/workspace/traiNNer-redux/datasets/train/DiverSeg-IP/HR'] (option file: ['/home/rift/workspace/traiNNer-redux/datasets/train/DiverSeg-IP/HR'])
+  datasets.train.batch_size_per_gpu: 16 (option file: 16)
+  datasets.train.num_worker_per_gpu: 8 (option file: 8)
+  datasets.train.gt_size: 256 (option file: None)
+  datasets.train.lq_size: None (option file: 128)
+Effective OTF options (model.opt):
+  scale: 2
+  use_amp: True
+  use_channels_last: True
+  high_order_degradation: True
+  high_order_degradations_debug: False
+  high_order_degradations_debug_limit: 100
+  otf_degradation_combos: None
+  otf_degradation_combo_weights: None
+  otf_no_combo_weight: 1.0
+  otf_global_degradations: None
+  otf_hf_noise_normalize: True
+  otf_hf_noise_prob: 0.0
+  otf_hf_noise_alpha_range: (0.0, 0.035)
+  otf_hf_noise_beta_shape_range: (2.0, 2.0)
+  otf_hf_noise_beta_offset_range: None
+  otf_hf_noise_gray_prob: 1.0
+  otf_hf_noise_denoise_lq: False
+  otf_hf_noise_denoise_strength: 30.0
+  dithering_prob: 0.0
+  dithering_types: ['quantize', 'order', 'floydsteinberg', 'jarvisjudiceninke', 'stucki', 'atkinson', 'burkes', 'sierra', 'tworowsierra', 'sierraLite', 'riemersma']
+  dithering_quantize_range: (4, 7)
+  dithering_map_size: [4, 8]
+  dithering_history_range: (2, 5)
+  dithering_ratio_range: (0.1, 0.5)
+  dithering_palette_mode: 0.7
+  dithering_palette_size: (128, 256)
+  shift_prob: 0.0
+  shift_types: ['yuv']
+  shift_percent: False
+  shift_rgb_r: [[0, 0], [0, 0]]
+  shift_rgb_g: [[0, 0], [0, 0]]
+  shift_rgb_b: [[0, 0], [0, 0]]
+  shift_yuv_y: [[-2, 2], [-2, 2]]
+  shift_yuv_u: [[-2, 2], [-2, 2]]
+  shift_yuv_v: [[-2, 2], [-2, 2]]
+  shift_cmyk_c: [[0, 0], [0, 0]]
+  shift_cmyk_m: [[0, 0], [0, 0]]
+  shift_cmyk_y: [[0, 0], [0, 0]]
+  shift_cmyk_k: [[0, 0], [0, 0]]
+  subsampling_prob: 0.0
+  subsampling_down_algorithms: ['nearest']
+  subsampling_up_algorithms: ['nearest']
+  subsampling_formats: ['4:4:4']
+  subsampling_blur_range: None
+  subsampling_ycbcr_type: ['601']
+  ghosting_prob: 0.0
+  ghosting_shift_x: [1, 8]
+  ghosting_shift_y: [0, 2]
+  ghosting_opacity: [0.05, 0.25]
+  interlace_prob: 0.0
+  interlace_field_shift: [1, 5]
+  interlace_dominant_field: ['top', 'bottom']
+  lowpass_prob: 0.0
+  lowpass_cutoff: [0.35, 0.7]
+  lowpass_order: [1, 10]
+  lowpass_detail_mask: False
+  lowpass_mask_lines_brz: 0.08
+  ntsc_prob: 0.0
+  ntsc_preset: ['broadcast']
+  ntsc_comb_mode: 2sample
+  ntsc_enable_vhs: False
+  ntsc_noise: [0.03, 0.03]
+  ntsc_luma_noise: [0.0, 0.0]
+  ntsc_ghost_amplitude: [0.0, 0.0]
+  ntsc_ghost_delay_us: [1.5, 1.5]
+  ntsc_ghost_phase: [180.0, 180.0]
+  ntsc_jitter: [0.0, 0.0]
+  ntsc_edge_ringing: [0.0, 0.0]
+  ntsc_vhs_luma_bw: [4.2, 4.2]
+  ntsc_color_under_bw: [500.0, 500.0]
+  ntsc_tape_trailing: [0.0, 0.0]
+  ntsc_intensity: [1.0, 1.0]
+  overshoot_prob: 0.0
+  overshoot_amount: [0.5, 2.0]
+  overshoot_cutoff: [0.2, 0.5]
+  overshoot_order: [1, 3]
+  rainbow_prob: 0.0
+  rainbow_subcarrier_freq: [0.25, 0.3]
+  rainbow_chroma_bandwidth: [0.06, 0.1]
+  rainbow_intensity: [0.3, 1.0]
+  rainbow_phase_alternation: True
+  scanline_prob: 0.0
+  scanline_strength: [0.1, 0.5]
+  scanline_even_lines: True
+  lq_usm: False
+  lq_usm_radius_range: (1, 25)
+  blur_prob: 0.0
+  thicklines_prob: 0.0
+  resize_prob: [0.15, 0.15, 0.7]
+  resize_mode_list: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob: [0.3, 0.3, 0.1, 0.3]
+  resize_range: (0.4, 1.5)
+  gaussian_noise_prob: 0.0
+  noise_range: (0.0, 0.0)
+  poisson_scale_range: (0.0, 0.0)
+  gray_noise_prob: 0.0
+  compress_prob: 0.0
+  compress_algorithms: ['jpeg', 'webp', 'h264', 'hevc', 'mpeg2', 'mpeg4', 'vp9']
+  compress_algorithm_probs: [2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  compress_jpeg_range: (40.0, 100.0)
+  compress_webp_range: (40, 100)
+  compress_h264_range: (13, 26)
+  compress_hevc_range: (13, 29)
+  compress_mpeg2_range: (2, 9)
+  compress_mpeg4_range: (2, 9)
+  compress_vp9_range: (20, 45)
+  compress_video_sampling: ['444', '422', '420']
+  compress_video_sampling_weights: [6.0, 2.0, 2.0]
+  blur_prob2: 0.0
+  resize_prob2: [0.15, 0.15, 0.7]
+  resize_mode_list2: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob2: [0.3, 0.3, 0.1, 0.3]
+  resize_range2: (0.6, 1.2)
+  gaussian_noise_prob2: 0.0
+  noise_range2: (0.0, 0.0)
+  poisson_scale_range2: (0.0, 0.0)
+  gray_noise_prob2: 0.0
+  compress_prob2: 0.0
+  compress_algorithms2: ['jpeg', 'webp', 'h264', 'hevc', 'mpeg2', 'mpeg4', 'vp9']
+  compress_algorithm_probs2: [2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  compress_jpeg_range2: (75.0, 100.0)
+  compress_webp_range2: (75, 100)
+  compress_h264_range2: (13, 20)
+  compress_hevc_range2: (13, 23)
+  compress_mpeg2_range2: (2, 6)
+  compress_mpeg4_range2: (2, 6)
+  compress_vp9_range2: (20, 35)
+  compress_video_sampling2: ['444', '422', '420']
+  compress_video_sampling_weights2: [6.0, 2.0, 2.0]
+  resize_mode_list3: ['bilinear', 'bicubic', 'nearest-exact', 'lanczos']
+  resize_mode_prob3: [0.3, 0.3, 0.1, 0.3]
+  queue_size: 64
+Effective train dataset options:
+  name: Train Dataset
+  type: realesrgandataset
+  io_backend: {'type': 'disk'}
+  num_worker_per_gpu: 8
+  batch_size_per_gpu: 16
+  accum_iter: 1
+  use_hflip: True
+  use_rot: True
+  gt_size: 256
+  lq_size: 128
+  phase: train
+  scale: 2
+  dataset_enlarge_ratio: auto
+  prefetch_mode: cuda
+  pin_memory: True
+  persistent_workers: True
+  num_prefetch_queue: 1
+  prefetch_factor: 2
+  dataroot_gt: ['/home/rift/workspace/traiNNer-redux/datasets/train/DiverSeg-IP/HR']
+  filename_tmpl: {}
+  blur_kernel_size: 12
+  kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+  kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+  kernel_range: (5, 17)
+  sinc_prob: 0
+  blur_sigma: (0.2, 2)
+  betag_range: (0.5, 4)
+  betap_range: (1, 2)
+  blur_kernel_size2: 12
+  kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+  kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+  kernel_range2: (5, 17)
+  sinc_prob2: 0
+  blur_sigma2: (0.2, 1)
+  betag_range2: (0.5, 4)
+  betap_range2: (1, 2)
+  final_sinc_prob: 0
+  final_kernel_range: (5, 17)
+
