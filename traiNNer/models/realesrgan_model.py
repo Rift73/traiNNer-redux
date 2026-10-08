@@ -388,7 +388,8 @@ class RealESRGANModel(SRModel):
         - Palette mode: content-adaptive indexed color (like GIF/PNG8) via median cut.
           Always CPU (chainner_ext PaletteQuantization).
         - Uniform mode: per-channel quantization levels.
-          GPU path for quantize/ordered dither, CPU for error diffusion/riemersma.
+          GPU path for quantize/ordered dither; error diffusion/riemersma use the
+          exact CUDA kernel when it builds, else CPU (chainner_ext).
         """
         rng = RNG.get_rng()
         dtype = rng.choice(self.opt.dithering_types).lower()
@@ -415,10 +416,30 @@ class RealESRGANModel(SRModel):
             map_size = int(rng.choice(self.opt.dithering_map_size))
             return ordered_dither_pt(out, quantize_ch, map_size)
         else:
-            # Error diffusion / riemersma — CPU path (chainner_ext)
+            # Error diffusion / riemersma — exact CUDA kernel (bit-identical to
+            # chainner_ext) when it builds, else the per-image CPU path. map_size
+            # is drawn on both paths so the RNG stream does not depend on the path.
             map_size = int(rng.choice(self.opt.dithering_map_size))
             history = int(rng.integers(*self.opt.dithering_history_range))
             decay_ratio = float(rng.uniform(*self.opt.dithering_ratio_range))
+            from traiNNer.data.dither_cuda import (
+                DIFFUSION_ALGORITHMS,
+                dither_cuda_available,
+                error_diffusion_dither_cuda,
+                riemersma_dither_cuda,
+            )
+
+            # Riemersma is one serial Hilbert walk per image-channel, so a single
+            # GPU thread per plane only beats a CPU core from batch 2 upward
+            # (measured: 3x faster at batch 8, 0.6x at batch 1). Same bits either way.
+            use_kernel = out.is_cuda and (
+                dtype in DIFFUSION_ALGORITHMS
+                or (dtype == "riemersma" and out.shape[0] >= 2)
+            )
+            if use_kernel and dither_cuda_available():
+                if dtype == "riemersma":
+                    return riemersma_dither_cuda(out, quantize_ch, history, decay_ratio)
+                return error_diffusion_dither_cuda(out, quantize_ch, dtype)
             return apply_per_image(
                 out,
                 lambda img: apply_dithering(
