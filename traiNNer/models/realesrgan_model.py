@@ -386,7 +386,8 @@ class RealESRGANModel(SRModel):
 
         Two modes:
         - Palette mode: content-adaptive indexed color (like GIF/PNG8) via median cut.
-          Always CPU (chainner_ext PaletteQuantization).
+          The median cut is CPU (Pillow, per image); the dithering uses the exact
+          CUDA kernel when it builds, else CPU (chainner_ext PaletteQuantization).
         - Uniform mode: per-channel quantization levels.
           GPU path for quantize/ordered dither; error diffusion/riemersma use the
           exact CUDA kernel when it builds, else CPU (chainner_ext).
@@ -400,6 +401,20 @@ class RealESRGANModel(SRModel):
             map_size = int(rng.choice(self.opt.dithering_map_size))
             history = int(rng.integers(*self.opt.dithering_history_range))
             decay_ratio = float(rng.uniform(*self.opt.dithering_ratio_range))
+            from traiNNer.data.dither_cuda import (
+                PALETTE_DITHERING_TYPES,
+                dither_cuda_available,
+                palette_dither_cuda,
+            )
+
+            # Same median cut either way; the GPU path dithers the whole batch
+            # bit-identically to the per-image CPU path.
+            if (
+                out.is_cuda
+                and dtype in PALETTE_DITHERING_TYPES
+                and dither_cuda_available()
+            ):
+                return palette_dither_cuda(out, dtype, num_colors, history, decay_ratio)
             return apply_per_image(
                 out,
                 lambda img: apply_dithering_palette(

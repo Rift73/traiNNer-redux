@@ -21,12 +21,31 @@ torch::Tensor error_diffusion_cuda(
 torch::Tensor riemersma_cuda(
     const torch::Tensor& src, const torch::Tensor& levels, int64_t history, float base
 );
+torch::Tensor palette_quantize_cuda(
+    const torch::Tensor& src, const torch::Tensor& palettes, const torch::Tensor& counts
+);
+torch::Tensor palette_error_diffusion_cuda(
+    const torch::Tensor& src,
+    const torch::Tensor& palettes,
+    const torch::Tensor& counts,
+    int64_t algorithm
+);
+torch::Tensor palette_riemersma_cuda(
+    const torch::Tensor& src,
+    const torch::Tensor& palettes,
+    const torch::Tensor& counts,
+    int64_t history,
+    float base
+);
 
 namespace {
 
 constexpr int64_t kMaxPixels = std::numeric_limits<int32_t>::max();
+// PaletteQuantization's linear scan holds below 300 colors; Pillow's median cut
+// gives at most 256.
+constexpr int64_t kMaxPaletteColors = 256;
 
-void check_input(const torch::Tensor& src, const torch::Tensor& levels) {
+void check_image(const torch::Tensor& src) {
     TORCH_CHECK(
         src.is_cuda() && src.scalar_type() == torch::kFloat32 && src.dim() == 4 &&
             src.is_contiguous(),
@@ -39,11 +58,70 @@ void check_input(const torch::Tensor& src, const torch::Tensor& levels) {
     );
     TORCH_CHECK(src.numel() > 0, "src must not be empty");
     TORCH_CHECK(src.size(2) * src.size(3) <= kMaxPixels, "image has too many pixels");
+}
+
+void check_input(const torch::Tensor& src, const torch::Tensor& levels) {
+    check_image(src);
     TORCH_CHECK(
         levels.device() == src.device() && levels.scalar_type() == torch::kInt64 &&
             levels.dim() == 1 && levels.size(0) == src.size(0) && levels.is_contiguous(),
         "levels must be a contiguous int64 tensor of N on the input's device"
     );
+}
+
+// palettes: (N, P, C) float32 with 1 <= P <= 256, C the image's channel count (1 or
+// 3), each image's colors first; counts: int64 of N, each in [1, P] (the Python
+// side builds both, so the values are not read back here).
+void check_palette(
+    const torch::Tensor& src, const torch::Tensor& palettes, const torch::Tensor& counts
+) {
+    check_image(src);
+    const int64_t channels = src.size(1);
+    TORCH_CHECK(
+        channels == 1 || channels == 3,
+        "palette dithering takes 1 or 3 channels, got ", channels
+    );
+    TORCH_CHECK(
+        palettes.device() == src.device() && palettes.scalar_type() == torch::kFloat32 &&
+            palettes.dim() == 3 && palettes.size(0) == src.size(0) &&
+            palettes.size(2) == channels && palettes.is_contiguous(),
+        "palettes must be a contiguous float32 tensor (N, P, C) on the input's device"
+    );
+    TORCH_CHECK(
+        palettes.size(1) >= 1 && palettes.size(1) <= kMaxPaletteColors,
+        "palettes hold 1 to ", kMaxPaletteColors, " colors, got ", palettes.size(1)
+    );
+    TORCH_CHECK(
+        counts.device() == src.device() && counts.scalar_type() == torch::kInt64 &&
+            counts.dim() == 1 && counts.size(0) == src.size(0) && counts.is_contiguous(),
+        "counts must be a contiguous int64 tensor of N on the input's device"
+    );
+}
+
+// riemersma_dither's float32 decay base and its assert.
+float riemersma_base(int64_t history, double decay_ratio) {
+    TORCH_CHECK(history >= 2, "Argument 'history_length' must be at least 2.");
+    TORCH_CHECK(
+        history <= std::numeric_limits<int32_t>::max() / 32, "history_length is too large"
+    );
+    const float decay = static_cast<float>(decay_ratio);
+    const float base = std::exp(std::log(decay) / (static_cast<float>(history) - 1.0f));
+    TORCH_CHECK(base > 0.0f && base < 1.0f, "assertion failed: 0.0 < base && base < 1.0");
+    return base;
+}
+
+void check_traversal(
+    const torch::Tensor& src, const torch::Tensor& order, const torch::Tensor& inverse
+) {
+    const int64_t pixels = src.size(2) * src.size(3);
+    for (const auto& permutation : {order, inverse}) {
+        TORCH_CHECK(
+            permutation.device() == src.device() &&
+                permutation.scalar_type() == torch::kInt32 && permutation.dim() == 1 &&
+                permutation.size(0) == pixels,
+            "order and inverse must be riemersma_order(H, W) on the input's device"
+        );
+    }
 }
 
 /* chainner_ext's rectangular Hilbert traversal: zhang_hilbert 0.1.1 (src/core.rs,
@@ -355,27 +433,45 @@ torch::Tensor riemersma(
     double decay_ratio
 ) {
     check_input(src, levels);
-    TORCH_CHECK(history >= 2, "Argument 'history_length' must be at least 2.");
-    TORCH_CHECK(
-        history <= std::numeric_limits<int32_t>::max() / 32, "history_length is too large"
-    );
+    const float base = riemersma_base(history, decay_ratio);
+    check_traversal(src, order, inverse);
     const int64_t pixels = src.size(2) * src.size(3);
-    for (const auto& permutation : {order, inverse}) {
-        TORCH_CHECK(
-            permutation.device() == src.device() &&
-                permutation.scalar_type() == torch::kInt32 && permutation.dim() == 1 &&
-                permutation.size(0) == pixels,
-            "order and inverse must be riemersma_order(H, W) on the input's device"
-        );
-    }
-    // riemersma_dither's float32 base and its assert.
-    const float decay = static_cast<float>(decay_ratio);
-    const float base = std::exp(std::log(decay) / (static_cast<float>(history) - 1.0f));
-    TORCH_CHECK(base > 0.0f && base < 1.0f, "assertion failed: 0.0 < base && base < 1.0");
     // Gather each plane into traversal order so the serial walk reads sequentially,
     // then scatter the result back with the inverse permutation.
     const auto planes = src.view({src.size(0), src.size(1), pixels}).index_select(2, order);
     return riemersma_cuda(planes, levels, history, base).index_select(2, inverse).view_as(src);
+}
+
+torch::Tensor palette_quantize(torch::Tensor src, torch::Tensor palettes, torch::Tensor counts) {
+    check_palette(src, palettes, counts);
+    return palette_quantize_cuda(src, palettes, counts);
+}
+
+torch::Tensor palette_error_diffusion(
+    torch::Tensor src, torch::Tensor palettes, torch::Tensor counts, int64_t algorithm
+) {
+    check_palette(src, palettes, counts);
+    TORCH_CHECK(algorithm >= 0 && algorithm < 8, "algorithm must be in [0, 8)");
+    return palette_error_diffusion_cuda(src, palettes, counts, algorithm);
+}
+
+torch::Tensor palette_riemersma(
+    torch::Tensor src,
+    torch::Tensor palettes,
+    torch::Tensor counts,
+    torch::Tensor order,
+    torch::Tensor inverse,
+    int64_t history,
+    double decay_ratio
+) {
+    check_palette(src, palettes, counts);
+    const float base = riemersma_base(history, decay_ratio);
+    check_traversal(src, order, inverse);
+    const int64_t pixels = src.size(2) * src.size(3);
+    const auto planes = src.view({src.size(0), src.size(1), pixels}).index_select(2, order);
+    return palette_riemersma_cuda(planes, palettes, counts, history, base)
+        .index_select(2, inverse)
+        .view_as(src);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -389,4 +485,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("riemersma_order", &riemersma_order,
           "riemersma_dither's traversal and its inverse as linear indices (CPU int32)",
           py::arg("height"), py::arg("width"));
+    m.def("palette_quantize", &palette_quantize,
+          "Palette quantize (CUDA), bit-exact to chainner_ext",
+          py::arg("src"), py::arg("palettes"), py::arg("counts"));
+    m.def("palette_error_diffusion", &palette_error_diffusion,
+          "Palette error-diffusion dithering (CUDA), bit-exact to chainner_ext",
+          py::arg("src"), py::arg("palettes"), py::arg("counts"), py::arg("algorithm"));
+    m.def("palette_riemersma", &palette_riemersma,
+          "Palette Riemersma dithering (CUDA), bit-exact to chainner_ext",
+          py::arg("src"), py::arg("palettes"), py::arg("counts"), py::arg("order"),
+          py::arg("inverse"), py::arg("history"), py::arg("decay_ratio"));
 }
