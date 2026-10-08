@@ -103,6 +103,16 @@ random stream differs from before from the first channel shift onward. Also fixe
 (`otf_degradations.py`): 1-channel images crashed uniform and palette dithering and WebP, and 4-channel palette
 dithering misaligned the palette; both now round-trip (alpha passes through palette dithering unchanged).
 
+### resize_pt autotune (`traiNNer/data/degradations.py`, `_resample`)
+Confirmed: with `cudnn.benchmark` on, every new lanczos conv shape cost 63–82 ms, and because the second and final
+resizes take inputs whose sizes depend on earlier random scales, the owner's config meets ~1,170 distinct shapes
+over 20k iterations (still rising). Fix: the lanczos kernel is zero-padded to a radius of 7, 15, 31, … and the
+reflect-padded input is extended with zeros to a size bucket (multiples of 32 up to 256 px, then 4 per octave) and
+cropped after the conv: 24 shapes for the whole run, all tuned by iteration ~5,000 (about 1 s once per process).
+Repeat calls 0.40 vs 0.42 ms before. Output `torch.equal` to HEAD in every case where HEAD is itself reproducible;
+above ~280 px with benchmark on, cuDNN picks algorithms by timing per run and HEAD differs from itself by 1–2 ulp
+across processes (so does the fix). 16 tests. Over 60 random calls: mean 6.21 → 1.49 ms, p90 1.01 → 0.43 ms.
+
 ### Codec path settings (`traiNNer/data/compress_video_batch.py`)
 Backends unchanged (owner's benchmarks). What actually reached the encoders was checked by effect on the output:
 x265 ran a 32-thread pool with one frame thread (now a pool and frame threads derived from the core count and the

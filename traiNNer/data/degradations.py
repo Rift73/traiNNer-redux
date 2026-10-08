@@ -1034,26 +1034,63 @@ def _ramp(ratio: float, width: int) -> Tensor:
     return torch.cat([-out[1:].flip([0]), out])[1:-1]
 
 
+# The lanczos kernel length follows the resize ratio, and the input size of the
+# second and final OTF resizes follows the earlier random scales; cudnn.benchmark
+# autotunes every new conv shape (30-40 ms each). The kernel is zero-padded to a
+# radius of 7, 15, 31, ... and the padded input is extended with zeros to a size
+# bucket and cropped after the conv, so a few conv shapes recur (24 in the OTF at
+# scale 2, GT 256, where there were over a thousand). Zero taps add exact zeros
+# and the extra rows and columns only reach outputs that are cropped, so the
+# result is bit-identical whenever cuDNN runs the same algorithm for both shapes.
+_LANCZOS_CONV_RADIUS = 7
+
+
+def _lanczos_kernel(dsize: int, size: int, a: int) -> tuple[Tensor, int]:
+    """1-D lanczos kernel for size -> dsize, zero-padded; returns it and its radius."""
+    kernel = _lanczos(_ramp(dsize / size, a), a)
+    radius = (kernel.shape[0] - 1) // 2
+    conv_radius = _LANCZOS_CONV_RADIUS
+    while conv_radius < radius:
+        conv_radius = 2 * conv_radius + 1
+    # Reflect padding needs pad < size; the unpadded radius already had to be.
+    conv_radius = max(min(conv_radius, size - 1), radius)
+    extra = conv_radius - radius
+    return F.pad(kernel, (extra, extra)), conv_radius
+
+
+def _size_bucket(size: int) -> int:
+    """Multiples of 32 up to 256, then 4 sizes per octave."""
+    step = 1 << max(5, size.bit_length() - 3)
+    return -(-size // step) * step
+
+
 # https://github.com/robobeebop/VQGAN-CLIP-Video/blob/72414dee1764397654121c75dbb576b038da68e4/utils.py#L41
 def _resample(input: Tensor, size: tuple[int, int], a: int = 3) -> Tensor:
     n, c, h, w = input.shape
     dh, dw = size
+    extend = (0, _size_bucket(w) - w, 0, _size_bucket(h) - h)
 
     input = input.reshape([n * c, 1, h, w])
 
     if dh < h:
-        kernel_h = _lanczos(_ramp(dh / h, a), a).to(input.device, input.dtype)
-        pad_h = (kernel_h.shape[0] - 1) // 2
+        kernel_h, pad_h = _lanczos_kernel(dh, h, a)
+        kernel_h = kernel_h.to(input.device, input.dtype)
         input = F.pad(input, (0, 0, pad_h, pad_h), "reflect")
+        if any(extend):
+            input = F.pad(input, extend)
         input = F.conv2d(input, kernel_h[None, None, :, None], padding=0)
+        input = input[:, :, :h, :w]
 
     if dw < w:
-        kernel_w = _lanczos(_ramp(dw / w, a), a).to(input.device, input.dtype)
-        pad_w = (kernel_w.shape[0] - 1) // 2
+        kernel_w, pad_w = _lanczos_kernel(dw, w, a)
+        kernel_w = kernel_w.to(input.device, input.dtype)
         input = F.pad(input, (pad_w, pad_w, 0, 0), "reflect")
+        if any(extend):
+            input = F.pad(input, extend)
         input = F.conv2d(input, kernel_w[None, None, None, :], padding=0)
+        input = input[:, :, :h, :w]
 
-    input = input.view([n, c, h, w])
+    input = input.reshape([n, c, h, w])
     return F.interpolate(input, size, mode="bicubic", align_corners=False).clamp(0, 1)
 
 
