@@ -85,6 +85,12 @@ FILTERED_REGISTRIES_SCALES_PARAMS = [
 
 # A dict of archs mapped to a list of scale + arch params that arch doesn't support.
 EXCLUDE_ARCH_SCALES = {
+    "dual_light": [{"scale": 3, "extra_arch_params": {}}],
+    "dual_xs": [{"scale": 3, "extra_arch_params": {}}],
+    "dual_s": [{"scale": 3, "extra_arch_params": {}}],
+    "dual_m": [{"scale": 3, "extra_arch_params": {}}],
+    "dual_l": [{"scale": 3, "extra_arch_params": {}}],
+    "dual_xl": [{"scale": 3, "extra_arch_params": {}}],
     "swinir_l": [{"scale": 3, "extra_arch_params": {}}],
     "swin2sr_l": [
         {"scale": 1, "extra_arch_params": {}},

@@ -128,7 +128,10 @@ class CUDAPrefetcher:
         # put tensors to gpu
         with torch.cuda.stream(self.stream):  # type: ignore
             for k, v in self.batch.items():
-                if torch.is_tensor(v):
+                if torch.is_tensor(v) and k not in (
+                    "otf_padded_height",
+                    "otf_padded_width",
+                ):
                     self.batch[k] = self.batch[k].to(
                         device=self.device,
                         memory_format=_memory_format_for_tensor(v, self.memory_format),

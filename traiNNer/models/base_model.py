@@ -85,8 +85,9 @@ class BaseModel:
         self.scaler_ae: GradScaler | None = None
         self.accum_iters: int = 1
         self.grad_clip: bool = False
-        self.grad_clip_max_norm: float = 100.0
+        self.grad_clip_max_norm: float = 1.0
         self.nan_count = 0
+        self._pending_nonfinite_rejection_count = 0
         self.training_step_accepted = True
         self.reset_accumulation_requested = False
         self.training_step_rejection_reason: str | None = None
@@ -248,6 +249,31 @@ class BaseModel:
     def reset_current_log(self) -> None:
         self.log_dict = {}
         self.loss_samples = 0
+
+    def prepare_network_for_compile(self, net: nn.Module) -> None:
+        """Prime architecture caches eagerly after device/layout changes."""
+        net = self.get_bare_model(net)
+        prepare_for_compile = getattr(net, "prepare_for_compile", None)
+        if not callable(prepare_for_compile):
+            return
+
+        train_dataset = self.opt.datasets.get("train")
+        input_shape = None
+        if (
+            train_dataset is not None
+            and train_dataset.batch_size_per_gpu is not None
+            and train_dataset.lq_size is not None
+        ):
+            input_shape = (
+                train_dataset.batch_size_per_gpu,
+                3,
+                train_dataset.lq_size,
+                train_dataset.lq_size,
+            )
+        prepare_for_compile(
+            input_shape=input_shape,
+            input_dtype=self.amp_dtype if self.use_amp else torch.float32,
+        )
 
     def model_to_device(
         self,
@@ -433,25 +459,7 @@ class BaseModel:
                 raise ValueError("compile_fullgraph must be a bool when defined")
             if compile_dynamic not in (None, True, False):
                 raise ValueError("compile_dynamic must be bool or None when defined")
-            prepare_for_compile = getattr(net, "prepare_for_compile", None)
-            if callable(prepare_for_compile):
-                train_dataset = self.opt.datasets.get("train")
-                input_shape = None
-                if (
-                    train_dataset is not None
-                    and train_dataset.batch_size_per_gpu is not None
-                    and train_dataset.lq_size is not None
-                ):
-                    input_shape = (
-                        train_dataset.batch_size_per_gpu,
-                        3,
-                        train_dataset.lq_size,
-                        train_dataset.lq_size,
-                    )
-                prepare_for_compile(
-                    input_shape=input_shape,
-                    input_dtype=self.amp_dtype if self.use_amp else torch.float32,
-                )
+            self.prepare_network_for_compile(net)
             net = torch.compile(  # pyright: ignore[reportAssignmentType]
                 net,
                 mode=self.opt.compile_mode,

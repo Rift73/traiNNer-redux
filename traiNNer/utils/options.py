@@ -14,6 +14,7 @@ import torch
 import yaml
 from yaml import MappingNode
 
+from traiNNer.training_recovery import add_recovery_arguments
 from traiNNer.utils.dist_util import get_dist_info, init_dist, master_only
 from traiNNer.utils.redux_options import ReduxOptions
 
@@ -141,6 +142,8 @@ def parse_options(
     parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument("--manual_seed", type=int, default=None)
     parser.add_argument("--name", type=str, default=None)
+    if is_train:
+        add_recovery_arguments(parser)
 
     args = parser.parse_args()
 

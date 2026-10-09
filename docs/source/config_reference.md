@@ -89,7 +89,7 @@
   Type: bool
 ### use_compile
 
-  Enable torch.compile for the generator model, which takes time on startup to compile the model, but can speed up training after the model is compiled. However, compilation must be redone when starting training each time, as the compiled model is not saved, so for models that take too long to compile it may not worth it.
+  Enable torch.compile for the generator model. The first matching graph pays compilation and autotuning cost. Architectures with precompile-cache support persist compiled forward/backward artifacts for much faster matching resumes. Cache reuse requires a compatible PyTorch/compiler environment, graph, precision, layout and training geometry; it does not promise an instant start for changed configurations.
 
   Type: bool
 ### compile_mode
@@ -431,7 +431,7 @@
   Type: bool
 ### grad_clip_max_norm
 
-  Max norm of gradients for gradient clipping.
+  Max norm of gradients for gradient clipping. Default: `1.0`. This applies only when `grad_clip: true`; an explicit YAML value overrides the default.
 
   Type: float
 ### warmup_iter
@@ -519,6 +519,16 @@
   Whether to save the validation images during validation, in the experiments/<name>/visualization folder.
 
   Type: bool
+### save_img_freq
+
+  Optional image-saving interval in absolute training iterations. Save at interval multiples OR at `save_img_iters`. This does not change `val_freq`: validation must actually run at that iteration. Omit both filters to save on every validation. Each validation dataset may independently override `save_img_freq` and `save_img_iters`; omitted dataset fields inherit their global counterpart. `val.save_img: false` disables all image saving. Standalone testing is not filtered by training iteration schedules.
+
+  Type: positive int or null
+### save_img_iters
+
+  Optional explicit training iterations for image saving, in addition to the interval. A dataset's `[]` suppresses inherited explicit iterations, but does not disable its inherited interval.
+
+  Type: list of int or null
 ### tile_size
 
   Tile size of input to use during validation, reduce VRAM usage but slower inference. 0 to disable.
@@ -558,6 +568,11 @@
   How often to save model checkpoints and training states, in iterations.
 
   Type: int
+### save_checkpoint_keep
+
+  Number of complete regular checkpoint sets to retain after a successful refreshed save. Default `0` disables pruning. A set includes the training state, raw generator, EMA generator when enabled, and discriminator when configured. Pruning is permanent and starts only after the retained set is complete and synced. Non-periodic manual saves, backups and configured pretrained files are protected. Existing files are not pruned merely by starting training.
+
+  Type: non-negative int
 ### use_tb_logger
 
   Whether or not to enable TensorBoard logging.
@@ -568,4 +583,3 @@
   Format to save model checkpoints.
 
   Options: safetensors, pth
-

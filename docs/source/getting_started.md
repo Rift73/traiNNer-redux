@@ -58,6 +58,14 @@ python train.py --auto_resume -opt ./options/train/SPAN/SPAN_fidelity.yml
 
 To pause training, press `ctrl+C` or close the command window. To resume training, run the same command that was used to start training. The `--auto_resume` flag will resume training from when it was paused.
 
+On single-rank Linux/WSL CLI launches, a lightweight supervisor also handles persistent nonfinite generator losses/gradients. After 20 consecutive rejected attempts it reloads the latest complete regular checkpoint, without saving the failing weights. Recovery preserves the configured seed and allows at most two restarts without a newer checkpoint. There must be a complete checkpoint to recover from, periodic saving must be enabled, and recovery requires full resume with `restart_scheduler: false`. It is not an exact replay of the interrupted data/augmentation stream. Ordinary exceptions (including OOM) are not automatically retried.
+
+Use `--no-auto-recover` to opt out, or `--recovery-max-restarts N` and `--recovery-delay SECONDS` to adjust the bounded policy. Distributed training and native Windows do not use this supervisor. Rejected nonfinite generator gradients never advance the optimizer, EMA, scheduler or accepted iteration, but an enabled GradScaler retains overflow backoff so it can recover on a later attempt.
+
+Compiled-function caches are retained across compatible resumes. EMA initialization re-primes architecture-owned geometry caches before the first compiled forward. Cache hits still depend on graph/runtime/shape compatibility; changing the model or configuration may require recompilation.
+
+OTF training uses a centered mirror-padded work canvas for undersized sources. The final aligned LR/GT crop is centered on axes where any sample in the batch needed padding; other axes remain random. This differs from the old black-padding recipe. The zero-range Gaussian/Poisson fast paths preserve their output clamp/round operations but intentionally skip unused random draws. Consequently, the same seed does not imply the same training trajectory across the old and new harness versions. Keep `manual_seed` and `deterministic` explicit when comparing runs, and record the harness version as well as the YAML.
+
 ##### Multi GPU
 
 Run the following command to start training with multiple GPUs. Change `--nproc-per-node 4` to the number of GPUs you want to use for training.

@@ -24,6 +24,19 @@ class DatasetOptions(StrictStruct):
     type: str
     io_backend: dict[str, Any] = field(default_factory=lambda: {"type": "disk"})
 
+    save_img_freq: Annotated[
+        Annotated[int, Meta(ge=1)] | None,
+        Meta(
+            description="Validation image saving interval for this dataset, in absolute training iterations. Omit to inherit val.save_img_freq. This only filters image saving; validation must still run and val.save_img must be enabled.",
+        ),
+    ] = None
+    save_img_iters: Annotated[
+        list[int] | None,
+        Meta(
+            description="Explicit validation image saving iterations for this dataset, in addition to its saving interval. Omit to inherit val.save_img_iters; use [] to disable inherited explicit iterations."
+        ),
+    ] = None
+
     num_worker_per_gpu: Annotated[
         int | None,
         Meta(
@@ -350,7 +363,7 @@ class TrainOptions(StrictStruct):
     ] = False
     grad_clip_max_norm: Annotated[
         float, Meta(description="Max norm of gradients for gradient clipping.")
-    ] = 100.0
+    ] = 1.0
     warmup_iter: Annotated[
         int,
         Meta(
@@ -461,10 +474,16 @@ class ValOptions(StrictStruct):
             description="Whether to save the validation images during validation, in the experiments/<name>/visualization folder."
         ),
     ]
+    save_img_freq: Annotated[
+        Annotated[int, Meta(ge=1)] | None,
+        Meta(
+            description="Optional validation image saving interval, in absolute training iterations. Save on multiples of this interval or at save_img_iters. Validation must still run according to val_freq. Datasets can override this interval.",
+        ),
+    ] = None
     save_img_iters: Annotated[
         list[int] | None,
         Meta(
-            description="Optional training iterations at which validation images are saved. This filters image saving only; validation must still run at the iteration according to val_freq. Omit to save at every validation when save_img is enabled."
+            description="Optional explicit training iterations at which validation images are saved, in addition to save_img_freq. This filters image saving only; validation must still run according to val_freq. Omit both filters to save at every validation when save_img is enabled."
         ),
     ] = None
     tile_size: Annotated[
@@ -492,16 +511,33 @@ class ValOptions(StrictStruct):
     metrics: dict[str, Any] | None = None
     pbar: bool = True
 
-    def should_save_img(self, current_iter: int) -> bool:
+    def should_save_img(
+        self, current_iter: int, dataset_opt: DatasetOptions | None = None
+    ) -> bool:
         """Return whether this validation should write images.
 
+        Each dataset filter independently overrides its global counterpart when
+        set. Interval multiples and explicit iterations are combined with OR.
         Negative iterations are standalone test runs, where an optional training
         schedule should not suppress explicitly enabled image output.
         """
-        return self.save_img and (
-            current_iter < 0
-            or self.save_img_iters is None
-            or current_iter in self.save_img_iters
+        if not self.save_img:
+            return False
+        if current_iter < 0:
+            return True
+
+        save_img_freq = self.save_img_freq
+        save_img_iters = self.save_img_iters
+        if dataset_opt is not None:
+            if dataset_opt.save_img_freq is not None:
+                save_img_freq = dataset_opt.save_img_freq
+            if dataset_opt.save_img_iters is not None:
+                save_img_iters = dataset_opt.save_img_iters
+
+        return (
+            (save_img_freq is None and save_img_iters is None)
+            or (save_img_freq is not None and current_iter % save_img_freq == 0)
+            or (save_img_iters is not None and current_iter in save_img_iters)
         )
 
 
@@ -522,6 +558,13 @@ class LogOptions(StrictStruct):
         Literal["safetensors", "pth"],
         Meta(description="Format to save model checkpoints."),
     ] = "safetensors"
+    save_checkpoint_keep: Annotated[
+        int,
+        Meta(
+            ge=0,
+            description="Keep this many complete regular checkpoint sets after a successful save. Zero disables pruning. Non-periodic manual saves, backups, and configured pretrained files are never pruned.",
+        ),
+    ] = 0
     wandb: WandbOptions | None = None
 
 
@@ -619,7 +662,7 @@ class ReduxOptions(StrictStruct):
     use_compile: Annotated[
         bool,
         Meta(
-            description="Enable torch.compile for the generator model, which takes time on startup to compile the model, but can speed up training after the model is compiled. However, compilation must be redone when starting training each time, as the compiled model is not saved, so for models that take too long to compile it may not worth it."
+            description="Enable torch.compile for the generator model. The first matching graph still pays compilation and autotuning cost, while architectures with precompile-cache support persist compiled forward/backward artifacts for much faster matching resumes."
         ),
     ] = False
     compile_discriminator: Annotated[

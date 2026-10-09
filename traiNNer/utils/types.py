@@ -17,6 +17,8 @@ class DataFeed(TypedDict):
     sinc_kernel: NotRequired[Tensor]
     target_gt: NotRequired[Tensor]
     target_gt_path: NotRequired[str]
+    otf_padded_height: NotRequired[bool | Tensor]
+    otf_padded_width: NotRequired[bool | Tensor]
 
 
 class TrainingState(TypedDict):

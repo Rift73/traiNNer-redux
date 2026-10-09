@@ -20,6 +20,7 @@ VIPS_FORMAT_TO_DTYPE: dict[str, np.dtype] = {
     "double": np.float64,
 }
 
+
 def get_vips_dtype(img: pyvips.Image) -> np.dtype:
     if img.format not in VIPS_FORMAT_TO_DTYPE:
         raise ValueError(f"Unsupported VIPS format: {img.format}. Supported formats: {list(VIPS_FORMAT_TO_DTYPE.keys())}")
@@ -70,6 +71,9 @@ def paired_random_crop(
     gt_patch_size: int,
     scale: int,
     gt_path: str | None = None,
+    *,
+    center_height: bool = False,
+    center_width: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]: ...
 
 
@@ -80,6 +84,9 @@ def paired_random_crop(
     gt_patch_size: int,
     scale: int,
     gt_path: str | None = None,
+    *,
+    center_height: bool = False,
+    center_width: bool = False,
 ) -> tuple[Tensor, Tensor]: ...
 
 
@@ -89,6 +96,9 @@ def paired_random_crop(
     gt_patch_size: int,
     scale: int,
     gt_path: str | None = None,
+    *,
+    center_height: bool = False,
+    center_width: bool = False,
 ) -> tuple[np.ndarray, np.ndarray] | tuple[Tensor, Tensor]:
     """Paired random crop. Support Numpy array and Tensor inputs.
 
@@ -104,6 +114,8 @@ def paired_random_crop(
         gt_patch_size (int): GT patch size.
         scale (int): Scale factor.
         gt_path (str): Path to ground-truth. Default: None.
+        center_height (bool): Center the vertical crop coordinate.
+        center_width (bool): Center the horizontal crop coordinate.
 
     Returns:
         list[ndarray] | ndarray: GT images and LQ images. If returned results
@@ -132,9 +144,15 @@ def paired_random_crop(
             f"Please remove {gt_path}."
         )
 
-    # randomly choose top and left coordinates for lq patch
-    top = random.randint(0, h_lq - lq_patch_size)
-    left = random.randint(0, w_lq - lq_patch_size)
+    if center_height:
+        top = (h_lq - lq_patch_size) // 2
+    else:
+        top = random.randint(0, h_lq - lq_patch_size)
+
+    if center_width:
+        left = (w_lq - lq_patch_size) // 2
+    else:
+        left = random.randint(0, w_lq - lq_patch_size)
 
     # crop lq patch
     if isinstance(img_lq, Tensor):
@@ -168,6 +186,9 @@ def paired_random_crop_multi_gt(
     gt_patch_size: int,
     scale: int,
     gt_path: str | None = None,
+    *,
+    center_height: bool = False,
+    center_width: bool = False,
 ) -> tuple[list[np.ndarray], np.ndarray]: ...
 
 
@@ -178,6 +199,9 @@ def paired_random_crop_multi_gt(
     gt_patch_size: int,
     scale: int,
     gt_path: str | None = None,
+    *,
+    center_height: bool = False,
+    center_width: bool = False,
 ) -> tuple[list[Tensor], Tensor]: ...
 
 
@@ -187,11 +211,15 @@ def paired_random_crop_multi_gt(
     gt_patch_size: int,
     scale: int,
     gt_path: str | None = None,
+    *,
+    center_height: bool = False,
+    center_width: bool = False,
 ) -> tuple[list[np.ndarray], np.ndarray] | tuple[list[Tensor], Tensor]:
     """Paired random crop for one LQ image and multiple aligned GT images.
 
     All GT tensors/arrays must share the same size and stay aligned with the LQ image.
-    The same crop coordinates are applied to every GT.
+    The same crop coordinates are applied to every GT. Either axis can be centered
+    independently instead of sampling that coordinate randomly.
     """
 
     if not img_gts:
@@ -221,8 +249,15 @@ def paired_random_crop_multi_gt(
             f"Please remove {gt_path}."
         )
 
-    top = random.randint(0, h_lq - lq_patch_size)
-    left = random.randint(0, w_lq - lq_patch_size)
+    if center_height:
+        top = (h_lq - lq_patch_size) // 2
+    else:
+        top = random.randint(0, h_lq - lq_patch_size)
+
+    if center_width:
+        left = (w_lq - lq_patch_size) // 2
+    else:
+        left = random.randint(0, w_lq - lq_patch_size)
 
     if isinstance(img_lq, Tensor):
         img_lq = img_lq[:, :, top : top + lq_patch_size, left : left + lq_patch_size]
@@ -234,11 +269,20 @@ def paired_random_crop_multi_gt(
     for gt in img_gts:
         if isinstance(gt, Tensor):
             cropped_gts.append(
-                gt[:, :, top_gt : top_gt + gt_patch_size, left_gt : left_gt + gt_patch_size]
+                gt[
+                    :,
+                    :,
+                    top_gt : top_gt + gt_patch_size,
+                    left_gt : left_gt + gt_patch_size,
+                ]
             )
         else:
             cropped_gts.append(
-                gt[top_gt : top_gt + gt_patch_size, left_gt : left_gt + gt_patch_size, ...]
+                gt[
+                    top_gt : top_gt + gt_patch_size,
+                    left_gt : left_gt + gt_patch_size,
+                    ...,
+                ]
             )
 
     return cropped_gts, img_lq  # type: ignore

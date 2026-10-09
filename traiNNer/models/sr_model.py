@@ -29,6 +29,10 @@ from traiNNer.losses import build_loss
 from traiNNer.metrics import calculate_metric
 from traiNNer.metrics.psnr_ssim import calculate_psnr_pt, calculate_ssim_pt
 from traiNNer.models.base_model import BaseModel
+from traiNNer.training_recovery import (
+    MAX_CONSECUTIVE_NONFINITE_ATTEMPTS,
+    PersistentNonfiniteError,
+)
 from traiNNer.utils import get_root_logger, imwrite, tensor2img
 from traiNNer.utils.color_util import pixelformat2rgb_pt, rgb2pixelformat_pt
 from traiNNer.utils.logger import clickable_file_path
@@ -381,6 +385,9 @@ class SRModel(BaseModel):
 
             assert self.net_g_ema is not None
             self.net_g_ema.step = self.net_g_ema.step.to(device=torch.device("cpu"))
+            self.net_g_ema.initted = self.net_g_ema.initted.to(device="cpu")
+            if self.use_compile:
+                self.prepare_network_for_compile(self.net_g)
 
         self.grad_clip = train_opt.grad_clip
         self.grad_clip_max_norm = train_opt.grad_clip_max_norm
@@ -647,6 +654,29 @@ class SRModel(BaseModel):
             self.optimizers_schedule_free.append(
                 "SCHEDULEFREE" in train_opt.optim_d["type"].upper()
             )
+
+    def _record_nonfinite_rejection(self, candidate_iter: int) -> bool:
+        """Record one rejected effective update and report a stalled loop."""
+        self.nan_count += 1
+        self._pending_nonfinite_rejection_count += 1
+        limit_reached = self.nan_count >= MAX_CONSECUTIVE_NONFINITE_ATTEMPTS
+        if self.nan_count % 100 == 0 or limit_reached:
+            get_root_logger().warning(
+                "NaN/Inf rejected attempts (count: %d), skipping update",
+                self._pending_nonfinite_rejection_count,
+            )
+            self._pending_nonfinite_rejection_count = 0
+        return limit_reached
+
+    def _report_pending_nonfinite_rejections(self, candidate_iter: int) -> None:
+        """Report all pending rejections on the next 100-iteration boundary."""
+        if candidate_iter % 100 != 0 or self._pending_nonfinite_rejection_count == 0:
+            return
+        get_root_logger().warning(
+            "NaN/Inf rejected attempts (count: %d), skipping update",
+            self._pending_nonfinite_rejection_count,
+        )
+        self._pending_nonfinite_rejection_count = 0
 
     def _prepare_cudagraph_gradient_accumulation(self) -> None:
         """Allocate persistent grad buffers before the first compiled backward."""
@@ -931,6 +961,7 @@ class SRModel(BaseModel):
         assert self.scaler_d is not None
         assert self.scaler_g is not None
 
+        candidate_iter = current_iter if apply_gradient else current_iter + 1
         skip_d_update = False
 
         # optimize net_d
@@ -1149,23 +1180,16 @@ class SRModel(BaseModel):
                 loss_is_finite_value = bool(backward_g_loss.isfinite().item())
 
                 if not loss_is_finite_value:
-                    self.nan_count += 1
-                    logger = get_root_logger()
-                    logger.warning(
-                        "NaN/Inf in loss (count: %d), skipping update", self.nan_count
-                    )
+                    limit_reached = self._record_nonfinite_rejection(candidate_iter)
                     self.reject_training_step("nonfinite_generator_loss")
                     for index in range(len(self.optimizers_skipped)):
                         self.optimizers_skipped[index] = True
                     self._discard_accumulated_gradients()
-                    if self.nan_count > 10:
-                        raise RuntimeError(
-                            "Training failed: more than 10 consecutive NaN/Inf "
-                            "generator losses were rejected."
+                    if limit_reached:
+                        raise PersistentNonfiniteError(
+                            "nonfinite_generator_loss", candidate_iter, self.nan_count
                         )
-                    return  # skip this iteration
-                else:
-                    self.nan_count = 0
+                    return
 
                 # add total generator loss for tensorboard tracking
                 loss_dict["l_g_total"] = backward_g_loss
@@ -1173,33 +1197,28 @@ class SRModel(BaseModel):
                 self.scaler_g.scale(backward_g_loss).backward()
 
                 if apply_gradient:
-                    scaler_state_before = (
-                        self.scaler_g.state_dict()
-                        if self.scaler_g.is_enabled()
-                        else None
-                    )
                     self.scaler_g.unscale_(self.optimizer_g)
                     grad_norm_g = _get_total_gradient_norm(self.net_g.parameters())
 
                     loss_dict["grad_norm_g"] = grad_norm_g
 
                     if not bool(torch.isfinite(grad_norm_g).item()):
-                        self.nan_count += 1
+                        limit_reached = self._record_nonfinite_rejection(candidate_iter)
                         self.reject_training_step("nonfinite_generator_gradient")
                         for index in range(len(self.optimizers_skipped)):
                             self.optimizers_skipped[index] = True
                         self._discard_accumulated_gradients()
-                        if scaler_state_before is not None:
-                            # Clear GradScaler's per-optimizer UNSCALED phase, then
-                            # restore its public state so the rejected attempt is
-                            # transactionally invisible to the scale schedule.
+                        if self.scaler_g.is_enabled():
+                            # unscale_ recorded overflow. Consume it and reset the
+                            # per-optimizer phase, retaining GradScaler's backoff.
+                            # Do not restore the old scale or step the optimizer.
                             self.scaler_g.update()
-                            self.scaler_g.load_state_dict(scaler_state_before)
-                        get_root_logger().warning(
-                            "NaN/Inf in generator gradients (count: %d); rejected "
-                            "the batch without advancing optimizer/EMA/scheduler/iter.",
-                            self.nan_count,
-                        )
+                        if limit_reached:
+                            raise PersistentNonfiniteError(
+                                "nonfinite_generator_gradient",
+                                candidate_iter,
+                                self.nan_count,
+                            )
                         return
 
                     if self.grad_clip:
@@ -1295,6 +1314,10 @@ class SRModel(BaseModel):
             self.log_dict[key] = self.log_dict.get(key, 0) + val * n_samples
 
         self.log_dict = self.reduce_loss_dict(self.log_dict)
+
+        if apply_gradient and not any(self.optimizers_skipped):
+            self.nan_count = 0
+            self._report_pending_nonfinite_rejections(candidate_iter)
 
         if self.net_g_ema is not None and apply_gradient:
             if not (self.use_amp and self.optimizers_skipped[0]):

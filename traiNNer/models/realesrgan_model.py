@@ -51,6 +51,12 @@ OTF_DEBUG_PATH = osp.abspath(
 ANTIALIAS_MODES = {"bicubic", "bilinear"}
 
 
+def _collated_any(value: bool | Tensor | None) -> bool:
+    if isinstance(value, Tensor):
+        return bool(value.any().item())
+    return bool(value)
+
+
 @MODEL_REGISTRY.register(suffix="traiNNer")
 class RealESRGANModel(SRModel):
     """RealESRGAN Model for Real-ESRGAN: Training Real-World Blind Super-Resolution with Pure Synthetic Data.
@@ -65,6 +71,7 @@ class RealESRGANModel(SRModel):
 
         self.queue_lr: Tensor | None = None
         self.queue_gt: Tensor | None = None
+        self._queue_index_host: Tensor | None = None
         self.queue_ptr = 0
         self.kernel1: Tensor | None = None
         self.kernel2: Tensor | None = None
@@ -120,8 +127,16 @@ class RealESRGANModel(SRModel):
             assert self.queue_lr is not None
             assert self.queue_gt is not None
             idx = torch.randperm(self.queue_size)
-            self.queue_lr = self.queue_lr[idx]
-            self.queue_gt = self.queue_gt[idx]
+            device_idx = idx
+            if self.lq.is_cuda:
+                # Retain pinned indices until the next feed; the existing finite-loss
+                # check synchronizes this transfer before that buffer can be replaced.
+                self._queue_index_host = idx.pin_memory()
+                device_idx = self._queue_index_host.to(
+                    device=self.lq.device, non_blocking=True
+                )
+            self.queue_lr = self.queue_lr[device_idx]
+            self.queue_gt = self.queue_gt[device_idx]
             # get first b samples
             lq_dequeue = self.queue_lr[0:b, :, :, :].clone()
             gt_dequeue = self.queue_gt[0:b, :, :, :].clone()
@@ -547,6 +562,8 @@ class RealESRGANModel(SRModel):
                 and "kernel2" in data
                 and "sinc_kernel" in data
             )
+            center_crop_height = _collated_any(data.get("otf_padded_height"))
+            center_crop_width = _collated_any(data.get("otf_padded_width"))
             # training data synthesis
             gt_source = data["gt"]
             if gt_source.device != self.device:
@@ -787,17 +804,27 @@ class RealESRGANModel(SRModel):
             # clamp and round
             self.lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.0
 
-            # random crop
+            # Center only padded axes; keep random crops on unpadded axes.
             gt_size = self.opt.datasets["train"].gt_size
             assert gt_size is not None
             if target_gt is not None:
                 cropped_gts, self.lq = paired_random_crop_multi_gt(
-                    [self.gt, gt_source], self.lq, gt_size, self.opt.scale
+                    [self.gt, gt_source],
+                    self.lq,
+                    gt_size,
+                    self.opt.scale,
+                    center_height=center_crop_height,
+                    center_width=center_crop_width,
                 )
                 self.gt = cropped_gts[0]
             else:
                 self.gt, self.lq = paired_random_crop(
-                    self.gt, self.lq, gt_size, self.opt.scale
+                    self.gt,
+                    self.lq,
+                    gt_size,
+                    self.opt.scale,
+                    center_height=center_crop_height,
+                    center_width=center_crop_width,
                 )
             if "hf_noise" in active:
                 self._apply_hf_noise()

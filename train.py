@@ -1,5 +1,12 @@
 import os
 
+# The waiting parent must not import Torch or initialize a CUDA runtime. This
+# only runs for the CLI; imported train_pipeline callers remain in-process.
+if __name__ == "__main__":
+    from traiNNer.training_recovery import maybe_supervise_training
+
+    maybe_supervise_training(__file__)
+
 from torch.distributed import destroy_process_group
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "1"
@@ -26,11 +33,18 @@ from rich.traceback import install
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard.writer import SummaryWriter
 from traiNNer.data import build_dataloader, build_dataset
+from traiNNer.data.base_dataset import BaseDataset
 from traiNNer.data.data_sampler import EnlargedSampler
 from traiNNer.data.paired_image_dataset import PairedImageDataset
 from traiNNer.data.paired_video_dataset import PairedVideoDataset
 from traiNNer.data.prefetch_dataloader import CPUPrefetcher, CUDAPrefetcher
 from traiNNer.models import build_model
+from traiNNer.training_recovery import (
+    NONFINITE_EXIT_CODE,
+    CheckpointRetention,
+    PersistentNonfiniteError,
+    TrainingRecovery,
+)
 from traiNNer.utils import (
     AvgTimer,
     MessageLogger,
@@ -227,9 +241,14 @@ def create_train_val_dataloader(
     return train_loader, train_sampler, val_loaders, total_epochs, total_iters
 
 
-def load_resume_state(opt: ReduxOptions) -> Any | None:
+def load_resume_state(
+    opt: ReduxOptions, recovery: TrainingRecovery | None = None
+) -> Any | None:
     resume_state_path = None
-    if opt.auto_resume:
+    if recovery is not None:
+        resume_state_path = recovery.choose_resume(opt)
+        opt.path.resume_state = resume_state_path
+    elif opt.auto_resume:
         state_path = osp.join("experiments", opt.name, "training_states")
         if osp.isdir(state_path):
             states = list(
@@ -257,6 +276,9 @@ def load_resume_state(opt: ReduxOptions) -> Any | None:
         )
         assert resume_state is not None
 
+        if recovery is not None:
+            recovery.note_resume(resume_state_path, resume_state["iter"])
+
         check_resume(
             opt,
             resume_state["iter"],
@@ -267,6 +289,9 @@ def load_resume_state(opt: ReduxOptions) -> Any | None:
 def train_pipeline(root_path: str) -> None:
     install()
 
+    # Parse CLI arguments before requiring CUDA so --help stays CPU-only.
+    opt, args = Config.load_config_from_file(root_path, is_train=True)
+
     if not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA is not available. Please ensure that you have a GPU with CUDA support "
@@ -274,8 +299,6 @@ def train_pipeline(root_path: str) -> None:
             "You can check the installation guide at https://pytorch.org/get-started/locally/"
         )
 
-    # parse options, set distributed setting, set random seed
-    opt, args = Config.load_config_from_file(root_path, is_train=True)
     opt.root_path = root_path
 
     assert opt.train is not None
@@ -285,6 +308,14 @@ def train_pipeline(root_path: str) -> None:
     assert opt.path.experiments_root is not None
     assert opt.path.log is not None
 
+    recovery = TrainingRecovery.from_environment(opt)
+    retention = CheckpointRetention.from_options(opt)
+    checkpoint_layout = None
+    if recovery is not None:
+        checkpoint_layout = recovery.layout
+    elif retention is not None:
+        checkpoint_layout = retention.layout
+
     torch.cuda.set_per_process_memory_fraction(fraction=1.0)
 
     if opt.detect_anomaly:
@@ -292,9 +323,7 @@ def train_pipeline(root_path: str) -> None:
 
     if opt.deterministic:
         torch.backends.cudnn.benchmark = False
-        torch.use_deterministic_algorithms(
-            True, warn_only=opt.deterministic_warn_only
-        )
+        torch.use_deterministic_algorithms(True, warn_only=opt.deterministic_warn_only)
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     else:
         torch.backends.cudnn.benchmark = True
@@ -302,7 +331,7 @@ def train_pipeline(root_path: str) -> None:
     set_random_seed(opt.manual_seed + opt.rank)
 
     # load resume states if necessary
-    resume_state = load_resume_state(opt)
+    resume_state = load_resume_state(opt, recovery)
     make_exp_dirs(opt, resume_state is not None)
     # mkdir for experiments and logger
     if resume_state is None:
@@ -322,6 +351,14 @@ def train_pipeline(root_path: str) -> None:
     diff, template_name = diff_user_vs_template(args.opt)
     if diff and template_name:
         logger.info("Diff with default config (%s):\n%s", template_name, diff)
+
+    if retention is not None:
+        logger.info(
+            "Checkpoint retention enabled: keep %d complete regular sets. "
+            "Older regular sets will be permanently pruned after a successful save; "
+            "manual checkpoints and backups are untouched.",
+            retention.keep,
+        )
 
     if opt.deterministic:
         logger.info(
@@ -431,6 +468,7 @@ def train_pipeline(root_path: str) -> None:
     apply_gradient = False
     accepted_gradient = False
     crashed = False
+    nonfinite_failure: PersistentNonfiniteError | None = None
     train_data = None
     assert model.opt.path.models is not None
 
@@ -508,10 +546,41 @@ def train_pipeline(root_path: str) -> None:
                         ),
                         free_space_gb_str(),
                     )
+                    checkpoint_before = (
+                        checkpoint_layout.before_save(current_iter)
+                        if checkpoint_layout is not None
+                        else None
+                    )
                     model.save(
                         epoch,
                         current_iter,
                     )
+                    if recovery is not None and not recovery.note_periodic_save(
+                        current_iter, checkpoint_before or {}
+                    ):
+                        logger.warning(
+                            "Checkpoint %d is incomplete or not fully refreshed; "
+                            "automatic recovery will retain its previous checkpoint.",
+                            current_iter,
+                        )
+                    if retention is not None:
+                        pruning = retention.prune_after_save(
+                            current_iter, checkpoint_before or {}
+                        )
+                        if pruning.removed_files:
+                            logger.info(
+                                "Checkpoint retention: removed %d old regular sets, "
+                                "%d files (%.2f GiB). Keeping %d regular sets; "
+                                "manual checkpoints are untouched.",
+                                len(pruning.removed_iterations),
+                                len(pruning.removed_files),
+                                pruning.removed_bytes / 1024**3,
+                                retention.keep,
+                            )
+                        if pruning.error:
+                            logger.warning(
+                                "Checkpoint retention stopped: %s", pruning.error
+                            )
 
                 # validation
                 if opt.val is not None:
@@ -520,13 +589,15 @@ def train_pipeline(root_path: str) -> None:
                     )
                     if current_iter % opt.val.val_freq == 0 and accepted_gradient:
                         multi_val_datasets = len(val_loaders) > 1
-                        save_img = opt.val.should_save_img(current_iter)
                         for val_loader in val_loaders:
+                            assert isinstance(val_loader.dataset, BaseDataset)
                             model.validation(
                                 val_loader,
                                 current_iter,
                                 tb_logger,
-                                save_img,
+                                opt.val.should_save_img(
+                                    current_iter, val_loader.dataset.opt
+                                ),
                                 multi_val_datasets,
                             )
                         model.on_validation_boundary(current_iter)
@@ -542,10 +613,35 @@ def train_pipeline(root_path: str) -> None:
             if interrupt_received:
                 break
         # end of epoch
+    except PersistentNonfiniteError as e:
+        logger.error("%s", e)
+        nonfinite_failure = e
+        crashed = True
+        interrupt_received = True
     except Exception as e:
         logger.exception(e)
         crashed = True
         interrupt_received = True
+
+    if nonfinite_failure is not None:
+        logger.error(
+            "Persistent NaN/Inf: not saving the failing model as a resumable "
+            "checkpoint. Existing regular checkpoints are unchanged."
+        )
+        try:
+            if recovery is not None:
+                recovery.report_failure(nonfinite_failure, opt.manual_seed)
+            else:
+                logger.error(
+                    "Automatic recovery is disabled for this launch. "
+                    "Resume manually from a known-good checkpoint."
+                )
+        finally:
+            if tb_logger is not None:
+                tb_logger.close()
+            if model.opt.dist:
+                destroy_process_group()
+        sys.exit(NONFINITE_EXIT_CODE)
 
     # epoch was completed, increment it to set the correct epoch count when interrupted
     if train_data is None:
@@ -566,7 +662,7 @@ def train_pipeline(root_path: str) -> None:
             model.save(epoch, current_iter)
         if model.opt.dist:
             destroy_process_group()
-        sys.exit(0)
+        sys.exit(1 if crashed else 0)
 
     consumed_time = str(datetime.timedelta(seconds=int(time.time() - start_time)))
     logger.info("End of training. Time consumed: %s", consumed_time)
@@ -577,11 +673,12 @@ def train_pipeline(root_path: str) -> None:
     )  # -1 stands for the latest
     if opt.val is not None:
         for val_loader in val_loaders:
+            assert isinstance(val_loader.dataset, BaseDataset)
             model.validation(
                 val_loader,
                 current_iter,
                 tb_logger,
-                opt.val.should_save_img(current_iter),
+                opt.val.should_save_img(current_iter, val_loader.dataset.opt),
             )
     if tb_logger:
         tb_logger.close()

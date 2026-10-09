@@ -27,6 +27,23 @@ from traiNNer.utils.registry import DATASET_REGISTRY
 from traiNNer.utils.types import DataFeed
 
 
+def _reflect_pad_vips(img: pyvips.Image, min_size: int) -> pyvips.Image:
+    height: int = img.height  # type: ignore
+    width: int = img.width  # type: ignore
+    if height >= min_size and width >= min_size:
+        return img
+
+    pad_height = max(0, min_size - height)
+    pad_width = max(0, min_size - width)
+    return img.embed(
+        pad_width // 2,
+        pad_height // 2,
+        width + pad_width,
+        height + pad_height,
+        extend=pyvips.enums.Extend.MIRROR,
+    )
+
+
 @DATASET_REGISTRY.register(suffix="traiNNer")
 class RealESRGANDataset(BaseDataset):
     """Dataset used for Real-ESRGAN model:
@@ -175,7 +192,9 @@ class RealESRGANDataset(BaseDataset):
                 (vips_img_gt, vips_img_target), self.opt.use_hflip, self.opt.use_rot
             )
         else:
-            vips_img_gt = augment_vips(vips_img_gt, self.opt.use_hflip, self.opt.use_rot)
+            vips_img_gt = augment_vips(
+                vips_img_gt, self.opt.use_hflip, self.opt.use_rot
+            )
 
         h: int = vips_img_gt.height  # type: ignore
         w: int = vips_img_gt.width  # type: ignore
@@ -191,15 +210,18 @@ class RealESRGANDataset(BaseDataset):
                 )
 
         crop_pad_size = self.opt.gt_size + 32
+        padded_height = h < crop_pad_size
+        padded_width = w < crop_pad_size
         # pad
-        if h < crop_pad_size or w < crop_pad_size:
-            pad_h = max(0, crop_pad_size - h)
-            pad_w = max(0, crop_pad_size - w)
-            vips_img_gt: pyvips.Image = vips_img_gt.embed(0, 0, w + pad_w, h + pad_h)  # type: ignore
+        if padded_height or padded_width:
+            vips_img_gt = _reflect_pad_vips(vips_img_gt, crop_pad_size)
             if vips_img_target is not None:
-                vips_img_target = vips_img_target.embed(
-                    0, 0, w + pad_w, h + pad_h
-                )  # type: ignore
+                vips_img_target = _reflect_pad_vips(vips_img_target, crop_pad_size)
+
+            # Crop coordinates must use the padded dimensions. In particular, one
+            # dimension may have been padded while the other was already oversized.
+            h = vips_img_gt.height  # type: ignore
+            w = vips_img_gt.width  # type: ignore
         # crop
         if w > crop_pad_size or h > crop_pad_size:
             if vips_img_target is not None:
@@ -280,17 +302,17 @@ class RealESRGANDataset(BaseDataset):
         kernel = torch.FloatTensor(kernel)
         kernel2 = torch.FloatTensor(kernel2)
 
-        output = {
+        output: DataFeed = {
             "gt": img_gt,
             "kernel1": kernel,
             "kernel2": kernel2,
             "sinc_kernel": sinc_kernel,
             "gt_path": gt_path,
+            "otf_padded_height": padded_height,
+            "otf_padded_width": padded_width,
         }
         if vips_img_target is not None:
-            output["target_gt"] = img2tensor(
-                img_target, from_bgr=False, float32=True
-            )
+            output["target_gt"] = img2tensor(img_target, from_bgr=False, float32=True)
             output["target_gt_path"] = target_gt_path
 
         return output

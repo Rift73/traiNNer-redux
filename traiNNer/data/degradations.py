@@ -687,8 +687,12 @@ def random_add_gaussian_noise_pt(
     clip: bool = True,
     rounds: bool = False,
 ) -> Tensor:
-    noise = random_generate_gaussian_noise_pt(img, sigma_range, gray_prob)
-    out = img + noise
+    if sigma_range[0] == 0 and sigma_range[1] == 0:
+        # Zero-noise fast path; intentionally does not advance RNG.
+        out = img
+    else:
+        noise = random_generate_gaussian_noise_pt(img, sigma_range, gray_prob)
+        out = img + noise
     if clip and rounds:
         out = torch.clamp((out * 255.0).round(), 0, 255) / 255.0
     elif clip:
@@ -898,8 +902,12 @@ def random_add_poisson_noise_pt(
     clip: bool = True,
     rounds: bool = False,
 ) -> Tensor:
-    noise = random_generate_poisson_noise_pt(img, scale_range, gray_prob)
-    out = img + noise
+    if scale_range[0] == 0 and scale_range[1] == 0:
+        # Zero-noise fast path; intentionally does not advance RNG.
+        out = img
+    else:
+        noise = random_generate_poisson_noise_pt(img, scale_range, gray_prob)
+        out = img + noise
     if clip and rounds:
         out = torch.clamp((out * 255.0).round(), 0, 255) / 255.0
     elif clip:
