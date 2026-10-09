@@ -81,7 +81,7 @@ Further gains need a different median cut; Pillow's is the floor.
 
 ### Sync-free noise and DiffJPEG (`traiNNer/data/degradations.py`, `traiNNer/utils/diffjpeg.py`)
 Poisson: the per-image `torch.unique` loop became a batched device-side level count (sort, count changes, log2/ceil
-in float64); the gray decision is evaluated once; with scale range [0, 0] and `gray_prob` ≤ 0 the noise is skipped
+in float64); the gray decision is evaluated once; with scale range [0, 0] the noise is skipped whatever `gray_prob`
 and `clamp(img + 0)` returned. DiffJPEG: `quality_to_factor` takes the whole per-image quality tensor, so the
 per-image loop and its 8 syncs per call are gone; the factor has a floor of 1e-7 so quality 100 is finite and
 near-lossless (only DiffJPEG's fixed 4:2:0 chroma remains). Bit-identical to the previous code in 116 tests
@@ -99,7 +99,9 @@ stream differs after it) and quality ≥ 100 (was NaN).
 Every recurring host sync removed (constants, colour matrices and their inverses, Bayer maps, frequency grids and
 NTSC carriers are cached per device/size; the first call of each still syncs once). Rainbow's cuDNN re-autotune
 on every new filter length (28–85 ms spikes) is fixed by zero-padding the kernel to a radius of 12, 24 or 48,
-bit-identical output. 33 tests compare each function with commit 0ed482ff under `set_sync_debug_mode("error")`.
+bit-identical output with cuDNN's heuristic algorithm choice (under `cudnn.benchmark` the timing-based choice can
+differ between the padded and the unpadded shape by an ulp; that test allows 1e-6). 33 tests compare each function
+with commit 0ed482ff under `set_sync_debug_mode("error")`.
 
 | function (batch 8×3×256²) | syncs/call | median ms before → after |
 |---|---|---|
@@ -213,3 +215,13 @@ $PY benchmarks/otf_profile.py --dither riemersma      --codecs jpeg  --out bench
 $PY benchmarks/otf_profile.py --dither floydsteinberg --codecs mixed --out benchmarks/otf_profile_after.txt --append
 $PY -m pytest -q tests/test_dither_cuda.py tests/test_otf_sync_free.py tests/test_gpu_degradations_sync_free.py
 ```
+
+## Merged into master (2026-10-09)
+Merged over the owner's working tree, committed first as `f4feb4b7`. Conflicts: `transforms.py` keeps the WIP's
+centre-crop options with the random offsets drawn from the project RNG (the WIP's crop test now forces the last offset
+through that RNG instead of `random.randint`); `degradations.py` takes the WIP's semantics for the zero-noise skip,
+which applies whatever `gray_prob` (the branch had skipped only without gray noise, where the full path's sign of
+zero at -0.0 pixels is reproducible; with gray noise that sign is random, so only the sign of zero can differ),
+keeping `img + 0`. The full suite
+on the merged tree fails only where the WIP already failed before the merge (architecture forward passes, the
+`CUDA_VISIBLE_DEVICES` fixture of the DUAL tests, the arch-info registry, the SR-model loss keys).

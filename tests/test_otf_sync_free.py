@@ -250,12 +250,17 @@ def test_poisson_every_level_count(gray_prob: float) -> None:
 def test_poisson_zero_scale_skip(
     seed: int, gray_prob: float, clip: bool, rounds: bool
 ) -> None:
-    """scale_range [0, 0] (skipped when gray_prob is 0) equals the full path."""
+    """scale_range [0, 0] (skipped for every gray_prob) equals the full path.
+
+    Up to the sign of zero: at -0.0 input pixels the full path adds a zero whose
+    sign is that of the (random) gray noise, the skip adds +0. Adding 0 to both
+    sides normalises that sign before the bitwise comparison.
+    """
     img = _images(seed)
     args = ((0.0, 0.0), gray_prob, clip, rounds)
     ref, _ = _seeded(seed, lambda: _ref_random_add_poisson_noise_pt(img, *args))
     new, _ = _seeded(seed, lambda: random_add_poisson_noise_pt(img, *args))
-    _assert_bitwise(new, ref)
+    _assert_bitwise(new + 0, ref + 0)
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])

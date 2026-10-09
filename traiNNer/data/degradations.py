@@ -951,9 +951,9 @@ def random_add_poisson_noise_pt(
     clip: bool = True,
     rounds: bool = False,
 ) -> Tensor:
-    if scale_range[0] == scale_range[1] == 0 and _known_any_gray(gray_prob) is False:
-        # Every sampled scale is exactly 0 and no image takes gray noise, so the
-        # noise is +-0 (+0 where img is -0.0) and img + noise equals img + 0.
+    if scale_range[0] == scale_range[1] == 0:
+        # Every sampled scale is exactly 0, so the noise (gray or not) is +-0 and
+        # img + noise equals img + 0 (up to the sign of zero at -0.0 pixels).
         # Skip generating it. This skips its random draws too, so later draws
         # from the CUDA generator come earlier in the stream.
         out = img + 0

@@ -226,15 +226,24 @@ def _call(
 
 
 def _assert_matches(
-    reference: ModuleType, case: str, image: torch.Tensor, draws: int
+    reference: ModuleType,
+    case: str,
+    image: torch.Tensor,
+    draws: int,
+    atol: float = 0.0,
 ) -> None:
+    """Bit-identical to the reference, or within atol when atol is not 0."""
     name, sampler = CASES[case]
     rng = np.random.default_rng(sum(map(ord, case)))
     for draw in range(draws):
         params = sampler(rng)
         expected = _call(reference, name, image, params, seed=draw)
         actual = _call(gpu_degradations, name, image, params, seed=draw)
-        assert torch.equal(actual, expected), f"{case} draw {draw}: {params}"
+        if atol:
+            difference = float((actual - expected).abs().max())
+            assert difference <= atol, f"{case} draw {draw}: {params}: max |d| {difference}"
+        else:
+            assert torch.equal(actual, expected), f"{case} draw {draw}: {params}"
 
 
 @pytest.mark.parametrize("case", sorted(set(CASES) - {"ntsc_vhs"}))
@@ -247,10 +256,12 @@ def test_rainbow_bit_identical_with_cudnn_benchmark(
     reference: ModuleType, monkeypatch: pytest.MonkeyPatch, width: int
 ) -> None:
     """Training runs with cudnn.benchmark on, which picks the conv algorithm by
-    timing; the zero-padded rainbow kernel must match there too, including
-    widths that cap the padded radius at w // 2."""
+    timing, separately for the padded and the unpadded kernel shape; the two
+    choices can differ (once, in a 15-minute run, by an ulp), so the padded
+    kernel must match within 1e-6 there, including widths that cap the padded
+    radius at w // 2. Exact equality is test_bit_identical_to_reference's."""
     monkeypatch.setattr(torch.backends.cudnn, "benchmark", True)
-    _assert_matches(reference, "rainbow", _image(4, 96, width, seed=4), draws=12)
+    _assert_matches(reference, "rainbow", _image(4, 96, width, seed=4), draws=12, atol=1e-6)
 
 
 @pytest.mark.parametrize(

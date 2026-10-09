@@ -6,6 +6,14 @@ from traiNNer.data.realesrgan_dataset import _reflect_pad_vips
 from traiNNer.data.transforms import paired_random_crop, paired_random_crop_multi_gt
 
 
+class _LastOffset:
+    """Stands in for the project RNG: every integers() draw returns its upper bound."""
+
+    @staticmethod
+    def integers(low: int, high: int, endpoint: bool = False) -> int:
+        return high
+
+
 @pytest.mark.parametrize(
     ("source_height", "expected_reflected_rows"), ((325, 59), (375, 9))
 )
@@ -34,7 +42,8 @@ def test_otf_final_crop_centers_only_padded_axes(
 ) -> None:
     lq = torch.arange(104 * 104).reshape(1, 1, 104, 104)
     gt = torch.arange(416 * 416).reshape(1, 1, 416, 416)
-    monkeypatch.setattr("traiNNer.data.transforms.random.randint", lambda _a, b: b)
+    # the crop offsets come from the project RNG; the random axis lands on its last offset
+    monkeypatch.setattr("traiNNer.data.transforms.RNG.get_rng", lambda: _LastOffset())
 
     cropped_gt, cropped_lq = paired_random_crop(gt, lq, 384, 4, center_height=True)
     cropped_gts, cropped_multi_lq = paired_random_crop_multi_gt(
