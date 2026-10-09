@@ -11,15 +11,25 @@ Strategy (from exhaustive benchmarking):
 IMPORTANT: All frames are encoded as intra-only (gop_size=1, no B-frames).
 This ensures each frame is independently compressed — batch-as-video is purely
 a performance optimization, not a semantic change from per-image encoding.
+One exception: x264 and x265 in CRF mode set each frame's QP from the running
+complexity of the frames before it in the batch, so the same frame can get a
+different QP depending on its neighbours (prediction stays intra).
+
+Thread counts come from _thread_counts. None of them changes the decoded
+frames.
 """
 
 from __future__ import annotations
 
 import io
+import os
+from typing import NamedTuple
 
 import numpy as np
 import torch
 from torch import Tensor
+
+from traiNNer.utils.rng import RNG
 
 # Codec → TorchCodec format mapping
 _TC_CODEC_MAP = {
@@ -63,6 +73,54 @@ def _filter_sampling(
     return filtered if filtered else ["420"]  # fallback to 420 if nothing matches
 
 
+class _ThreadCounts(NamedTuple):
+    x265_pools: int
+    x265_frame_threads: int
+    vp9_encoder: int
+    vp9_decoder: int
+
+
+def _thread_counts(batch: int, height: int, width: int) -> _ThreadCounts:
+    """Encoder and decoder thread counts for one call.
+
+    The codec defaults suit long videos, not a batch of small intra-only
+    frames: x265 runs one frame thread next to a pool of one worker per core,
+    and libvpx starts one thread per core, whose start-up costs more than it
+    saves on frames up to 256². Intra-only frames are independent, so frame
+    threads (x265 encode, vp9 decode) spread the batch over the cores.
+
+    The counts derive from the batch size and from the CPUs this process may
+    run on: its affinity mask where the OS has one (training may be pinned),
+    otherwise os.cpu_count(). On a 16-core/32-thread CPU, batch 8: x265 pool 8
+    and 8 frame threads, libvpx 1 thread up to 256² and 4 above, 8 vp9 decode
+    threads.
+    """
+    if hasattr(os, "sched_getaffinity"):
+        cpus = len(os.sched_getaffinity(0))
+    else:
+        cpus = os.cpu_count() or 1
+    pools = min(8, cpus)
+    return _ThreadCounts(
+        x265_pools=pools,
+        x265_frame_threads=min(batch, pools),
+        vp9_encoder=1 if height * width <= 256 * 256 else min(4, cpus),
+        vp9_decoder=min(8, cpus),
+    )
+
+
+def _to_unit_float(frames: Tensor, device: torch.device) -> Tensor:
+    """BCHW uint8 CPU frames → contiguous float32 [0, 1] on `device`.
+
+    The frames cross to the device as uint8 (a quarter of the float32 bytes).
+    The divisor is a 0-dim device tensor because CUDA turns a Python-scalar
+    divisor into a multiply by its reciprocal, which is 1 ulp off true division
+    for about half of the values 0..255.
+    """
+    frames = frames.to(device)
+    divisor = torch.full((), 255.0, device=device)
+    return frames.to(torch.float32, memory_format=torch.contiguous_format).div_(divisor)
+
+
 def compress_video_batch_torchcodec(
     tensor: Tensor,
     codec: str = "h264",
@@ -91,19 +149,18 @@ def compress_video_batch_torchcodec(
 
     if codec not in _TC_CODEC_MAP:
         raise ValueError(
-            "TorchCodec batch: unsupported codec '{}'. Use one of: {}".format(
-                codec, list(_TC_CODEC_MAP.keys())
-            )
+            f"TorchCodec batch: unsupported codec '{codec}'. "
+            f"Use one of: {list(_TC_CODEC_MAP.keys())}"
         )
 
     device = tensor.device
     codec_name, fmt = _TC_CODEC_MAP[codec]
-    _, _, orig_h, orig_w = tensor.shape
+    b, _, orig_h, orig_w = tensor.shape
 
     # Chroma subsampling selection (filter to codec-supported formats)
     if video_sampling:
         filtered = _filter_sampling(video_sampling, codec)
-        sampling_key = np.random.choice(filtered)
+        sampling_key = RNG.get_rng().choice(filtered)
         pix_fmt = _VIDEO_SUBSAMPLING.get(sampling_key, "yuv420p")
     else:
         pix_fmt = None  # codec default
@@ -131,15 +188,24 @@ def compress_video_batch_torchcodec(
     if codec_name == "libx264":
         extra_options["preset"] = "ultrafast"
     elif codec_name == "libx265":
+        threads = _thread_counts(b, orig_h, orig_w)
         extra_options["preset"] = "ultrafast"
-        extra_options["x265-params"] = "log-level=0"
+        extra_options["x265-params"] = (
+            f"log-level=0:pools={threads.x265_pools}"
+            f":frame-threads={threads.x265_frame_threads}"
+        )
 
     encode_kwargs: dict = {
         "format": fmt,
         "codec": codec_name,
-        "crf": quality,
         "extra_options": extra_options,
     }
+    if codec_name == "mpeg4":
+        # The mpeg4 encoder has no CRF option and ignores `crf`; its quality is
+        # a fixed qscale, as in compress_video.
+        extra_options["qmin"] = extra_options["qmax"] = str(quality)
+    else:
+        encode_kwargs["crf"] = quality
 
     if pix_fmt:
         encode_kwargs["pixel_format"] = pix_fmt
@@ -148,13 +214,12 @@ def compress_video_batch_torchcodec(
 
     # Decode all frames back
     dec = VideoDecoder(encoded)
-    frames = [dec[i] for i in range(len(dec))]
+    frames = torch.stack([dec[i] for i in range(len(dec))])
 
-    # Stack, crop padding, convert back to float on original device
-    result = torch.stack(frames).float().div_(255.0).to(device)
+    # Crop padding, convert back to float on original device
     if pad_h or pad_w:
-        result = result[:, :, :orig_h, :orig_w]
-    return result
+        frames = frames[:, :, :orig_h, :orig_w]
+    return _to_unit_float(frames, device)
 
 
 def compress_video_batch_pyav(
@@ -181,12 +246,12 @@ def compress_video_batch_pyav(
         BCHW float32 tensor on same device, after codec roundtrip.
     """
     import av
+    from av.video.reformatter import VideoReformatter
 
     if codec not in _PYAV_CODEC_MAP:
         raise ValueError(
-            "PyAV batch: unsupported codec '{}'. Use one of: {}".format(
-                codec, list(_PYAV_CODEC_MAP.keys())
-            )
+            f"PyAV batch: unsupported codec '{codec}'. "
+            f"Use one of: {list(_PYAV_CODEC_MAP.keys())}"
         )
 
     device = tensor.device
@@ -199,7 +264,7 @@ def compress_video_batch_pyav(
     # Chroma subsampling (filter to codec-supported formats)
     if video_sampling:
         filtered = _filter_sampling(video_sampling, codec)
-        sampling_key = np.random.choice(filtered)
+        sampling_key = RNG.get_rng().choice(filtered)
         pix_fmt = _VIDEO_SUBSAMPLING.get(sampling_key, "yuv420p")
     else:
         pix_fmt = "yuv420p"
@@ -215,17 +280,16 @@ def compress_video_batch_pyav(
     else:
         h_padded, w_padded = h, w
 
-    # Build codec options
+    # Build codec options and encoder thread count
+    threads = _thread_counts(b, h_padded, w_padded)
     if codec == "vp9":
         options = {"cpu-used": "8", "crf": str(quality), "row-mt": "1"}
-    elif codec == "mpeg2":
-        options = {
-            "qscale:v": str(quality),
-            "qmax": str(quality),
-            "qmin": str(quality),
-        }
+        enc_threads = threads.vp9_encoder
     else:
-        options = {}
+        # Fixed qscale. The slice encoder's default of one thread per core
+        # (capped at 16) is several times slower than 1 thread on these frames.
+        options = {"qmax": str(quality), "qmin": str(quality)}
+        enc_threads = 1
 
     # Encode all frames into single intra-only container
     buf = io.BytesIO()
@@ -236,6 +300,7 @@ def compress_video_batch_pyav(
     stream.pix_fmt = pix_fmt
     stream.gop_size = 1  # Every frame is an I-frame
     stream.options = options
+    stream.codec_context.thread_count = enc_threads
 
     for i in range(b):
         frame_hwc = inp_np[i].transpose(1, 2, 0)  # CHW → HWC
@@ -249,15 +314,26 @@ def compress_video_batch_pyav(
     # Decode all frames back
     buf.seek(0)
     dec_container = av.open(buf)
-    frames = []
-    for frame in dec_container.decode(video=0):
-        arr = frame.to_ndarray(format="rgb24")
-        frames.append(torch.from_numpy(arr[:h, :w, :]))  # Crop padding
+    dec_ctx = dec_container.streams.video[0].codec_context
+    if codec == "vp9":
+        # Intra-only frames decode in parallel on frame threads.
+        dec_ctx.thread_type = "FRAME"
+        dec_ctx.thread_count = threads.vp9_decoder
+    else:
+        dec_ctx.thread_count = 1
+    # One converter for the batch: frame.to_ndarray(format=...) builds a new
+    # swscale context for every frame.
+    to_rgb = VideoReformatter()
+    frames = [
+        to_rgb.reformat(frame, format="rgb24").to_ndarray()[:h, :w]  # Crop padding
+        for frame in dec_container.decode(video=0)
+    ]
     dec_container.close()
 
-    # HWC → CHW, stack, convert to float
-    result = torch.stack([f.permute(2, 0, 1) for f in frames])
-    return result.float().div_(255.0).to(device)
+    # HWC → CHW, stack, convert to float on original device
+    return _to_unit_float(
+        torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2), device
+    )
 
 
 def compress_video_batch(
@@ -288,7 +364,6 @@ def compress_video_batch(
         return compress_video_batch_pyav(tensor, codec, quality, video_sampling)
     else:
         raise ValueError(
-            "Unknown codec '{}'. Supported: {}".format(
-                codec, list(_TC_CODEC_MAP.keys()) + list(_PYAV_CODEC_MAP.keys())
-            )
+            f"Unknown codec '{codec}'. "
+            f"Supported: {list(_TC_CODEC_MAP.keys()) + list(_PYAV_CODEC_MAP.keys())}"
         )

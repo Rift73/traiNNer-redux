@@ -21,6 +21,7 @@
  */
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -199,7 +200,10 @@ torch::Tensor nlmeans_cuda(
 
     const int smem_bytes = (channels * tile_size + d_size + rowfilt_size) * sizeof(float);
 
-    nlmeans_kernel<<<grid, block, smem_bytes>>>(
+    // Launch on PyTorch's current stream, so callers that run the degradation
+    // chain on a side stream keep their ordering (the legacy default stream
+    // does not synchronise with torch's non-blocking streams).
+    nlmeans_kernel<<<grid, block, smem_bytes, at::cuda::getCurrentCUDAStream()>>>(
         input.data_ptr<float>(),
         output.data_ptr<float>(),
         batch_size, channels, height, width,

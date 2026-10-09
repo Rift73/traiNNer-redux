@@ -7,7 +7,7 @@ import pyvips
 from torch import Tensor
 
 from traiNNer.utils.img_util import img2rgb
-
+from traiNNer.utils.rng import RNG
 
 VIPS_FORMAT_TO_DTYPE: dict[str, np.dtype] = {
     "uchar": np.uint8,
@@ -144,15 +144,19 @@ def paired_random_crop(
             f"Please remove {gt_path}."
         )
 
+    # randomly choose top and left coordinates for lq patch (inclusive bounds;
+    # the project RNG, as the OTF chain runs this in the main process, where
+    # rich's log handler also draws from Python's random)
+    rng = RNG.get_rng()
     if center_height:
         top = (h_lq - lq_patch_size) // 2
     else:
-        top = random.randint(0, h_lq - lq_patch_size)
+        top = int(rng.integers(0, h_lq - lq_patch_size, endpoint=True))
 
     if center_width:
         left = (w_lq - lq_patch_size) // 2
     else:
-        left = random.randint(0, w_lq - lq_patch_size)
+        left = int(rng.integers(0, w_lq - lq_patch_size, endpoint=True))
 
     # crop lq patch
     if isinstance(img_lq, Tensor):
@@ -249,15 +253,17 @@ def paired_random_crop_multi_gt(
             f"Please remove {gt_path}."
         )
 
+    # Inclusive bounds, from the project RNG (see paired_random_crop).
+    rng = RNG.get_rng()
     if center_height:
         top = (h_lq - lq_patch_size) // 2
     else:
-        top = random.randint(0, h_lq - lq_patch_size)
+        top = int(rng.integers(0, h_lq - lq_patch_size, endpoint=True))
 
     if center_width:
         left = (w_lq - lq_patch_size) // 2
     else:
-        left = random.randint(0, w_lq - lq_patch_size)
+        left = int(rng.integers(0, w_lq - lq_patch_size, endpoint=True))
 
     if isinstance(img_lq, Tensor):
         img_lq = img_lq[:, :, top : top + lq_patch_size, left : left + lq_patch_size]

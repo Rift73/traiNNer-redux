@@ -566,14 +566,52 @@ def add_gaussian_noise(
     return out
 
 
+def _known_any_gray(gray_prob: float | Tensor) -> bool | None:
+    """Whether (torch.rand(b) < gray_prob) has a True entry, if the host can tell.
+
+    torch.rand draws from [0, 1), so a number gray_prob <= 0 selects no image and
+    gray_prob >= 1 selects every image. Otherwise the answer is only on the
+    device and None is returned.
+    """
+    if isinstance(gray_prob, float | int):
+        if gray_prob <= 0:
+            return False
+        if gray_prob >= 1:
+            return True
+    return None
+
+
+def _has_gray_noise(
+    gray_noise: float | Tensor, b: int, any_gray: bool | None
+) -> tuple[bool, float | Tensor]:
+    """Gray-noise switch for the noise generators, and gray_noise ready to mix.
+
+    A tensor gray_noise is reshaped to (b, 1, 1, 1). Testing it for a nonzero
+    entry reads it back from the device (one host sync) unless any_gray, the
+    caller's host-side knowledge of that answer, is given.
+    """
+    if isinstance(gray_noise, float | int):
+        return gray_noise > 0, gray_noise
+    gray_noise = gray_noise.view(b, 1, 1, 1)
+    if any_gray is None:
+        any_gray = bool(torch.sum(gray_noise) > 0)
+    return any_gray, gray_noise
+
+
 def generate_gaussian_noise_pt(
-    img: Tensor, sigma: float | Tensor = 10, gray_noise: float | Tensor = 0
+    img: Tensor,
+    sigma: float | Tensor = 10,
+    gray_noise: float | Tensor = 0,
+    any_gray: bool | None = None,
 ) -> Tensor:
     """Add Gaussian noise (PyTorch version).
 
     Args:
         img (Tensor): Shape (b, c, h, w), range[0, 1], float32.
         scale (float | Tensor): Noise scale. Default: 1.0.
+        any_gray (bool | None): Whether a tensor gray_noise has a nonzero entry,
+            when the caller knows it on the host. None reads it from the
+            device (one host sync). Default: None.
 
     Returns:
         (Tensor): Returned noisy image, shape (b, c, h, w), range[0, 1],
@@ -582,11 +620,7 @@ def generate_gaussian_noise_pt(
     b, _, h, w = img.size()
     if not isinstance(sigma, float | int):
         sigma = sigma.view(img.size(0), 1, 1, 1)
-    if isinstance(gray_noise, float | int):
-        cal_gray_noise = gray_noise > 0
-    else:
-        gray_noise = gray_noise.view(b, 1, 1, 1)
-        cal_gray_noise = torch.sum(gray_noise) > 0
+    cal_gray_noise, gray_noise = _has_gray_noise(gray_noise, b, any_gray)
 
     noise_gray = None
     if cal_gray_noise:
@@ -677,7 +711,9 @@ def random_generate_gaussian_noise_pt(
     )
     gray_noise = torch.rand(img.size(0), dtype=img.dtype, device=img.device)
     gray_noise = (gray_noise < gray_prob).float()
-    return generate_gaussian_noise_pt(img, sigma, gray_noise)
+    return generate_gaussian_noise_pt(
+        img, sigma, gray_noise, any_gray=_known_any_gray(gray_prob)
+    )
 
 
 def random_add_gaussian_noise_pt(
@@ -763,8 +799,26 @@ def add_poisson_noise(
     return out
 
 
+def _poisson_levels(img: Tensor) -> Tensor:
+    """Per-image Poisson level count 2 ** ceil(log2(n)), shape (b, 1, 1, 1).
+
+    n is the number of distinct values in each image. The result equals
+    len(torch.unique(img[i])) followed by 2 ** np.ceil(np.log2(n)) per image,
+    but stays on the device (no host sync): each flattened image is sorted and
+    n counts its value changes. The noise generators round images to 8 bits, so
+    n <= 256, and float64 log2/exp2 are exact at powers of two.
+    """
+    flat = img.flatten(1).sort(dim=1).values
+    n = (flat[:, 1:] != flat[:, :-1]).sum(dim=1) + 1
+    levels = torch.exp2(torch.ceil(torch.log2(n.double())))
+    return levels.to(img.dtype).view(-1, 1, 1, 1)
+
+
 def generate_poisson_noise_pt(
-    img: Tensor, scale: float | Tensor = 1.0, gray_noise: float | Tensor = 0
+    img: Tensor,
+    scale: float | Tensor = 1.0,
+    gray_noise: float | Tensor = 0,
+    any_gray: bool | None = None,
 ) -> Tensor:
     """Generate a batch of poisson noise (PyTorch version)
 
@@ -774,27 +828,23 @@ def generate_poisson_noise_pt(
             Default: 1.0.
         gray_noise (float | Tensor): 0-1 number or Tensor with shape (b).
             0 for False, 1 for True. Default: 0.
+        any_gray (bool | None): Whether a tensor gray_noise has a nonzero entry,
+            when the caller knows it on the host. None reads it from the
+            device (one host sync). Default: None.
 
     Returns:
         (Tensor): Returned noisy image, shape (b, c, h, w), range[0, 1],
             float32.
     """
     b, _, h, w = img.size()
-    if isinstance(gray_noise, float | int):
-        cal_gray_noise = gray_noise > 0
-    else:
-        gray_noise = gray_noise.view(b, 1, 1, 1)
-        cal_gray_noise = torch.sum(gray_noise) > 0
+    cal_gray_noise, gray_noise = _has_gray_noise(gray_noise, b, any_gray)
 
     noise_gray = None
     if cal_gray_noise:
         img_gray = rgb_to_grayscale(img, num_output_channels=1)
         # round and clip image for counting vals correctly
         img_gray = torch.clamp((img_gray * 255.0).round(), 0, 255) / 255.0
-        # use for-loop to get the unique values for each sample
-        vals_list = [len(torch.unique(img_gray[i, :, :, :])) for i in range(b)]
-        vals_list = [2 ** np.ceil(np.log2(vals)) for vals in vals_list]
-        vals = img_gray.new_tensor(vals_list).view(b, 1, 1, 1)
+        vals = _poisson_levels(img_gray)
         out = torch.poisson(img_gray * vals) / vals
         noise_gray = out - img_gray
         noise_gray = noise_gray.expand(b, 3, h, w)
@@ -802,10 +852,7 @@ def generate_poisson_noise_pt(
     # always calculate color noise
     # round and clip image for counting vals correctly
     img = torch.clamp((img * 255.0).round(), 0, 255) / 255.0
-    # use for-loop to get the unique values for each sample
-    vals_list = [len(torch.unique(img[i, :, :, :])) for i in range(b)]
-    vals_list = [2 ** np.ceil(np.log2(vals)) for vals in vals_list]
-    vals = img.new_tensor(vals_list).view(b, 1, 1, 1)
+    vals = _poisson_levels(img)
     out = torch.poisson(img * vals) / vals
     noise = out - img
     if cal_gray_noise and noise_gray is not None:
@@ -892,7 +939,9 @@ def random_generate_poisson_noise_pt(
     )
     gray_noise = torch.rand(img.size(0), dtype=img.dtype, device=img.device)
     gray_noise = (gray_noise < gray_prob).float()
-    return generate_poisson_noise_pt(img, scale, gray_noise)
+    return generate_poisson_noise_pt(
+        img, scale, gray_noise, any_gray=_known_any_gray(gray_prob)
+    )
 
 
 def random_add_poisson_noise_pt(
@@ -902,9 +951,12 @@ def random_add_poisson_noise_pt(
     clip: bool = True,
     rounds: bool = False,
 ) -> Tensor:
-    if scale_range[0] == 0 and scale_range[1] == 0:
-        # Zero-noise fast path; intentionally does not advance RNG.
-        out = img
+    if scale_range[0] == scale_range[1] == 0 and _known_any_gray(gray_prob) is False:
+        # Every sampled scale is exactly 0 and no image takes gray noise, so the
+        # noise is +-0 (+0 where img is -0.0) and img + noise equals img + 0.
+        # Skip generating it. This skips its random draws too, so later draws
+        # from the CUDA generator come earlier in the stream.
+        out = img + 0
     else:
         noise = random_generate_poisson_noise_pt(img, scale_range, gray_prob)
         out = img + noise
@@ -986,26 +1038,63 @@ def _ramp(ratio: float, width: int) -> Tensor:
     return torch.cat([-out[1:].flip([0]), out])[1:-1]
 
 
+# The lanczos kernel length follows the resize ratio, and the input size of the
+# second and final OTF resizes follows the earlier random scales; cudnn.benchmark
+# autotunes every new conv shape (30-40 ms each). The kernel is zero-padded to a
+# radius of 7, 15, 31, ... and the padded input is extended with zeros to a size
+# bucket and cropped after the conv, so a few conv shapes recur (24 in the OTF at
+# scale 2, GT 256, where there were over a thousand). Zero taps add exact zeros
+# and the extra rows and columns only reach outputs that are cropped, so the
+# result is bit-identical whenever cuDNN runs the same algorithm for both shapes.
+_LANCZOS_CONV_RADIUS = 7
+
+
+def _lanczos_kernel(dsize: int, size: int, a: int) -> tuple[Tensor, int]:
+    """1-D lanczos kernel for size -> dsize, zero-padded; returns it and its radius."""
+    kernel = _lanczos(_ramp(dsize / size, a), a)
+    radius = (kernel.shape[0] - 1) // 2
+    conv_radius = _LANCZOS_CONV_RADIUS
+    while conv_radius < radius:
+        conv_radius = 2 * conv_radius + 1
+    # Reflect padding needs pad < size; the unpadded radius already had to be.
+    conv_radius = max(min(conv_radius, size - 1), radius)
+    extra = conv_radius - radius
+    return F.pad(kernel, (extra, extra)), conv_radius
+
+
+def _size_bucket(size: int) -> int:
+    """Multiples of 32 up to 256, then 4 sizes per octave."""
+    step = 1 << max(5, size.bit_length() - 3)
+    return -(-size // step) * step
+
+
 # https://github.com/robobeebop/VQGAN-CLIP-Video/blob/72414dee1764397654121c75dbb576b038da68e4/utils.py#L41
 def _resample(input: Tensor, size: tuple[int, int], a: int = 3) -> Tensor:
     n, c, h, w = input.shape
     dh, dw = size
+    extend = (0, _size_bucket(w) - w, 0, _size_bucket(h) - h)
 
     input = input.reshape([n * c, 1, h, w])
 
     if dh < h:
-        kernel_h = _lanczos(_ramp(dh / h, a), a).to(input.device, input.dtype)
-        pad_h = (kernel_h.shape[0] - 1) // 2
+        kernel_h, pad_h = _lanczos_kernel(dh, h, a)
+        kernel_h = kernel_h.to(input.device, input.dtype)
         input = F.pad(input, (0, 0, pad_h, pad_h), "reflect")
+        if any(extend):
+            input = F.pad(input, extend)
         input = F.conv2d(input, kernel_h[None, None, :, None], padding=0)
+        input = input[:, :, :h, :w]
 
     if dw < w:
-        kernel_w = _lanczos(_ramp(dw / w, a), a).to(input.device, input.dtype)
-        pad_w = (kernel_w.shape[0] - 1) // 2
+        kernel_w, pad_w = _lanczos_kernel(dw, w, a)
+        kernel_w = kernel_w.to(input.device, input.dtype)
         input = F.pad(input, (pad_w, pad_w, 0, 0), "reflect")
+        if any(extend):
+            input = F.pad(input, extend)
         input = F.conv2d(input, kernel_w[None, None, None, :], padding=0)
+        input = input[:, :, :h, :w]
 
-    input = input.view([n, c, h, w])
+    input = input.reshape([n, c, h, w])
     return F.interpolate(input, size, mode="bicubic", align_corners=False).clamp(0, 1)
 
 

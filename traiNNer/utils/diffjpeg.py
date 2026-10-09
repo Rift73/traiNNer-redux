@@ -7,7 +7,6 @@ https://dsp.stackexchange.com/questions/35339/jpeg-dct-padding/35343#35343
 
 import itertools
 from collections.abc import Callable
-from typing import TypeVar
 
 import numpy as np
 import torch
@@ -42,23 +41,36 @@ def diff_round(x: Tensor) -> Tensor:
     return torch.round(x) + (x - torch.round(x)) ** 3
 
 
-T = TypeVar("T", float, Tensor)
+# Floor of the compression factor. The scaling below maps quality 100 to a
+# factor of 0, which zeroes the quantisation tables and divides by zero (NaN).
+# With the floor, quality >= 100 is near-lossless: the quantisation steps
+# (table * 1e-7) are below the float32 resolution of the DCT coefficients, so
+# only chroma subsampling and the [0, 255] clamp change the image. Every
+# float32 quality below 100 maps to a factor of at least 1.5e-7, so those
+# results are unchanged by the floor.
+MIN_FACTOR = 1e-7
 
 
-def quality_to_factor(quality: T) -> T:
+def quality_to_factor(quality: float | Tensor) -> float | Tensor:
     """Calculate factor corresponding to quality
 
     Args:
-        quality(float): Quality for jpeg compression.
+        quality(float | Tensor): Quality for jpeg compression, a number or a
+            tensor of per-image qualities.
 
     Returns:
-        float: Compression factor.
+        float | Tensor: Compression factor, at least MIN_FACTOR.
     """
+    if isinstance(quality, Tensor):
+        # Elementwise form of the branch below with the same tensor ops, so
+        # each element matches the scalar path without a host sync.
+        factor = torch.where(quality < 50, 5000.0 / quality, 200.0 - quality * 2)
+        return (factor / 100.0).clamp_min(MIN_FACTOR)
     if quality < 50:
         quality = 5000.0 / quality
     else:
         quality = 200.0 - quality * 2
-    return quality / 100.0
+    return max(quality / 100.0, MIN_FACTOR)
 
 
 # ------------------------ compression ------------------------#
@@ -504,14 +516,11 @@ class DiffJPEG(nn.Module):
         """
         Args:
             x (Tensor): Input image, bchw, rgb, [0, 1]
-            quality(float): Quality factor for jpeg compression scheme.
+            quality(float | Tensor): Quality factor for jpeg compression scheme,
+                a number or a tensor of shape (b) with one quality per image.
+                Qualities >= 100 are near-lossless (see MIN_FACTOR).
         """
-        factor = quality
-        if isinstance(factor, int | float):
-            factor = quality_to_factor(factor)
-        else:
-            for i in range(factor.size(0)):
-                factor[i] = quality_to_factor(factor[i])
+        factor = quality_to_factor(quality)
         h, w = x.size()[-2:]
         h_pad, w_pad = 0, 0
         # why should use 16

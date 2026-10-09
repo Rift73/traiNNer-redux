@@ -1,19 +1,21 @@
 import os
-import random
 import sys
+from collections.abc import Sequence
 from os import path as osp
+from typing import TypeVar
 
+import numpy as np
 import torch
 import torchvision
 from torch import Tensor, nn
 from torch.nn import functional as F  # noqa: N812
 
+from traiNNer.data.compress_video_batch import compress_video_batch
 from traiNNer.data.degradations import (
     random_add_gaussian_noise_pt,
     random_add_poisson_noise_pt,
     resize_pt,
 )
-from traiNNer.data.compress_video_batch import compress_video_batch
 from traiNNer.data.gpu_degradations import (
     channel_shift_pt,
     chroma_subsample_pt,
@@ -49,6 +51,22 @@ OTF_DEBUG_PATH = osp.abspath(
 )
 
 ANTIALIAS_MODES = {"bicubic", "bilinear"}
+
+T = TypeVar("T")
+
+
+def _weighted_choice(population: Sequence[T], weights: Sequence[float] | None) -> T:
+    """population[i] with probability weights[i] / sum(weights) (uniform when
+    weights is None), the distribution of random.choices(population, weights)[0].
+
+    Drawn from the project RNG, not Python's random: rich's log handler also
+    draws from random, so logging changed the degradation stream.
+    """
+    p = None
+    if weights is not None:
+        w = np.asarray(weights, dtype=np.float64)
+        p = w / w.sum()
+    return population[int(RNG.get_rng().choice(len(population), p=p))]
 
 
 def _collated_any(value: bool | Tensor | None) -> bool:
@@ -287,12 +305,10 @@ class RealESRGANModel(SRModel):
         # Two-step selection: first check if any combo fires, then pick which
         no_combo_prob = self.opt.otf_no_combo_weight
         if RNG.get_rng().uniform() >= no_combo_prob:
-            # A combo fires — pick which one using relative weights
-            weights = self.opt.otf_degradation_combo_weights
-            if weights is None:
-                weights = [1.0] * len(combos)
-
-            selected = random.choices(combos, weights=weights, k=1)[0]
+            # A combo fires — pick which one using relative weights (uniform if None)
+            selected = _weighted_choice(
+                combos, self.opt.otf_degradation_combo_weights
+            )
             active.update(selected)
 
         return active
@@ -314,7 +330,7 @@ class RealESRGANModel(SRModel):
             if stage == 1
             else self.opt.compress_algorithm_probs2
         )
-        algo = random.choices(algos, probs)[0]
+        algo = _weighted_choice(algos, probs)
 
         if algo == "jpeg":
             jpeg_range = self.opt.compress_jpeg_range if stage == 1 else self.opt.compress_jpeg_range2
@@ -347,9 +363,7 @@ class RealESRGANModel(SRModel):
                 else self.opt.compress_video_sampling_weights2
             )
             # Select one sampling format using weights (or uniform if None)
-            selected_sampling = random.choices(
-                video_sampling, weights=sampling_weights, k=1
-            )
+            selected_sampling = [_weighted_choice(video_sampling, sampling_weights)]
             out = torch.clamp(out, 0, 1)
             out = compress_video_batch(out, algo, quality, selected_sampling)
         return out
@@ -401,9 +415,11 @@ class RealESRGANModel(SRModel):
 
         Two modes:
         - Palette mode: content-adaptive indexed color (like GIF/PNG8) via median cut.
-          Always CPU (chainner_ext PaletteQuantization).
+          The median cut is CPU (Pillow, per image); the dithering uses the exact
+          CUDA kernel when it builds, else CPU (chainner_ext PaletteQuantization).
         - Uniform mode: per-channel quantization levels.
-          GPU path for quantize/ordered dither, CPU for error diffusion/riemersma.
+          GPU path for quantize/ordered dither; error diffusion/riemersma use the
+          exact CUDA kernel when it builds, else CPU (chainner_ext).
         """
         rng = RNG.get_rng()
         dtype = rng.choice(self.opt.dithering_types).lower()
@@ -414,6 +430,20 @@ class RealESRGANModel(SRModel):
             map_size = int(rng.choice(self.opt.dithering_map_size))
             history = int(rng.integers(*self.opt.dithering_history_range))
             decay_ratio = float(rng.uniform(*self.opt.dithering_ratio_range))
+            from traiNNer.data.dither_cuda import (
+                PALETTE_DITHERING_TYPES,
+                dither_cuda_available,
+                palette_dither_cuda,
+            )
+
+            # Same median cut either way; the GPU path dithers the whole batch
+            # bit-identically to the per-image CPU path.
+            if (
+                out.is_cuda
+                and dtype in PALETTE_DITHERING_TYPES
+                and dither_cuda_available()
+            ):
+                return palette_dither_cuda(out, dtype, num_colors, history, decay_ratio)
             return apply_per_image(
                 out,
                 lambda img: apply_dithering_palette(
@@ -430,10 +460,30 @@ class RealESRGANModel(SRModel):
             map_size = int(rng.choice(self.opt.dithering_map_size))
             return ordered_dither_pt(out, quantize_ch, map_size)
         else:
-            # Error diffusion / riemersma — CPU path (chainner_ext)
+            # Error diffusion / riemersma — exact CUDA kernel (bit-identical to
+            # chainner_ext) when it builds, else the per-image CPU path. map_size
+            # is drawn on both paths so the RNG stream does not depend on the path.
             map_size = int(rng.choice(self.opt.dithering_map_size))
             history = int(rng.integers(*self.opt.dithering_history_range))
             decay_ratio = float(rng.uniform(*self.opt.dithering_ratio_range))
+            from traiNNer.data.dither_cuda import (
+                DIFFUSION_ALGORITHMS,
+                dither_cuda_available,
+                error_diffusion_dither_cuda,
+                riemersma_dither_cuda,
+            )
+
+            # Riemersma is one serial Hilbert walk per image-channel, so a single
+            # GPU thread per plane only beats a CPU core from batch 2 upward
+            # (measured: 3x faster at batch 8, 0.6x at batch 1). Same bits either way.
+            use_kernel = out.is_cuda and (
+                dtype in DIFFUSION_ALGORITHMS
+                or (dtype == "riemersma" and out.shape[0] >= 2)
+            )
+            if use_kernel and dither_cuda_available():
+                if dtype == "riemersma":
+                    return riemersma_dither_cuda(out, quantize_ch, history, decay_ratio)
+                return error_diffusion_dither_cuda(out, quantize_ch, dtype)
             return apply_per_image(
                 out,
                 lambda img: apply_dithering(
@@ -668,9 +718,7 @@ class RealESRGANModel(SRModel):
                 out = self._apply_subsampling(out)
 
             # random resize
-            updown_type = random.choices(["up", "down", "keep"], self.opt.resize_prob)[
-                0
-            ]
+            updown_type = _weighted_choice(("up", "down", "keep"), self.opt.resize_prob)
             if updown_type == "up":
                 scale = RNG.get_rng().uniform(1, self.opt.resize_range[1])
             elif updown_type == "down":
@@ -682,9 +730,9 @@ class RealESRGANModel(SRModel):
                 assert len(self.opt.resize_mode_list) == len(
                     self.opt.resize_mode_prob
                 ), "resize_mode_list and resize_mode_prob must be the same length"
-                mode = random.choices(
-                    self.opt.resize_mode_list, weights=self.opt.resize_mode_prob
-                )[0]
+                mode = _weighted_choice(
+                    self.opt.resize_mode_list, self.opt.resize_mode_prob
+                )
 
                 out = resize_pt(
                     out,
@@ -719,9 +767,7 @@ class RealESRGANModel(SRModel):
             if RNG.get_rng().uniform() < self.opt.blur_prob2:
                 out = filter2d(out, self.kernel2)
             # random resize
-            updown_type = random.choices(["up", "down", "keep"], self.opt.resize_prob2)[
-                0
-            ]
+            updown_type = _weighted_choice(("up", "down", "keep"), self.opt.resize_prob2)
             if updown_type == "up":
                 scale = RNG.get_rng().uniform(1, self.opt.resize_range2[1])
             elif updown_type == "down":
@@ -733,9 +779,9 @@ class RealESRGANModel(SRModel):
                 assert len(self.opt.resize_mode_list2) == len(
                     self.opt.resize_mode_prob2
                 ), "resize_mode_list2 and resize_mode_prob2 must be the same length"
-                mode = random.choices(
-                    self.opt.resize_mode_list2, weights=self.opt.resize_mode_prob2
-                )[0]
+                mode = _weighted_choice(
+                    self.opt.resize_mode_list2, self.opt.resize_mode_prob2
+                )
                 out = resize_pt(
                     out,
                     size=(
@@ -775,9 +821,9 @@ class RealESRGANModel(SRModel):
                 "resize_mode_list3 and resize_mode_prob3 must be the same length"
             )
 
-            mode = random.choices(
-                self.opt.resize_mode_list3, weights=self.opt.resize_mode_prob3
-            )[0]
+            mode = _weighted_choice(
+                self.opt.resize_mode_list3, self.opt.resize_mode_prob3
+            )
             if RNG.get_rng().uniform() < 0.5:
                 # resize back + the final sinc filter
                 out = resize_pt(

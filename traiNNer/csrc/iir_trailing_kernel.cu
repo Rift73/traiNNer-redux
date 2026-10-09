@@ -1,6 +1,7 @@
 // Causal 1-pole IIR filter (tape trailing) — one thread per row.
 // y[i] = alpha * x[i] + (1 - alpha) * y[i-1], applied along last dimension.
 
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 
 __global__ void iir_trailing_kernel(
@@ -34,7 +35,8 @@ void iir_trailing_forward_cuda(
     const int threads = 256;
     const int blocks = (num_rows + threads - 1) / threads;
 
-    iir_trailing_kernel<<<blocks, threads>>>(
+    // Launch on PyTorch's current stream (see nlmeans_kernel.cu).
+    iir_trailing_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         output, input, alpha, beta, num_rows, W
     );
 }
