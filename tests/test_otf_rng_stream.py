@@ -145,6 +145,19 @@ def _otf_model(opt: ReduxOptions) -> RealESRGANModel:
     model.otf_debug = False
     model.otf_debug_limit = 0
     model.batch_augment = BatchAugment(opt.scale, opt.train)
+    # Read by feed_data in trees whose RealESRGANModel carries forensic
+    # provenance and sample-provenance queues; None means disabled, and the
+    # attributes are harmless where the model lacks them.
+    for name in (
+        "forensic_queue_rng",
+        "forensic_degradation_cpu_rng_state",
+        "forensic_degradation_cuda_rng_state",
+        "queue_sample_indices",
+        "queue_sample_paths",
+        "batch_sample_indices",
+        "batch_sample_paths",
+    ):
+        setattr(model, name, None)
     return model
 
 

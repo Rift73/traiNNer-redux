@@ -283,8 +283,12 @@ def test_no_host_sync_after_warm_up(case: str) -> None:
     name, sampler = CASES[case]
     image = _image(4, 96, 160, seed=3)
     rng = np.random.default_rng(7)
-    _call(gpu_degradations, name, image, sampler(rng), seed=0)  # fills the caches
     params = [sampler(rng) for _ in range(4)]
+    # Warm up with the parameter sets measured below: the first call for a new
+    # colour standard, Bayer map size or filter design builds its device
+    # constants (one documented sync each); repeat calls must not sync.
+    for seed, draw in enumerate(params, start=1):
+        _call(gpu_degradations, name, image, draw, seed=seed)
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
